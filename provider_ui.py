@@ -112,7 +112,7 @@ async def machine_region(message: Message, state: FSMContext):
         return
     await state.update_data(region=message.text)
     await state.set_state(AddMachine.area)
-    await message.answer("Укажите район (например, СЗАО) или напишите «весь регион».")
+    await message.answer("Укажите район (например, СЗАО или Химки) либо выберите «весь регион», если готовы работать в любом районе выбранного региона.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="весь регион")]], resize_keyboard=True))
 
 
 @router.message(AddMachine.area)
