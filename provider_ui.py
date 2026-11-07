@@ -8,6 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 import provider_registry as registry
+import payment_preferences as payments
 
 router = Router()
 
@@ -22,6 +23,7 @@ class Register(StatesGroup):
     consent = State()
     name = State()
     phone = State()
+    payment = State()
 
 
 class AddMachine(StatesGroup):
@@ -74,8 +76,20 @@ async def phone(message: Message, state: FSMContext):
     except ValueError as exc:
         await message.answer(str(exc))
         return
+    await state.set_state(Register.payment)
+    await message.answer("Какие формы оплаты принимаете? Укажите один или несколько вариантов через запятую:\n" + "\n".join(sorted(payments.METHODS)))
+
+
+@router.message(Register.payment)
+async def provider_payment(message: Message, state: FSMContext):
+    methods = {part.strip() for part in (message.text or "").split(",")}
+    if not methods or not methods <= payments.METHODS:
+        await message.answer("Укажите формы оплаты точно из списка, через запятую.")
+        return
+    await payments.init_schema()
+    await payments.save_provider(message.from_user.id, methods)
     await state.clear()
-    await message.answer("Профиль сохранён. Добавьте технику через меню.", reply_markup=MENU)
+    await message.answer("Профиль и формы оплаты сохранены. Добавьте технику через меню.", reply_markup=MENU)
 
 
 @router.message(F.text == "➕ Добавить технику")
