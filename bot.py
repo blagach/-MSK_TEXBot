@@ -21,6 +21,7 @@ import provider_dispatch
 import lead_routing
 import moderation_history
 import lead_moderation
+import lead_shadow_review
 
 load_dotenv()
 
@@ -274,14 +275,14 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         lead_id = cursor.lastrowid
     await lead_routing.save(lead_id, data["equipment"], data["region"], data["area"], storage.DB_PATH)
     lead = await get_lead(lead_id)
-    approved = await moderation_history.approved_before(message.from_user.id, storage.DB_PATH)
-    decision = lead_moderation.assess(
-        previously_approved=approved, category=data["equipment"],
+    # Shadow evaluation only: never changes the manual approval workflow.
+    shadow = await lead_shadow_review.evaluate(
+        message.from_user.id, equipment=data["equipment"],
         region=data["region"], area=data["area"], place=data["place"],
         work_date=data["work_date"], details=data["details"],
+        db_path=storage.DB_PATH, enabled=False, exclude_lead_id=lead_id,
     )
-    # Advisory only: all leads still require administrator approval.
-    logging.info("Lead %s moderation assessment: %s", lead_id, decision.status)
+    logging.info("Lead %s shadow route: %s", lead_id, shadow.route)
     markup = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}"),
