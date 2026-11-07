@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 import os
@@ -41,6 +42,7 @@ def read_settings() -> Settings:
 
 
 settings = read_settings()
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
 router = Router()
 
 
@@ -78,7 +80,7 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 async def init_db() -> None:
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS leads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +122,7 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
 
 
 async def get_lead(lead_id: int):
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)) as cursor:
             return await cursor.fetchone()
@@ -188,7 +190,7 @@ async def lead_details(message: Message, state: FSMContext) -> None:
 @router.message(LeadForm.phone)
 async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -230,7 +232,7 @@ async def provider_location(message: Message, state: FSMContext) -> None:
 @router.message(ProviderForm.phone)
 async def provider_phone(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO providers(telegram_id, name, equipment, location, phone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (message.from_user.id, message.from_user.full_name, data["equipment"], data["location"], message.text, datetime.now(timezone.utc).isoformat()),
@@ -293,7 +295,7 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
         url=f"https://t.me/{settings.bot_username}?start=lead_{lead_id}",
     )]])
     await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("UPDATE leads SET status = 'published' WHERE id = ?", (lead_id,))
         await db.commit()
     await callback.message.edit_text("✅ Заявка опубликована в канале.\n\n" + lead_text(lead, True))
@@ -308,7 +310,7 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
     lead_id = int(callback.data.split(":")[1])
     lead = await get_lead(lead_id)
     if lead:
-        async with aiosqlite.connect("bot.db") as db:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
             await db.execute("UPDATE leads SET status = 'rejected' WHERE id = ?", (lead_id,))
             await db.commit()
         await bot.send_message(lead["customer_id"], "К сожалению, сейчас не сможем подобрать исполнителя по этой заявке.")
@@ -316,14 +318,37 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
-async def main() -> None:
+async def check_telegram(bot: Bot) -> None:
+    me = await bot.get_me()
+    if me.username.lower() != settings.bot_username.lower():
+        raise RuntimeError("BOT_USERNAME не совпадает с username бота в Telegram")
+    channel = await bot.get_chat(settings.leads_channel_id)
+    if channel.type != "channel":
+        raise RuntimeError("LEADS_CHANNEL_ID должен указывать на канал")
+    member = await bot.get_chat_member(settings.leads_channel_id, me.id)
+    if member.status != "administrator" or not member.can_post_messages:
+        raise RuntimeError("Добавьте бота администратором канала с правом публикации сообщений")
+    webhook = await bot.get_webhook_info()
+    if webhook.url:
+        raise RuntimeError("У бота включён webhook. Отключите его на прежнем хостинге перед запуском polling")
+    logging.info("Telegram: @%s; канал доступен; публикация разрешена", me.username)
+
+
+async def main(check_only: bool = False) -> None:
     logging.basicConfig(level=logging.INFO)
-    await init_db()
-    bot = Bot(token=settings.token)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    await dp.start_polling(bot)
+    async with Bot(token=settings.token) as bot:
+        await check_telegram(bot)
+        await init_db()
+        if check_only:
+            logging.info("Проверка завершена: Telegram и база данных доступны")
+            return
+        dp = Dispatcher(storage=MemoryStorage())
+        dp.include_router(router)
+        await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="Проверить Telegram и БД без запуска polling")
+    args = parser.parse_args()
+    asyncio.run(main(check_only=args.check))
