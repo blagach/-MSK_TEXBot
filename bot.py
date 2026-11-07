@@ -15,6 +15,8 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramFor
 from dotenv import load_dotenv
 
 import storage
+import provider_registry
+import provider_ui
 
 load_dotenv()
 
@@ -76,6 +78,9 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📝 Оставить заявку")],
             [KeyboardButton(text="🚜 Я исполнитель")],
+            [KeyboardButton(text="🚜 Зарегистрироваться как исполнитель")],
+            [KeyboardButton(text="➕ Добавить технику"), KeyboardButton(text="📋 Моя техника")],
+            [KeyboardButton(text="🔔 Уведомления вкл"), KeyboardButton(text="🔕 Уведомления выкл")],
         ], resize_keyboard=True,
     )
 
@@ -108,6 +113,7 @@ async def init_db() -> None:
         """)
         await db.commit()
     await storage.init_schema()
+    await provider_registry.init_schema(storage.DB_PATH)
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
@@ -420,6 +426,7 @@ async def main() -> None:
     bot = Bot(token=settings.token)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    dp.include_router(provider_ui.router)
     await dp.start_polling(bot)
 
 
