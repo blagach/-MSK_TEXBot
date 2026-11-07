@@ -24,7 +24,7 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
             p.start()
         import bot
         self.bot_module = bot
-        self.patchers.append(patch.object(bot.settings, "leads_channel_id", -10012345) if False else patch.object(bot.storage, "DB_PATH", self.db_path))
+        self.patchers.append(patch.object(bot, "is_admin", return_value=True))
         self.patchers[-1].start()
         with sqlite3.connect(self.db_path) as db:
             db.execute("""CREATE TABLE leads (
