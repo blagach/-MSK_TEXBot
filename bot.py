@@ -22,6 +22,7 @@ import lead_routing
 import moderation_history
 import lead_moderation
 import lead_shadow_review
+import payment_preferences
 
 load_dotenv()
 
@@ -61,6 +62,7 @@ class LeadForm(StatesGroup):
     place = State()
     date = State()
     details = State()
+    payment = State()
     phone = State()
 
 
@@ -123,6 +125,7 @@ async def init_db() -> None:
     await provider_registry.init_schema(storage.DB_PATH)
     await lead_routing.init_schema(storage.DB_PATH)
     await moderation_history.init_schema(storage.DB_PATH)
+    await payment_preferences.init_schema(storage.DB_PATH)
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
@@ -256,6 +259,21 @@ async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
     await state.update_data(details=message.text)
+    await state.set_state(LeadForm.payment)
+    await message.answer("Выберите форму оплаты:", reply_markup=ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text=payment_preferences.CASH)],
+        [KeyboardButton(text=payment_preferences.VAT)],
+        [KeyboardButton(text=payment_preferences.NO_VAT)],
+        [KeyboardButton(text=payment_preferences.ANY)],
+    ], resize_keyboard=True))
+
+
+@router.message(LeadForm.payment)
+async def lead_payment(message: Message, state: FSMContext) -> None:
+    if not message.text or message.text not in payment_preferences.METHODS | {payment_preferences.ANY}:
+        await message.answer("Выберите форму оплаты кнопкой из списка.")
+        return
+    await state.update_data(payment_method=message.text)
     await state.set_state(LeadForm.phone)
     await message.answer("Оставьте номер телефона для связи.")
 
@@ -273,6 +291,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         await db.commit()
         lead_id = cursor.lastrowid
+    await payment_preferences.save_lead(lead_id, data.get("payment_method", payment_preferences.ANY), storage.DB_PATH)
     await lead_routing.save(lead_id, data["equipment"], data["region"], data["area"], storage.DB_PATH)
     lead = await get_lead(lead_id)
     # Shadow evaluation only: never changes the manual approval workflow.
