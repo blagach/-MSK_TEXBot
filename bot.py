@@ -18,6 +18,7 @@ import storage
 import provider_registry
 import provider_ui
 import provider_dispatch
+import lead_routing
 
 load_dotenv()
 
@@ -52,6 +53,8 @@ router = Router()
 
 class LeadForm(StatesGroup):
     equipment = State()
+    region = State()
+    area = State()
     place = State()
     date = State()
     details = State()
@@ -115,6 +118,7 @@ async def init_db() -> None:
         await db.commit()
     await storage.init_schema()
     await provider_registry.init_schema(storage.DB_PATH)
+    await lead_routing.init_schema(storage.DB_PATH)
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
@@ -193,16 +197,36 @@ async def start(message: Message, state: FSMContext) -> None:
 async def lead_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(LeadForm.equipment)
-    await message.answer("Какая техника нужна? Например: манипулятор 5 т, мини-экскаватор, каток.")
+    await message.answer("Выберите категорию техники:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=item)] for item in sorted(provider_registry.CATEGORIES)], resize_keyboard=True))
 
 
 @router.message(LeadForm.equipment)
 async def lead_equipment(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 200, phone=False):
+    if message.text not in provider_registry.CATEGORIES:
+        await message.answer("Выберите категорию техники кнопкой из списка.")
         return
     await state.update_data(equipment=message.text)
+    await state.set_state(LeadForm.region)
+    await message.answer("Выберите регион:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Москва"), KeyboardButton(text="Московская область")]], resize_keyboard=True))
+
+
+@router.message(LeadForm.region)
+async def lead_region(message: Message, state: FSMContext) -> None:
+    if message.text not in provider_registry.REGIONS:
+        await message.answer("Выберите Москву или Московскую область.")
+        return
+    await state.update_data(region=message.text)
+    await state.set_state(LeadForm.area)
+    await message.answer("Укажите район или населённый пункт (например, СЗАО или Химки).")
+
+
+@router.message(LeadForm.area)
+async def lead_area(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 120):
+        return
+    await state.update_data(area=message.text.strip())
     await state.set_state(LeadForm.place)
-    await message.answer("Где нужна техника? Укажите район, адрес или ближайшее метро.")
+    await message.answer("Укажите точный адрес, ориентир или ближайшее метро.")
 
 
 @router.message(LeadForm.place)
@@ -245,6 +269,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         await db.commit()
         lead_id = cursor.lastrowid
+    await lead_routing.save(lead_id, data["equipment"], data["region"], data["area"], storage.DB_PATH)
     lead = await get_lead(lead_id)
     markup = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
@@ -393,16 +418,13 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
                      "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
         return
     await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
-    # Targeted notifications require structured fields; current lead form stores
-    # only free text. Fail closed rather than guessing a category or location.
-    if all(key in lead.keys() for key in ("category", "region", "area")):
+    routing = await lead_routing.get(lead_id, storage.DB_PATH)
+    if routing:
         recipients = await provider_dispatch.recipients_for_lead(
-            category=lead["category"], region=lead["region"], area=lead["area"],
-            db_path=storage.DB_PATH,
+            **routing, db_path=storage.DB_PATH,
         )
-        # Delivery is intentionally disabled until persistent idempotency and
-        # unknown-outcome reconciliation are implemented and tested.
-        logging.info("Targeted delivery pending safety checks: %d recipients", len(recipients))
+        # Never send until delivery idempotency and reconciliation are verified.
+        logging.info("Targeted delivery disabled; %d matching recipients", len(recipients))
     if callback.message:
         try:
             await callback.message.edit_text("✅ Заявка опубликована.\n\n" + lead_text(lead, True))
