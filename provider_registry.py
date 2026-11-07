@@ -16,6 +16,8 @@ CATEGORIES = frozenset({
     "самосвал", "трал", "другая техника",
 })
 REGIONS = frozenset({"Москва", "Московская область"})
+BOTH_REGIONS = "Москва и Московская область"
+SERVICE_REGIONS = REGIONS | {BOTH_REGIONS}
 
 
 def _now():
@@ -81,7 +83,7 @@ async def register_provider(telegram_id, name, phone, consent, db_path=DEFAULT_D
 
 async def add_equipment(telegram_id, category, description, region, area,
                         db_path=DEFAULT_DB_PATH):
-    if category not in CATEGORIES or region not in REGIONS:
+    if category not in CATEGORIES or region not in SERVICE_REGIONS:
         raise ValueError("Выберите категорию техники и регион из списка")
     if not isinstance(description, str) or not 1 <= len(description.strip()) <= 200:
         raise ValueError("Описание техники: от 1 до 200 символов")
@@ -161,7 +163,7 @@ async def matching_providers(category, region, area, db_path=DEFAULT_DB_PATH):
             FROM provider_profiles p
             JOIN provider_equipment e ON e.provider_id=p.telegram_id
             WHERE p.blocked=0 AND p.notifications_enabled=1
-              AND e.active=1 AND e.category=? AND e.region=?
+              AND e.active=1 AND e.category=? AND (e.region=? OR e.region=?)
               AND (e.area=? OR e.area='весь регион')
-            ORDER BY p.telegram_id""", (category, region, area)) as cursor:
+            ORDER BY p.telegram_id""", (category, region, BOTH_REGIONS, area)) as cursor:
             return [row[0] for row in await cursor.fetchall()]
