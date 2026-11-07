@@ -102,17 +102,28 @@ async def machine_description(message: Message, state: FSMContext):
         return
     await state.update_data(description=message.text.strip())
     await state.set_state(AddMachine.region)
-    await message.answer("Выберите регион: Москва или Московская область.")
+    await message.answer("Выберите зону работы: Москва, Московская область или Москва и Московская область.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Москва"), KeyboardButton(text="Московская область")], [KeyboardButton(text="Москва и Московская область")]], resize_keyboard=True))
 
 
 @router.message(AddMachine.region)
 async def machine_region(message: Message, state: FSMContext):
-    if message.text not in registry.REGIONS:
-        await message.answer("Введите «Москва» или «Московская область».")
+    if message.text not in registry.SERVICE_REGIONS:
+        await message.answer("Выберите Москву, Московскую область либо оба региона.")
         return
     await state.update_data(region=message.text)
     await state.set_state(AddMachine.area)
-    await message.answer("Укажите район (например, СЗАО или Химки) либо выберите «весь регион», если готовы работать в любом районе выбранного региона.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="весь регион")]], resize_keyboard=True))
+    if message.text == registry.BOTH_REGIONS:
+        await state.update_data(area="весь регион")
+        data = await state.get_data()
+        try:
+            item_id = await registry.add_equipment(message.from_user.id, data["category"], data["description"], data["region"], "весь регион")
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        await state.clear()
+        await message.answer(f"Техника №{item_id} добавлена: выезд по Москве и всей Московской области.", reply_markup=MENU)
+        return
+    await message.answer("Укажите район (например, СЗАО или Химки) либо выберите «весь регион».", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="весь регион")]], resize_keyboard=True))
 
 
 @router.message(AddMachine.area)
