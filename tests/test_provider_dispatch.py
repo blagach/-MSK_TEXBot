@@ -23,7 +23,7 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_only_matching_area_and_region(self):
         result = await recipients_for_lead(category="мини-погрузчик", region="Московская область", area="Химки", db_path=self.db)
-        self.assertEqual({row["telegram_id"] for row in result}, {101, 103})
+        self.assertEqual(set(result), {101, 103})
 
     async def test_unknown_location_and_category_fail_closed(self):
         for category, region, area in [
