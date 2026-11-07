@@ -21,7 +21,7 @@ load_dotenv()
 class Settings:
     token: str
     admin_ids: set[int]
-    leads_channel_id: int
+    leads_channel_id: int | str
     payment_url: str
     bot_username: str
 
@@ -29,13 +29,13 @@ class Settings:
 def read_settings() -> Settings:
     token = os.getenv("BOT_TOKEN", "")
     admins = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "").split(",") if value.strip()}
-    channel = os.getenv("LEADS_CHANNEL_ID", "")
+    channel = os.getenv("LEADS_CHANNEL_ID", "").strip()
     if not token or not admins or not channel:
         raise RuntimeError("Заполните BOT_TOKEN, ADMIN_IDS и LEADS_CHANNEL_ID в .env")
     return Settings(
         token,
         admins,
-        int(channel),
+        channel if channel.startswith("@") else int(channel),
         os.getenv("PAYMENT_URL", ""),
         os.getenv("BOT_USERNAME", "MSK_TEXBot").lstrip("@"),
     )
