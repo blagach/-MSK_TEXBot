@@ -76,10 +76,8 @@ class LeadJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await bot.get_lead(second))["status"], "new")
         decision = lead_moderation.assess(
             previously_approved=await moderation_history.approved_before(501, storage.DB_PATH),
-            **self.state.get_data.return_value,
-        ) if False else lead_moderation.assess(
-            previously_approved=True, category="каток", region="Москва",
-            area="СЗАО", place="улица Свободы", work_date="завтра в 9",
+            category="каток", region="Москва", area="СЗАО",
+            place="улица Свободы", work_date="завтра в 9",
             details="Укатать площадку",
         )
         self.assertEqual(decision.status, "eligible")
