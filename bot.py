@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import storage
 import provider_registry
 import provider_ui
+import provider_dispatch
 
 load_dotenv()
 
@@ -392,6 +393,16 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
                      "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
         return
     await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
+    # Targeted notifications require structured fields; current lead form stores
+    # only free text. Fail closed rather than guessing a category or location.
+    if all(key in lead.keys() for key in ("category", "region", "area")):
+        recipients = await provider_dispatch.recipients_for_lead(
+            category=lead["category"], region=lead["region"], area=lead["area"],
+            db_path=storage.DB_PATH,
+        )
+        # Delivery is intentionally disabled until persistent idempotency and
+        # unknown-outcome reconciliation are implemented and tested.
+        logging.info("Targeted delivery pending safety checks: %d recipients", len(recipients))
     if callback.message:
         try:
             await callback.message.edit_text("✅ Заявка опубликована.\n\n" + lead_text(lead, True))
