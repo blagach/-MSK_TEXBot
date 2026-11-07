@@ -6,12 +6,15 @@ from datetime import datetime, timezone
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
+
+import storage
 
 load_dotenv()
 
@@ -78,7 +81,7 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 async def init_db() -> None:
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS leads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +107,7 @@ async def init_db() -> None:
             )
         """)
         await db.commit()
+    await storage.init_schema()
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
@@ -120,10 +124,34 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
 
 
 async def get_lead(lead_id: int):
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)) as cursor:
             return await cursor.fetchone()
+
+
+async def valid_input(message: Message, limit: int, phone: bool = False) -> bool:
+    if not storage.valid_text(message.text, limit, phone):
+        await message.answer("Введите телефон в формате +7XXXXXXXXXX или 8XXXXXXXXXX." if phone
+                             else f"Отправьте текст от 1 до {limit} символов.")
+        return False
+    return True
+
+
+async def notify(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
+    try:
+        await bot.send_message(chat_id, text, **kwargs)
+        return True
+    except TelegramAPIError as exc:
+        # Do not log personal data or the exception's request payload.
+        logging.warning("Notification failed: %s", type(exc).__name__)
+        return False
+
+
+@router.message(Command("cancel"))
+async def cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Заполнение отменено.", reply_markup=main_menu())
 
 
 @router.message(CommandStart(deep_link=True))
@@ -132,7 +160,10 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
     if not command.args or not command.args.startswith("lead_"):
         await message.answer("Ссылка на заявку устарела. Откройте актуальную заявку в канале.", reply_markup=main_menu())
         return
-    lead_id = int(command.args.removeprefix("lead_"))
+    lead_id = storage.parse_id(command.args, "lead_")
+    if lead_id is None:
+        await message.answer("Некорректная ссылка на заявку.", reply_markup=main_menu())
+        return
     lead = await get_lead(lead_id)
     if not lead or lead["status"] != "published":
         await message.answer("Эта заявка уже недоступна.", reply_markup=main_menu())
@@ -153,12 +184,15 @@ async def start(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "📝 Оставить заявку")
 async def lead_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await state.set_state(LeadForm.equipment)
     await message.answer("Какая техника нужна? Например: манипулятор 5 т, мини-экскаватор, каток.")
 
 
 @router.message(LeadForm.equipment)
 async def lead_equipment(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 200, phone=False):
+        return
     await state.update_data(equipment=message.text)
     await state.set_state(LeadForm.place)
     await message.answer("Где нужна техника? Укажите район, адрес или ближайшее метро.")
@@ -166,6 +200,8 @@ async def lead_equipment(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.place)
 async def lead_place(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 300, phone=False):
+        return
     await state.update_data(place=message.text)
     await state.set_state(LeadForm.date)
     await message.answer("На какую дату и время нужна техника?")
@@ -173,6 +209,8 @@ async def lead_place(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.date)
 async def lead_date(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 100, phone=False):
+        return
     await state.update_data(work_date=message.text)
     await state.set_state(LeadForm.details)
     await message.answer("Опишите работу: объём, срок, груз/навесное оборудование, важные условия.")
@@ -180,6 +218,8 @@ async def lead_date(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.details)
 async def lead_details(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 1500, phone=False):
+        return
     await state.update_data(details=message.text)
     await state.set_state(LeadForm.phone)
     await message.answer("Оставьте номер телефона для связи.")
@@ -187,8 +227,10 @@ async def lead_details(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.phone)
 async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not await valid_input(message, 32, phone=True):
+        return
     data = await state.get_data()
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -202,19 +244,22 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}"),
     ]])
     for admin_id in settings.admin_ids:
-        await bot.send_message(admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
+        await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
     await state.clear()
     await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu())
 
 
 @router.message(F.text == "🚜 Я исполнитель")
 async def provider_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await state.set_state(ProviderForm.equipment)
     await message.answer("Какую технику вы предоставляете?")
 
 
 @router.message(ProviderForm.equipment)
 async def provider_equipment(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 200, phone=False):
+        return
     await state.update_data(equipment=message.text)
     await state.set_state(ProviderForm.location)
     await message.answer("В каких районах работаете?")
@@ -222,6 +267,8 @@ async def provider_equipment(message: Message, state: FSMContext) -> None:
 
 @router.message(ProviderForm.location)
 async def provider_location(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 300, phone=False):
+        return
     await state.update_data(location=message.text)
     await state.set_state(ProviderForm.phone)
     await message.answer("Оставьте телефон для связи.")
@@ -229,8 +276,10 @@ async def provider_location(message: Message, state: FSMContext) -> None:
 
 @router.message(ProviderForm.phone)
 async def provider_phone(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 32, phone=True):
+        return
     data = await state.get_data()
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO providers(telegram_id, name, equipment, location, phone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (message.from_user.id, message.from_user.full_name, data["equipment"], data["location"], message.text, datetime.now(timezone.utc).isoformat()),
@@ -242,6 +291,8 @@ async def provider_phone(message: Message, state: FSMContext) -> None:
 
 @router.message(OfferForm.price)
 async def offer_price(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 100, phone=False):
+        return
     await state.update_data(price=message.text)
     await state.set_state(OfferForm.comment)
     await message.answer("Коротко опишите условия: какая техника, подача, что включено. Если без комментария — напишите «без комментария».")
@@ -249,6 +300,8 @@ async def offer_price(message: Message, state: FSMContext) -> None:
 
 @router.message(OfferForm.comment)
 async def offer_comment(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 1500, phone=False):
+        return
     await state.update_data(comment=message.text)
     await state.set_state(OfferForm.phone)
     await message.answer("Оставьте телефон для связи с заказчиком.")
@@ -256,6 +309,8 @@ async def offer_comment(message: Message, state: FSMContext) -> None:
 
 @router.message(OfferForm.phone)
 async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not await valid_input(message, 32, phone=True):
+        return
     data = await state.get_data()
     lead = await get_lead(int(data["lead_id"]))
     if not lead or lead["status"] != "published":
@@ -271,49 +326,92 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         f"Условия: {data['comment']}\n"
         f"Телефон: {message.text}"
     )
-    await bot.send_message(lead["customer_id"], "По вашей заявке появился отклик:\n\n" + offer)
-    for admin_id in settings.admin_ids:
-        await bot.send_message(admin_id, offer)
+    offer_id = await storage.save_offer(
+        lead["id"], message.from_user.id, provider_name, username,
+        data["price"], data["comment"], message.text,
+    )
     await state.clear()
-    await message.answer("✅ Отклик отправлен заказчику. Если он заинтересуется, свяжется с вами напрямую.", reply_markup=main_menu())
+    if offer_id is None:
+        await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu())
+        return
+    delivered = await notify(bot, lead["customer_id"], "По вашей заявке появился отклик:\n\n" + offer)
+    await storage.mark_offer(offer_id, "sent" if delivered else "unconfirmed")
+    for admin_id in settings.admin_ids:
+        await notify(bot, admin_id, offer + ("" if delivered else "\n⚠️ Доставка заказчику не подтверждена. Отклик сохранён."))
+    await message.answer(
+        "✅ Отклик сохранён и отправлен заказчику." if delivered else
+        "Отклик сохранён. Доставка заказчику не подтверждена, требуется проверка диспетчера.",
+        reply_markup=main_menu(),
+    )
+
+
+async def admin_lead_id(callback: CallbackQuery, prefix: str):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return None
+    lead_id = storage.parse_id(callback.data, prefix)
+    if lead_id is None:
+        await callback.answer("Некорректная заявка", show_alert=True)
+    return lead_id
 
 
 @router.callback_query(F.data.startswith("publish:"))
 async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    lead_id = await admin_lead_id(callback, "publish:")
+    if lead_id is None:
         return
-    lead_id = int(callback.data.split(":")[1])
+    if not await storage.transition(lead_id, "new", "publishing"):
+        await callback.answer("Заявка уже обработана или ожидает проверки", show_alert=True)
+        return
+    try:
+        await callback.answer("Публикуем заявку")
+    except TelegramAPIError:
+        logging.warning("Cannot acknowledge publication callback for lead %s", lead_id)
     lead = await get_lead(lead_id)
-    if not lead or lead["status"] != "new":
-        await callback.answer("Заявка уже обработана", show_alert=True)
-        return
     markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
         text="🚜 Откликнуться",
         url=f"https://t.me/{settings.bot_username}?start=lead_{lead_id}",
     )]])
-    await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
-    async with aiosqlite.connect("bot.db") as db:
-        await db.execute("UPDATE leads SET status = 'published' WHERE id = ?", (lead_id,))
-        await db.commit()
-    await callback.message.edit_text("✅ Заявка опубликована в канале.\n\n" + lead_text(lead, True))
-    await callback.answer()
+    try:
+        sent = await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        # Explicit rejection: Telegram did not accept the message, retry is safe.
+        await storage.transition(lead_id, "publishing", "new")
+        await notify(bot, callback.from_user.id, "Telegram отклонил публикацию. Проверьте права и повторите.")
+        return
+    except TelegramAPIError:
+        # Timeout/network failure may happen AFTER Telegram accepted the message.
+        # Keep publishing across restarts; never retry blindly and duplicate a lead.
+        await notify(bot, callback.from_user.id,
+                     "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
+        return
+    await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
+    if callback.message:
+        try:
+            await callback.message.edit_text("✅ Заявка опубликована.\n\n" + lead_text(lead, True))
+        except TelegramAPIError:
+            logging.warning("Cannot update moderation message for lead %s", lead_id)
 
 
 @router.callback_query(F.data.startswith("reject:"))
 async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    lead_id = await admin_lead_id(callback, "reject:")
+    if lead_id is None:
         return
-    lead_id = int(callback.data.split(":")[1])
+    if not await storage.transition(lead_id, "new", "rejected"):
+        await callback.answer("Заявка уже обработана", show_alert=True)
+        return
+    try:
+        await callback.answer("Заявка отклонена")
+    except TelegramAPIError:
+        logging.warning("Cannot acknowledge rejection callback for lead %s", lead_id)
     lead = await get_lead(lead_id)
-    if lead:
-        async with aiosqlite.connect("bot.db") as db:
-            await db.execute("UPDATE leads SET status = 'rejected' WHERE id = ?", (lead_id,))
-            await db.commit()
-        await bot.send_message(lead["customer_id"], "К сожалению, сейчас не сможем подобрать исполнителя по этой заявке.")
-    await callback.message.edit_text("❌ Заявка отклонена.")
-    await callback.answer()
+    await notify(bot, lead["customer_id"], "К сожалению, сейчас не сможем подобрать исполнителя по этой заявке.")
+    if callback.message:
+        try:
+            await callback.message.edit_text("❌ Заявка отклонена.")
+        except TelegramAPIError:
+            logging.warning("Cannot update moderation message for lead %s", lead_id)
 
 
 async def main() -> None:
