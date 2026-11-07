@@ -19,6 +19,8 @@ import provider_registry
 import provider_ui
 import provider_dispatch
 import lead_routing
+import moderation_history
+import lead_moderation
 
 load_dotenv()
 
@@ -119,6 +121,7 @@ async def init_db() -> None:
     await storage.init_schema()
     await provider_registry.init_schema(storage.DB_PATH)
     await lead_routing.init_schema(storage.DB_PATH)
+    await moderation_history.init_schema(storage.DB_PATH)
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
@@ -271,6 +274,14 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         lead_id = cursor.lastrowid
     await lead_routing.save(lead_id, data["equipment"], data["region"], data["area"], storage.DB_PATH)
     lead = await get_lead(lead_id)
+    approved = await moderation_history.approved_before(message.from_user.id, storage.DB_PATH)
+    decision = lead_moderation.assess(
+        previously_approved=approved, category=data["equipment"],
+        region=data["region"], area=data["area"], place=data["place"],
+        work_date=data["work_date"], details=data["details"],
+    )
+    # Advisory only: all leads still require administrator approval.
+    logging.info("Lead %s moderation assessment: %s", lead_id, decision.status)
     markup = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}"),
@@ -418,6 +429,7 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
                      "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
         return
     await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
+    await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
     routing = await lead_routing.get(lead_id, storage.DB_PATH)
     if routing:
         recipients = await provider_dispatch.recipients_for_lead(
