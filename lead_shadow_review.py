@@ -4,12 +4,13 @@ from lead_activity import activity
 from auto_publish_shadow import decide, ShadowResult
 
 async def evaluate(customer_id, *, equipment, region, area, place, work_date,
-                   details, db_path="bot.db", enabled=False, now=None):
+                   details, db_path="bot.db", enabled=False, now=None, exclude_lead_id=None):
     try:
         approved = await moderation_history.approved_before(customer_id, db_path)
         count, duplicate = await activity(
             customer_id, equipment=equipment, place=place,
             work_date=work_date, details=details, db_path=db_path, now=now,
+            exclude_lead_id=exclude_lead_id,
         )
         return decide(
             enabled=enabled, approved=approved, duplicate=duplicate,
