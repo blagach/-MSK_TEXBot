@@ -11,6 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -96,13 +97,15 @@ def is_admin(user_id: int) -> bool:
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="🧾 Заказчик"), KeyboardButton(text="🛠 Исполнитель")],
+            [KeyboardButton(text="🏠 Главное меню")],
             [KeyboardButton(text="📝 Оставить заявку")],
             [KeyboardButton(text="🚜 Я исполнитель")],
             [KeyboardButton(text="🚜 Зарегистрироваться как исполнитель")],
             [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="💳 Способы оплаты")],
             [KeyboardButton(text="➕ Добавить технику"), KeyboardButton(text="📋 Моя техника")],
             [KeyboardButton(text="🔔 Уведомления вкл"), KeyboardButton(text="🔕 Уведомления выкл")],
-        ], resize_keyboard=True,
+        ], resize_keyboard=True, is_persistent=True,
     )
 
 
@@ -211,6 +214,24 @@ async def start(message: Message, state: FSMContext) -> None:
         "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
         reply_markup=main_menu(),
     )
+
+
+@router.message(Command("menu"))
+@router.message(F.text == "🏠 Главное меню")
+async def show_main_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Главное меню MSK_TEX. Выберите нужный раздел:", reply_markup=main_menu())
+
+
+@router.message(F.text == "🧾 Заказчик")
+async def customer_menu(message: Message, state: FSMContext) -> None:
+    await lead_start(message, state)
+
+
+@router.message(F.text == "🛠 Исполнитель")
+async def executor_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Раздел исполнителя. Выберите действие:", reply_markup=main_menu())
 
 
 @router.message(F.text == "📝 Оставить заявку")
@@ -541,6 +562,11 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     await init_db()
     bot = Bot(token=settings.token)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="menu", description="Открыть меню"),
+        BotCommand(command="cancel", description="Отменить действие"),
+    ])
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     dp.include_router(provider_ui.router)
