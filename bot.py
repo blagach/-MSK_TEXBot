@@ -388,15 +388,22 @@ async def offer_comment(message: Message, state: FSMContext) -> None:
     await state.update_data(comment=message.text)
     await state.set_state(OfferForm.phone)
     await message.answer(
-        "Оставьте телефон для связи с заказчиком.",
+        "Введите свой телефон, чтобы заказчик мог с вами связаться. "
+        "Например, +7 912 345-67-89, 79123456789 или 89123456789.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
 
 @router.message(OfferForm.phone)
 async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not await valid_input(message, 32, phone=True):
+    raw_phone = (message.text or "").strip()
+    phone = raw_phone.translate(str.maketrans("", "", " ()-\u00a0\u202f"))
+    if phone.startswith("7"):
+        phone = "+" + phone
+    if len(raw_phone) > 32 or not storage.valid_text(phone, 32, phone=True):
+        await message.answer("Введите свой номер. Например, +7 912 345-67-89, 79123456789 или 89123456789.")
         return
+    phone = "+7" + phone[-10:]
     data = await state.get_data()
     lead = await get_lead(int(data["lead_id"]))
     if not lead or lead["status"] != "published":
@@ -410,11 +417,11 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         f"Исполнитель: {provider_name} ({username})\n"
         f"Цена: {data['price']}\n"
         f"Условия: {data['comment']}\n"
-        f"Телефон: {message.text}"
+        f"Телефон: {phone}"
     )
     offer_id = await storage.save_offer(
         lead["id"], message.from_user.id, provider_name, username,
-        data["price"], data["comment"], message.text,
+        data["price"], data["comment"], phone,
     )
     await state.clear()
     if offer_id is None:
