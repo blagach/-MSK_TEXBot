@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
-DB_PATH = "bot.db"
+DB_PATH = "/var/data/bot.db"
 ALLOWED_TRANSITIONS = {("new", "publishing"), ("publishing", "new"), ("new", "rejected")}
 
 
