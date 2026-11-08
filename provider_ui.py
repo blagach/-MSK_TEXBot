@@ -87,8 +87,8 @@ async def provider_payment(message: Message, state: FSMContext):
     if not methods or not methods <= payments.METHODS:
         await message.answer("Укажите формы оплаты точно из списка, через запятую.")
         return
-    await payments.init_schema()
-    await payments.save_provider(message.from_user.id, methods)
+    await payments.init_schema(storage.DB_PATH)
+    await payments.save_provider(message.from_user.id, methods, storage.DB_PATH)
     await state.clear()
     await message.answer("Профиль и формы оплаты сохранены. Добавьте технику через меню.", reply_markup=MENU)
 
