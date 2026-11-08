@@ -63,15 +63,18 @@ MACHINE_STEPS = nav.Form({
 })
 
 
-@router.message(F.text == nav.REGISTER)
-async def begin_register(message: Message, state: FSMContext):
-    await state.clear()
+async def profile_status(telegram_id):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
-            "SELECT 1 FROM provider_profiles WHERE telegram_id=?", (message.from_user.id,)
+            "SELECT blocked FROM provider_profiles WHERE telegram_id=?", (telegram_id,)
         ) as cursor:
-            registered = await cursor.fetchone()
-    if registered:
+            return await cursor.fetchone()
+
+
+@router.message(F.text == nav.REGISTER)
+async def begin_register(message: Message, state: FSMContext):
+    await nav.return_to_provider_menu(state)
+    if await profile_status(message.from_user.id):
         await message.answer("Вы уже зарегистрированы. Ваши данные доступны в «Моём профиле».", reply_markup=MENU)
         return
     await REGISTRATION_STEPS.show(message, state, Register.consent)
@@ -84,7 +87,7 @@ async def consent(message: Message, state: FSMContext):
         await message.answer("Выберите «Да» или «Нет».")
         return
     if answer == "нет":
-        await state.clear()
+        await nav.return_to_provider_menu(state)
         await message.answer("Регистрация не выполнена: согласие не получено.", reply_markup=MENU)
         return
     await REGISTRATION_STEPS.show(message, state, Register.name)
@@ -122,7 +125,7 @@ async def provider_payment(message: Message, state: FSMContext):
     created = await registry.register_new_provider(
         message.from_user.id, data["name"], data["phone"], methods, storage.DB_PATH,
     )
-    await state.clear()
+    await nav.return_to_provider_menu(state)
     text = (
         "Профиль и формы оплаты сохранены. Добавьте технику через меню."
         if created else "Вы уже зарегистрированы. Ваши данные доступны в «Моём профиле»."
@@ -132,7 +135,14 @@ async def provider_payment(message: Message, state: FSMContext):
 
 @router.message(F.text == nav.ADD_MACHINE)
 async def begin_machine(message: Message, state: FSMContext):
-    await state.clear()
+    await nav.return_to_provider_menu(state)
+    status = await profile_status(message.from_user.id)
+    if status is None:
+        await message.answer("Сначала зарегистрируйтесь как исполнитель.", reply_markup=MENU)
+        return
+    if status[0]:
+        await message.answer("Профиль заблокирован. Добавление техники недоступно.", reply_markup=MENU)
+        return
     await MACHINE_STEPS.show(message, state, AddMachine.category)
 
 
@@ -168,7 +178,7 @@ async def machine_region(message: Message, state: FSMContext):
         except ValueError as exc:
             await message.answer(str(exc))
             return
-        await state.clear()
+        await nav.return_to_provider_menu(state)
         await message.answer(f"Техника №{item_id} добавлена: выезд по Москве и всей Московской области.", reply_markup=MENU)
         return
     await MACHINE_STEPS.show(message, state, AddMachine.area)
@@ -185,7 +195,7 @@ async def machine_area(message: Message, state: FSMContext):
     except ValueError as exc:
         await message.answer(str(exc))
         return
-    await state.clear()
+    await nav.return_to_provider_menu(state)
     await message.answer(f"Техника №{item_id} добавлена.", reply_markup=MENU)
 
 
@@ -201,7 +211,7 @@ async def legacy_provider(telegram_id):
 
 @router.message(F.text == nav.MY_MACHINES)
 async def my_machines(message: Message, state: FSMContext):
-    await state.update_data(return_to=nav.PROVIDERS)
+    await nav.remember_screen(state, nav.MY_MACHINES, default_parent=nav.PROVIDERS)
     detail_menu = nav.section_menu()
     items = await registry.list_equipment(message.from_user.id, storage.DB_PATH)
     lines = [
@@ -230,7 +240,8 @@ async def my_machines(message: Message, state: FSMContext):
 
 
 @router.message(F.text.in_({nav.ENABLE_NOTIFICATIONS, nav.DISABLE_NOTIFICATIONS}))
-async def notifications(message: Message):
+async def notifications(message: Message, state: FSMContext):
+    await nav.return_to_provider_menu(state)
     enabled = message.text == nav.ENABLE_NOTIFICATIONS
     changed = await registry.set_notifications(message.from_user.id, enabled, storage.DB_PATH)
     await message.answer(
@@ -242,9 +253,7 @@ async def notifications(message: Message):
 
 @router.message(F.text == nav.PROFILE)
 async def my_profile(message: Message, state: FSMContext):
-    section = (await state.get_data()).get("section")
-    await state.clear()
-    await state.update_data(return_to=nav.ACCOUNT if section == nav.ACCOUNT else nav.PROVIDERS)
+    await nav.remember_screen(state, nav.PROFILE, default_parent=nav.PROVIDERS)
     detail_menu = nav.section_menu()
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -293,7 +302,7 @@ async def my_profile(message: Message, state: FSMContext):
 
 @router.message(F.text == nav.PAYMENT)
 async def my_payment_methods(message: Message, state: FSMContext):
-    await state.update_data(return_to=nav.PROVIDERS)
+    await nav.remember_screen(state, nav.PAYMENT, default_parent=nav.PROVIDERS)
     detail_menu = nav.section_menu()
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(

@@ -1,5 +1,7 @@
 """Drive real aiogram routing against a temporary SQLite DB and a fake session."""
 import os
+import sqlite3
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +34,12 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         db_patch.start()
         self.addCleanup(db_patch.stop)
         await bot.init_db()
+        config = patch.object(bot, "settings", replace(
+            bot.settings, token="123456:TEST", admin_ids={1, 2}, leads_channel_id=-100123,
+            bot_username="OfflineTestBot", test_notification_provider_ids=frozenset(),
+        ))
+        config.start()
+        self.addCleanup(config.stop)
         self.session = AsyncMock(return_value=True)
         self.telegram = Bot("123456:TEST", session=self.session)
         self.user_id = 501
@@ -242,12 +250,14 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_home_discards_every_form_without_writes(self):
         await self.add_lead()
-        for action in (nav.PLACE_REQUEST, nav.REGISTER, nav.ADD_MACHINE, "/start lead_37"):
+        for action in (nav.PLACE_REQUEST, nav.REGISTER, "/start lead_37"):
             await self.send(action)
             self.assertIsNotNone(await self.state().get_state())
             self.assertIn(nav.PLACE_REQUEST, self.labels(await self.send(nav.HOME)))
             self.assertIsNone(await self.state().get_state())
             self.assertEqual(await self.state().get_data(), {})
+        self.assertIn("Сначала зарегистрируйтесь", (await self.send(nav.ADD_MACHINE)).text)
+        self.assertIsNone(await self.state().get_state())
         for table in ("provider_profiles", "provider_equipment", "offers"):
             self.assertEqual(await self.sql(f"SELECT * FROM {table}"), [])
         self.assertEqual(await self.sql("SELECT id FROM leads"), [(37,)])
@@ -272,3 +282,100 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Старый каток", answer.text)
         self.assertEqual(await self.sql("SELECT equipment FROM providers"), [("Старый каток",)])
         self.assertEqual({table: await self.sql(f"SELECT * FROM {table}") for table in tables}, before)
+
+    async def test_back_follows_nested_screens_and_catalog_form(self):
+        await self.send(nav.HELP)
+        await self.send(nav.PROVIDERS)
+        await self.send(nav.PROFILE)
+        self.assertIn("Раздел исполнителя", (await self.send(nav.BACK)).text)
+        self.assertIn("Чтобы заказать технику", (await self.send(nav.BACK)).text)
+        await self.send(nav.MY_REQUESTS)
+        self.assertIn("Чтобы заказать технику", (await self.send(nav.BACK)).text)
+        await self.send(nav.HOME)
+        await self.send(nav.FIND_EQUIPMENT)
+        await self.send(nav.PLACE_REQUEST)
+        self.assertIn("каталогу готовится", (await self.send(nav.BACK)).text)
+
+    async def test_stale_buttons_and_start_preserve_in_progress_form(self):
+        await self.send(nav.PLACE_REQUEST)
+        await self.send("каток")
+        await self.send("Москва")
+        draft = await self.state().get_data()
+        for action in (nav.MY_REQUESTS, nav.REGISTER, nav.ADD_MACHINE, "/start", "/start lead_999"):
+            self.assertIn("Анкета ещё открыта", (await self.send(action)).text)
+            self.assertEqual(await self.state().get_state(), bot.LeadForm.area.state)
+            self.assertEqual(await self.state().get_data(), draft)
+        await self.send("Куркино")
+        self.assertEqual((await self.state().get_data())["area"], "Куркино")
+        self.assertIn("отменено", (await self.send("/cancel")).text)
+
+    async def test_add_machine_for_blocked_provider_stays_in_menu(self):
+        await self.sql(
+            "INSERT INTO provider_profiles VALUES (501, 'Исполнитель', '+79990001122', 1, 1, 'old', 'old')"
+        )
+        self.assertIn("Профиль заблокирован", (await self.send(nav.ADD_MACHINE)).text)
+        self.assertIsNone(await self.state().get_state())
+        self.assertEqual(await self.sql("SELECT id FROM provider_equipment"), [])
+
+    async def test_lead_save_failure_is_atomic_and_keeps_form_for_retry(self):
+        await self.send(nav.PLACE_REQUEST)
+        for value in ("каток", "Москва", "Куркино", "ул. Тестовая", "завтра", "Укатать площадку", payments.CASH):
+            await self.send(value)
+        draft = await self.state().get_data()
+        with patch.object(bot.lead_routing, "write", AsyncMock(side_effect=sqlite3.OperationalError("simulated"))):
+            self.assertIn("Анкета открыта", (await self.send("+79991234567")).text)
+        self.assertEqual(await self.state().get_data(), draft)
+        self.assertEqual(await self.state().get_state(), bot.LeadForm.phone.state)
+        self.assertEqual(await self.sql("SELECT * FROM leads"), [])
+        self.assertEqual(await self.sql("SELECT * FROM lead_payment_preferences"), [])
+        with patch.object(bot.lead_shadow_review, "evaluate", AsyncMock(side_effect=sqlite3.OperationalError("simulated"))):
+            await self.send("+79991234567")
+        self.assertIsNone(await self.state().get_state())
+        self.assertEqual(await self.sql("SELECT status FROM leads"), [("new",)])
+        self.assertEqual(await self.sql("SELECT area FROM lead_routing"), [("Куркино",)])
+        self.assertEqual(await self.sql("SELECT method FROM lead_payment_preferences"), [(payments.CASH,)])
+        notifications = [
+            call.args[1].chat_id for call in self.session.await_args_list
+            if call.args[1].text.startswith("Новая заявка на проверку")
+        ]
+        self.assertEqual(set(notifications), {1, 2})
+
+    async def test_empty_allowlist_cannot_send_provider_notification(self):
+        await self.add_lead()
+        await self.sql("INSERT INTO lead_routing VALUES (37, 'каток', 'Москва', 'Куркино')")
+        await self.sql("INSERT INTO provider_profiles VALUES (501, 'Исполнитель', '+79990001122', 1, 0, 'old', 'old')")
+        await self.sql("INSERT INTO provider_equipment VALUES (8, 501, 'каток', 'ARX 23', 'Москва', 'Куркино', 1, 'old')")
+        lead = await bot.get_lead(37)
+        await bot.notify_test_providers(self.telegram, lead)
+        self.session.assert_not_awaited()
+        self.assertEqual(await self.sql("SELECT * FROM provider_notification_reservations"), [])
+
+    async def test_sqlite_backup_preserves_existing_schema_and_all_rows(self):
+        await self.add_lead()
+        await self.sql("INSERT INTO providers VALUES (501, 'Прежняя анкета', 'каток', 'СЗАО', '+79990001122', 'old')")
+        await self.sql("INSERT INTO provider_profiles VALUES (501, 'Исполнитель', '+79990001122', 0, 1, 'old', 'old')")
+        await self.sql("INSERT INTO provider_equipment VALUES (8, 501, 'каток', 'ARX 23', 'Москва', 'Куркино', 1, 'old')")
+        await self.sql("INSERT INTO provider_payment_preferences VALUES (501, ?)", (payments.VAT,))
+        await self.sql("INSERT INTO lead_payment_preferences VALUES (37, ?)", (payments.CASH,))
+        await self.sql("INSERT INTO lead_routing VALUES (37, 'каток', 'Москва', 'Куркино')")
+        await self.sql("INSERT INTO lead_publications VALUES (37, -100123, 17)")
+        await self.sql("INSERT INTO provider_notification_reservations VALUES (37, 501, 'confirmed')")
+        await self.sql(
+            "INSERT INTO offers VALUES (11, 37, 501, 'Исполнитель', '@offline', "
+            "'25000', 'Тест', '+79990001122', 'old', 'sent')"
+        )
+        source = Path(storage.DB_PATH)
+        copy = source.with_name("backup.sqlite")
+        with sqlite3.connect(source) as original, sqlite3.connect(copy) as backup:
+            original.backup(backup)
+            before = list(original.iterdump())
+            self.assertEqual(list(backup.iterdump()), before)
+        with patch.object(storage, "DB_PATH", str(copy)):
+            await bot.init_db()
+            await bot.init_db()
+            self.assertIn("№37", (await self.send(nav.MY_REQUESTS)).text)
+            self.assertIn("ARX 23", (await self.send(nav.MY_MACHINES)).text)
+            self.assertEqual(await self.sql("PRAGMA integrity_check"), [("ok",)])
+        for path in (source, copy):
+            with sqlite3.connect(path) as db:
+                self.assertEqual(list(db.iterdump()), before)

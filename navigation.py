@@ -64,3 +64,19 @@ class Form:
 
     def contains(self, current):
         return any(step.state == current for step in self.steps)
+
+
+async def remember_screen(state, screen, default_parent=None):
+    history = (await state.get_data()).get("screens") or []
+    if not history and default_parent:
+        history = [default_parent]
+    if screen in history:
+        history = history[:history.index(screen) + 1]
+    else:
+        history = [*history, screen]
+    await state.set_data({"screens": history})
+
+
+async def return_to_provider_menu(state):
+    await state.set_state(None)
+    await remember_screen(state, PROVIDERS)
