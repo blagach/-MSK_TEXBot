@@ -26,6 +26,7 @@ import storage
 import provider_registry
 import provider_ui
 import provider_dispatch
+import notification_reservations
 import lead_routing
 import moderation_history
 import lead_moderation
@@ -42,6 +43,7 @@ class Settings:
     leads_channel_id: int
     payment_url: str
     bot_username: str
+    test_notification_provider_ids: frozenset[int] = frozenset()
 
 
 def read_settings() -> Settings:
@@ -56,6 +58,7 @@ def read_settings() -> Settings:
         int(channel),
         os.getenv("PAYMENT_URL", ""),
         os.getenv("BOT_USERNAME", "MSK_TEXBot").lstrip("@"),
+        frozenset(int(value.strip()) for value in os.getenv("TEST_NOTIFICATION_PROVIDER_IDS", "").split(",") if value.strip()),
     )
 
 
@@ -135,6 +138,7 @@ async def init_db() -> None:
     await lead_routing.init_schema(storage.DB_PATH)
     await moderation_history.init_schema(storage.DB_PATH)
     await payment_preferences.init_schema(storage.DB_PATH)
+    await notification_reservations.init_schema(storage.DB_PATH)
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
@@ -448,6 +452,30 @@ async def admin_lead_id(callback: CallbackQuery, prefix: str):
     return lead_id
 
 
+async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
+    if not settings.test_notification_provider_ids:
+        return
+    routing = await lead_routing.get(lead["id"], storage.DB_PATH)
+    if not routing:
+        return
+    recipients = await provider_dispatch.recipients_for_lead(
+        **routing, db_path=storage.DB_PATH,
+    )
+    text = provider_dispatch.notification_text(
+        lead_id=lead["id"], **routing, work_date=lead["work_date"],
+        details=lead["details"], bot_username=settings.bot_username,
+    )
+    for provider_id in recipients:
+        if provider_id not in settings.test_notification_provider_ids:
+            continue
+        if not await notification_reservations.reserve(lead["id"], provider_id, storage.DB_PATH):
+            continue
+        delivered = await notify(bot, provider_id, text)
+        await notification_reservations.record_outcome(
+            lead["id"], provider_id, "confirmed" if delivered else "uncertain", storage.DB_PATH,
+        )
+
+
 @router.callback_query(F.data.startswith("publish:"))
 async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
     lead_id = await admin_lead_id(callback, "publish:")
@@ -480,13 +508,7 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
         return
     await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
     await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
-    routing = await lead_routing.get(lead_id, storage.DB_PATH)
-    if routing:
-        recipients = await provider_dispatch.recipients_for_lead(
-            **routing, db_path=storage.DB_PATH,
-        )
-        # Never send until delivery idempotency and reconciliation are verified.
-        logging.info("Targeted delivery disabled; %d matching recipients", len(recipients))
+    await notify_test_providers(bot, lead)
     if callback.message:
         try:
             await callback.message.edit_text("✅ Заявка опубликована.\n\n" + lead_text(lead, True))
