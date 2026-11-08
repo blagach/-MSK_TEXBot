@@ -10,7 +10,15 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
@@ -362,7 +370,15 @@ async def offer_price(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(price=message.text)
     await state.set_state(OfferForm.comment)
-    await message.answer("Коротко опишите условия: какая техника, подача, что включено. Если без комментария — напишите «без комментария».")
+    await message.answer(
+        "Коротко опишите условия: какая техника, подача, что включено. "
+        "Если добавить нечего, нажмите «Без комментария».",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Без комментария")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
 
 
 @router.message(OfferForm.comment)
@@ -371,7 +387,10 @@ async def offer_comment(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(comment=message.text)
     await state.set_state(OfferForm.phone)
-    await message.answer("Оставьте телефон для связи с заказчиком.")
+    await message.answer(
+        "Оставьте телефон для связи с заказчиком.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @router.message(OfferForm.phone)
