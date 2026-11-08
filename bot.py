@@ -276,7 +276,10 @@ async def lead_payment(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(payment_method=message.text)
     await state.set_state(LeadForm.phone)
-    await message.answer("Оставьте номер телефона для связи.")
+    await message.answer(
+        "Введите номер телефона для связи без пробелов, скобок и дефисов. "
+        "Например, +79123456789 или 89123456789."
+    )
 
 
 @router.message(LeadForm.phone)
