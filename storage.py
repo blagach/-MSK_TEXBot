@@ -72,12 +72,20 @@ async def finish_publication(lead_id, chat_id, message_id):
         await db.commit()
 
 
+async def has_offer(lead_id, provider_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM offers WHERE lead_id = ? AND provider_id = ?", (lead_id, provider_id),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+
 async def save_offer(lead_id, provider_id, name, username, price, comment, phone):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        cursor = await db.execute("SELECT status FROM leads WHERE id = ?", (lead_id,))
+        cursor = await db.execute("SELECT status, customer_id FROM leads WHERE id = ?", (lead_id,))
         lead = await cursor.fetchone()
-        if not lead or lead[0] != "published":
+        if not lead or lead[0] != "published" or lead[1] == provider_id:
             return None
         cursor = await db.execute(
             """INSERT INTO offers(lead_id, provider_id, provider_name, username, price, comment, phone, created_at)
