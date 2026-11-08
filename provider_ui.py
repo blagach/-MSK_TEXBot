@@ -9,6 +9,7 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 import provider_registry as registry
 import payment_preferences as payments
+import storage
 
 router = Router()
 
@@ -72,7 +73,7 @@ async def phone(message: Message, state: FSMContext):
     try:
         data = await state.get_data()
         await registry.register_provider(message.from_user.id, data["name"], message.text,
-                                         data["consent"])
+                                         data["consent"], db_path=storage.DB_PATH)
     except ValueError as exc:
         await message.answer(str(exc))
         return
@@ -130,7 +131,7 @@ async def machine_region(message: Message, state: FSMContext):
         await state.update_data(area="весь регион")
         data = await state.get_data()
         try:
-            item_id = await registry.add_equipment(message.from_user.id, data["category"], data["description"], data["region"], "весь регион")
+            item_id = await registry.add_equipment(message.from_user.id, data["category"], data["description"], data["region"], "весь регион", db_path=storage.DB_PATH)
         except ValueError as exc:
             await message.answer(str(exc))
             return
@@ -146,7 +147,7 @@ async def machine_area(message: Message, state: FSMContext):
     try:
         item_id = await registry.add_equipment(
             message.from_user.id, data["category"], data["description"],
-            data["region"], message.text,
+            data["region"], message.text, db_path=storage.DB_PATH,
         )
     except ValueError as exc:
         await message.answer(str(exc))
@@ -157,7 +158,7 @@ async def machine_area(message: Message, state: FSMContext):
 
 @router.message(F.text == "📋 Моя техника")
 async def my_machines(message: Message):
-    items = await registry.list_equipment(message.from_user.id)
+    items = await registry.list_equipment(message.from_user.id, storage.DB_PATH)
     if not items:
         await message.answer("Техника пока не добавлена.", reply_markup=MENU)
         return
@@ -170,7 +171,7 @@ async def my_machines(message: Message):
 @router.message(F.text.in_({"🔔 Уведомления вкл", "🔕 Уведомления выкл"}))
 async def notifications(message: Message):
     enabled = message.text == "🔔 Уведомления вкл"
-    changed = await registry.set_notifications(message.from_user.id, enabled)
+    changed = await registry.set_notifications(message.from_user.id, enabled, storage.DB_PATH)
     await message.answer(
         ("Уведомления включены." if enabled else "Уведомления отключены.")
         if changed else "Сначала зарегистрируйтесь; заблокированный профиль недоступен.",
