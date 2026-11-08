@@ -68,6 +68,7 @@ router.message.filter(F.chat.type == "private")
 
 class LeadForm(StatesGroup):
     equipment = State()
+    waste_type = State()
     region = State()
     area = State()
     place = State()
@@ -87,10 +88,23 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
+WASTE_REQUEST = "♻️ Вывоз грунта и стройотходов"
+NO_COMMENT = "Без комментария"
+OFFER_PHONE_PROMPT = (
+    "Введите свой телефон, чтобы заказчик мог с вами связаться. "
+    "Например, +7 912 345-67-89, 79123456789 или 89123456789."
+)
+
+
 LEAD_STEPS = nav.Form({
     LeadForm.equipment: (
-        "Выберите категорию техники:",
+        "Выберите технику или вывоз отходов.",
+        (WASTE_REQUEST,),
         *((item,) for item in sorted(provider_registry.CATEGORIES)),
+    ),
+    LeadForm.waste_type: (
+        "Что нужно вывезти?",
+        *((category,) for category in lead_routing.WASTE_CATEGORIES),
     ),
     LeadForm.region: ("Выберите регион:", ("Москва", "Московская область")),
     LeadForm.area: ("Укажите район или населённый пункт (например, СЗАО или Химки).",),
@@ -113,12 +127,9 @@ OFFER_STEPS = nav.Form({
     OfferForm.comment: (
         "Коротко опишите условия: какая техника, подача, что включено. "
         "Если добавить нечего, нажмите «Без комментария».",
-        ("Без комментария",),
+        (NO_COMMENT,),
     ),
-    OfferForm.phone: (
-        "Введите свой телефон, чтобы заказчик мог с вами связаться. "
-        "Например, +7 912 345-67-89, 79123456789 или 89123456789.",
-    ),
+    OfferForm.phone: (OFFER_PHONE_PROMPT,),
 })
 
 FORMS = (LEAD_STEPS, OFFER_STEPS, provider_ui.REGISTRATION_STEPS, provider_ui.MACHINE_STEPS)
@@ -168,13 +179,19 @@ async def init_db() -> None:
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
+    kind = "Услуга" if lead["equipment"] in lead_routing.WASTE_CATEGORIES else "Техника"
     text = (
         f"📌 Заявка №{lead['id']}\n"
-        f"Техника: {lead['equipment']}\n"
+        f"{kind}: {lead['equipment']}\n"
         f"Место: {lead['place']}\n"
         f"Когда: {lead['work_date']}\n"
         f"Детали: {lead['details']}"
     )
+    fields = lead.keys()
+    if "region" in fields and lead["region"]:
+        text += f"\nРегион: {lead['region']}, {lead['area']}"
+    if "payment_method" in fields and lead["payment_method"]:
+        text += f"\nРасчёт за работу: {lead['payment_method']}"
     if with_phone:
         text += f"\nКонтакт заказчика: {lead['phone']}"
     return text
@@ -183,7 +200,14 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
 async def get_lead(lead_id: int):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)) as cursor:
+        async with db.execute(
+            """SELECT leads.*, lead_routing.region, lead_routing.area,
+                      lead_payment_preferences.method AS payment_method
+               FROM leads
+               LEFT JOIN lead_routing ON lead_routing.lead_id = leads.id
+               LEFT JOIN lead_payment_preferences ON lead_payment_preferences.lead_id = leads.id
+               WHERE leads.id = ?""", (lead_id,),
+        ) as cursor:
             return await cursor.fetchone()
 
 
@@ -239,8 +263,14 @@ async def back(message: Message, state: FSMContext) -> None:
     for form in FORMS:
         if form.contains(current):
             previous = form.previous(current)
+            if current == LeadForm.region.state:
+                equipment = (await state.get_data()).get("equipment")
+                if equipment not in lead_routing.WASTE_CATEGORIES:
+                    previous = LeadForm.equipment
             if previous is None:
                 await finish_navigation(message, state, "Заполнение отменено.")
+            elif previous == LeadForm.details:
+                await show_lead_details(message, state)
             else:
                 await form.show(message, state, previous)
             return
@@ -356,6 +386,12 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
     if not lead or lead["status"] != "published":
         await message.answer("Эта заявка уже недоступна.", reply_markup=main_menu())
         return
+    if lead["customer_id"] == message.from_user.id:
+        await message.answer("На свою заявку откликнуться нельзя.", reply_markup=main_menu())
+        return
+    if await storage.has_offer(lead_id, message.from_user.id):
+        await message.answer("Вы уже откликнулись на эту заявку.", reply_markup=main_menu())
+        return
     await state.update_data(lead_id=lead_id)
     await OFFER_STEPS.show(message, state, OfferForm.price)
 
@@ -367,7 +403,8 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await message.answer(
-        "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
+        "МСК Тех — бесплатная бета. Здесь можно оставить заявку на аренду техники "
+        "или вывоз грунта и стройотходов в Москве и Московской области.",
         reply_markup=main_menu(),
     )
 
@@ -379,8 +416,20 @@ async def lead_start(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.equipment)
 async def lead_equipment(message: Message, state: FSMContext) -> None:
+    if message.text == WASTE_REQUEST:
+        await LEAD_STEPS.show(message, state, LeadForm.waste_type)
+        return
     if message.text not in provider_registry.CATEGORIES:
-        await message.answer("Выберите категорию техники кнопкой из списка.")
+        await LEAD_STEPS.show(message, state, LeadForm.equipment)
+        return
+    await state.update_data(equipment=message.text)
+    await LEAD_STEPS.show(message, state, LeadForm.region)
+
+
+@router.message(LeadForm.waste_type)
+async def lead_waste_type(message: Message, state: FSMContext) -> None:
+    if message.text not in lead_routing.WASTE_CATEGORIES:
+        await LEAD_STEPS.show(message, state, LeadForm.waste_type)
         return
     await state.update_data(equipment=message.text)
     await LEAD_STEPS.show(message, state, LeadForm.region)
@@ -416,6 +465,17 @@ async def lead_date(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
     await state.update_data(work_date=message.text)
+    await show_lead_details(message, state)
+
+
+async def show_lead_details(message: Message, state: FSMContext) -> None:
+    if (await state.get_data()).get("equipment") in lead_routing.WASTE_CATEGORIES:
+        await state.set_state(LeadForm.details)
+        await message.answer(
+            "Укажите объём в м³ или тоннах, нужна ли погрузка и есть ли согласованное место приёма.",
+            reply_markup=nav.section_menu(),
+        )
+        return
     await LEAD_STEPS.show(message, state, LeadForm.details)
 
 
@@ -463,6 +523,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     lead = {
         "id": lead_id, "equipment": data["equipment"], "place": data["place"],
         "work_date": data["work_date"], "details": data["details"], "phone": message.text.strip(),
+        "region": data["region"], "area": data["area"], "payment_method": data.get("payment_method"),
     }
     # Diagnostics are optional. A saved lead must reach moderation even if they fail.
     try:
@@ -486,7 +547,8 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.message(OfferForm.price)
 async def offer_price(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 100, phone=False):
+    if not storage.valid_text(message.text, 100):
+        await OFFER_STEPS.show(message, state, OfferForm.price)
         return
     await state.update_data(price=message.text)
     await OFFER_STEPS.show(message, state, OfferForm.comment)
@@ -494,9 +556,10 @@ async def offer_price(message: Message, state: FSMContext) -> None:
 
 @router.message(OfferForm.comment)
 async def offer_comment(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 1500, phone=False):
+    if not storage.valid_text(message.text, 1500):
+        await OFFER_STEPS.show(message, state, OfferForm.comment)
         return
-    await state.update_data(comment=message.text)
+    await state.update_data(comment=message.text.strip())
     await OFFER_STEPS.show(message, state, OfferForm.phone)
 
 
@@ -507,7 +570,7 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     if phone.startswith("7"):
         phone = "+" + phone
     if len(raw_phone) > 32 or not storage.valid_text(phone, 32, phone=True):
-        await message.answer("Введите свой номер. Например, +7 912 345-67-89, 79123456789 или 89123456789.")
+        await OFFER_STEPS.show(message, state, OfferForm.phone)
         return
     phone = "+7" + phone[-10:]
     data = await state.get_data()
@@ -531,7 +594,9 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     )
     await state.clear()
     if offer_id is None:
-        await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu())
+        duplicate = await storage.has_offer(lead["id"], message.from_user.id)
+        text = "Вы уже откликнулись на эту заявку." if duplicate else "Заявка уже недоступна."
+        await message.answer(text, reply_markup=main_menu())
         return
     delivered = await notify(bot, lead["customer_id"], "По вашей заявке появился отклик:\n\n" + offer)
     await storage.mark_offer(offer_id, "sent" if delivered else "unconfirmed")
@@ -563,6 +628,8 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
     recipients = await provider_dispatch.recipients_for_lead(
         **routing, db_path=storage.DB_PATH,
     )
+    if not recipients:
+        return
     text = provider_dispatch.notification_text(
         lead_id=lead["id"], **routing, work_date=lead["work_date"],
         details=lead["details"], bot_username=settings.bot_username,
