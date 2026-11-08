@@ -45,6 +45,10 @@ async def init_schema():
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL
         )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS lead_rates (
+            lead_id INTEGER PRIMARY KEY REFERENCES leads(id),
+            rate TEXT NOT NULL
+        )""")
         await db.commit()
 
 
@@ -70,6 +74,14 @@ async def finish_publication(lead_id, chat_id, message_id):
             raise ValueError("Lead is not awaiting publication")
         await db.execute("INSERT INTO lead_publications VALUES (?, ?, ?)", (lead_id, chat_id, message_id))
         await db.commit()
+
+
+async def has_offer(lead_id, provider_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM offers WHERE lead_id = ? AND provider_id = ?", (lead_id, provider_id),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
 
 async def save_offer(lead_id, provider_id, name, username, price, comment, phone):

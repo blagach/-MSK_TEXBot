@@ -34,7 +34,7 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
             )""")
             for i in (1, 2, 3):
                 db.execute("""INSERT INTO leads VALUES (?,777,'Заказчик','каток','СЗАО','завтра','Работа','+79990000000','new','now')""", (i,))
-        await storage.init_schema()
+        await bot.init_db()
 
     async def asyncTearDown(self):
         for p in reversed(self.patchers):
@@ -75,3 +75,6 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
             await self.bot_module.publish_lead(self.callback(3), fake_bot)
         self.assertEqual(self.status(3), "published")
         self.assertEqual(fake_bot.send_message.await_count, 1)
+        buttons = fake_bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0]
+        self.assertTrue(buttons[0].url.endswith("?start=lead_3"))
+        self.assertTrue(buttons[1].url.endswith("?start=new_request"))
