@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+import payment_preferences
+
 DEFAULT_DB_PATH = "bot.db"
 PHONE_RE = re.compile(r"(?:\+7|8)[0-9]{10}\Z")
 CATEGORIES = frozenset({
@@ -79,6 +81,29 @@ async def register_provider(telegram_id, name, phone, consent, db_path=DEFAULT_D
                 updated_at=excluded.updated_at""",
             (telegram_id, name, phone, now, now))
         await db.commit()
+
+
+async def register_new_provider(telegram_id, name, phone, methods, db_path=DEFAULT_DB_PATH):
+    """Save a completed signup once, preserving existing profiles and preferences."""
+    if not isinstance(telegram_id, int) or telegram_id <= 0:
+        raise ValueError("Некорректный Telegram ID")
+    name, phone = _validate_name(name), _validate_phone(phone)
+    if not methods or not methods <= payment_preferences.METHODS:
+        raise ValueError("Выберите принимаемые формы оплаты")
+    now = _now()
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""INSERT INTO provider_profiles
+            (telegram_id, display_name, phone, consent_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO NOTHING""",
+            (telegram_id, name, phone, now, now))
+        if cursor.rowcount != 1:
+            return False
+        await db.executemany("""INSERT INTO provider_payment_preferences (provider_id, method)
+            VALUES (?, ?) ON CONFLICT(provider_id, method) DO NOTHING""",
+            [(telegram_id, method) for method in sorted(methods)])
+        await db.commit()
+        return True
 
 
 async def add_equipment(telegram_id, category, description, region, area,

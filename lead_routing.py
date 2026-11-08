@@ -21,17 +21,22 @@ def validate(category, region, area):
         raise ValueError("Укажите район или населённый пункт")
     return category, region, area.strip()
 
-async def save(lead_id, category, region, area, db_path="bot.db"):
+async def write(db, lead_id, category, region, area):
     category, region, area = validate(category, region, area)
     if not isinstance(lead_id, int) or lead_id <= 0:
         raise ValueError("Некорректный номер заявки")
+    await db.execute("""INSERT INTO lead_routing(lead_id,category,region,area)
+        VALUES(?,?,?,?)
+        ON CONFLICT(lead_id) DO UPDATE SET
+        category=excluded.category,region=excluded.region,area=excluded.area""",
+        (lead_id, category, region, area))
+
+
+async def save(lead_id, category, region, area, db_path="bot.db"):
     async with aiosqlite.connect(db_path) as db:
-        await db.execute("""INSERT INTO lead_routing(lead_id,category,region,area)
-            VALUES(?,?,?,?)
-            ON CONFLICT(lead_id) DO UPDATE SET
-            category=excluded.category,region=excluded.region,area=excluded.area""",
-            (lead_id,category,region,area))
+        await write(db, lead_id, category, region, area)
         await db.commit()
+
 
 async def get(lead_id, db_path="bot.db"):
     async with aiosqlite.connect(db_path) as db:

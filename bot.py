@@ -6,23 +6,22 @@ from datetime import datetime, timezone
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
 import storage
+import navigation as nav
+from navigation import main_menu
 import provider_registry
 import provider_ui
 import provider_dispatch
@@ -64,6 +63,7 @@ def read_settings() -> Settings:
 
 settings = read_settings()
 router = Router()
+router.message.filter(F.chat.type == "private")
 
 
 class LeadForm(StatesGroup):
@@ -77,12 +77,6 @@ class LeadForm(StatesGroup):
     phone = State()
 
 
-class ProviderForm(StatesGroup):
-    equipment = State()
-    location = State()
-    phone = State()
-
-
 class OfferForm(StatesGroup):
     price = State()
     comment = State()
@@ -93,17 +87,49 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📝 Оставить заявку")],
-            [KeyboardButton(text="🚜 Я исполнитель")],
-            [KeyboardButton(text="🚜 Зарегистрироваться как исполнитель")],
-            [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="💳 Способы оплаты")],
-            [KeyboardButton(text="➕ Добавить технику"), KeyboardButton(text="📋 Моя техника")],
-            [KeyboardButton(text="🔔 Уведомления вкл"), KeyboardButton(text="🔕 Уведомления выкл")],
-        ], resize_keyboard=True,
-    )
+LEAD_STEPS = nav.Form({
+    LeadForm.equipment: (
+        "Выберите категорию техники:",
+        *((item,) for item in sorted(provider_registry.CATEGORIES)),
+    ),
+    LeadForm.region: ("Выберите регион:", ("Москва", "Московская область")),
+    LeadForm.area: ("Укажите район или населённый пункт (например, СЗАО или Химки).",),
+    LeadForm.place: ("Укажите точный адрес, ориентир или ближайшее метро.",),
+    LeadForm.date: ("На какую дату и время нужна техника?",),
+    LeadForm.details: ("Опишите работу: объём, срок, груз/навесное оборудование, важные условия.",),
+    LeadForm.payment: (
+        "Выберите форму оплаты:",
+        (payment_preferences.CASH,), (payment_preferences.VAT,),
+        (payment_preferences.NO_VAT,), (payment_preferences.ANY,),
+    ),
+    LeadForm.phone: (
+        "Введите номер телефона для связи без пробелов, скобок и дефисов. "
+        "Например, +79123456789 или 89123456789.",
+    ),
+})
+
+OFFER_STEPS = nav.Form({
+    OfferForm.price: ("Укажите вашу цену по заявке. Например: 28 000 ₽ за смену.",),
+    OfferForm.comment: (
+        "Коротко опишите условия: какая техника, подача, что включено. "
+        "Если добавить нечего, нажмите «Без комментария».",
+        ("Без комментария",),
+    ),
+    OfferForm.phone: (
+        "Введите свой телефон, чтобы заказчик мог с вами связаться. "
+        "Например, +7 912 345-67-89, 79123456789 или 89123456789.",
+    ),
+})
+
+FORMS = (LEAD_STEPS, OFFER_STEPS, provider_ui.REGISTRATION_STEPS, provider_ui.MACHINE_STEPS)
+
+LEAD_STATUSES = {
+    "new": "На проверке",
+    "publishing": "Публикация проверяется",
+    "published": "Опубликована",
+    "rejected": "Отклонена",
+    "closed": "Закрыта",
+}
 
 
 async def init_db() -> None:
@@ -179,14 +205,145 @@ async def notify(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
         return False
 
 
+async def finish_navigation(message: Message, state: FSMContext, text: str) -> None:
+    current = await state.get_state()
+    if any(form.contains(current) for form in (provider_ui.REGISTRATION_STEPS, provider_ui.MACHINE_STEPS)):
+        await nav.return_to_provider_menu(state)
+        await message.answer(text, reply_markup=nav.PROVIDER_MENU)
+        return
+    history = (await state.get_data()).get("screens", [])
+    if history:
+        await state.set_state(None)
+        await message.answer(text)
+        await show_section(message, state, history[-1])
+        return
+    await state.clear()
+    await message.answer(text, reply_markup=main_menu())
+
+
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
+    await finish_navigation(message, state, "Заполнение отменено.")
+
+
+@router.message(Command("menu"))
+@router.message(F.text.in_({nav.HOME, "Главное меню"}))
+async def home(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Заполнение отменено.", reply_markup=main_menu())
+    await message.answer("Главное меню", reply_markup=main_menu())
+
+
+@router.message(F.text.in_({nav.BACK, "Назад"}))
+async def back(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    for form in FORMS:
+        if form.contains(current):
+            previous = form.previous(current)
+            if previous is None:
+                await finish_navigation(message, state, "Заполнение отменено.")
+            else:
+                await form.show(message, state, previous)
+            return
+    history = (await state.get_data()).get("screens", [])
+    if len(history) > 1:
+        await state.set_data({"screens": history[:-1]})
+        await show_section(message, state, history[-2])
+    else:
+        await home(message, state)
+
+
+@router.message(
+    StateFilter(*(step for form in FORMS for step in form.steps)),
+    F.text.in_({
+        nav.PLACE_REQUEST, "📝 Оставить заявку", nav.FIND_EQUIPMENT,
+        nav.PROVIDERS, "🚜 Я исполнитель", nav.MY_REQUESTS, nav.ACCOUNT, nav.HELP,
+        nav.REGISTER, nav.PROFILE, nav.PAYMENT, nav.ADD_MACHINE, nav.MY_MACHINES,
+        nav.ENABLE_NOTIFICATIONS, nav.DISABLE_NOTIFICATIONS,
+    }),
+)
+async def keep_active_form(message: Message) -> None:
+    await message.answer("Анкета ещё открыта. Продолжите её или нажмите «Главное меню», чтобы выйти.")
+
+
+@router.message(F.text.in_({nav.PROVIDERS, "🚜 Я исполнитель"}))
+async def providers_menu(message: Message, state: FSMContext) -> None:
+    await nav.remember_screen(state, nav.PROVIDERS)
+    await message.answer(
+        "Раздел исполнителя. Здесь можно зарегистрироваться, добавить технику "
+        "или открыть существующий профиль.",
+        reply_markup=nav.PROVIDER_MENU,
+    )
+
+
+@router.message(F.text == nav.ACCOUNT)
+async def account_menu(message: Message, state: FSMContext) -> None:
+    await nav.remember_screen(state, nav.ACCOUNT)
+    await message.answer("Личный кабинет", reply_markup=nav.ACCOUNT_MENU)
+
+
+@router.message(F.text == nav.FIND_EQUIPMENT)
+async def find_equipment(message: Message, state: FSMContext) -> None:
+    await nav.remember_screen(state, nav.FIND_EQUIPMENT)
+    await message.answer(
+        "Поиск по каталогу готовится. Уже можно разместить заявку на нужную технику.",
+        reply_markup=nav.section_menu((nav.PLACE_REQUEST,)),
+    )
+
+
+@router.message(F.text == nav.HELP)
+async def help_menu(message: Message, state: FSMContext) -> None:
+    await nav.remember_screen(state, nav.HELP)
+    await message.answer(
+        "Чтобы заказать технику, нажмите «Разместить заявку». "
+        "Статус можно посмотреть в «Моих заявках». "
+        "Чтобы предложить свою технику, откройте «Исполнителям». "
+        "Ответы на опубликованные заявки приходят сюда. "
+        "Канал заявок и связь с его администрацией: @zayavki_specteh_msk.",
+        reply_markup=nav.section_menu((nav.MY_REQUESTS, nav.PROVIDERS)),
+    )
+
+
+@router.message(F.text == nav.MY_REQUESTS)
+async def my_requests(message: Message, state: FSMContext) -> None:
+    await nav.remember_screen(state, nav.MY_REQUESTS)
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, equipment, work_date, status FROM leads "
+            "WHERE customer_id=? ORDER BY id DESC LIMIT 10",
+            (message.from_user.id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    if rows:
+        lines = [
+            f"№{lead_id} · {equipment[:120]} · {work_date[:100]} · "
+            f"{LEAD_STATUSES.get(status, 'Статус уточняется')}"
+            for lead_id, equipment, work_date, status in rows
+        ]
+        text = "Ваши заявки (до 10 последних):\n\n" + "\n".join(lines)
+    else:
+        text = "У вас пока нет заявок."
+    await message.answer(text, reply_markup=nav.section_menu((nav.PLACE_REQUEST,)))
+
+
+async def show_section(message: Message, state: FSMContext, section: str) -> None:
+    handlers = {
+        nav.PROVIDERS: providers_menu,
+        nav.ACCOUNT: account_menu,
+        nav.FIND_EQUIPMENT: find_equipment,
+        nav.HELP: help_menu,
+        nav.MY_REQUESTS: my_requests,
+        nav.PROFILE: provider_ui.my_profile,
+        nav.MY_MACHINES: provider_ui.my_machines,
+        nav.PAYMENT: provider_ui.my_payment_methods,
+    }
+    await handlers[section](message, state)
 
 
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await state.get_state():
+        await keep_active_form(message)
+        return
     await state.clear()
     if not command.args or not command.args.startswith("lead_"):
         await message.answer("Ссылка на заявку устарела. Откройте актуальную заявку в канале.", reply_markup=main_menu())
@@ -200,12 +357,14 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
         await message.answer("Эта заявка уже недоступна.", reply_markup=main_menu())
         return
     await state.update_data(lead_id=lead_id)
-    await state.set_state(OfferForm.price)
-    await message.answer("Укажите вашу цену по заявке. Например: 28 000 ₽ за смену.")
+    await OFFER_STEPS.show(message, state, OfferForm.price)
 
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
+    if await state.get_state():
+        await keep_active_form(message)
+        return
     await state.clear()
     await message.answer(
         "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
@@ -213,11 +372,9 @@ async def start(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(F.text == "📝 Оставить заявку")
+@router.message(F.text.in_({nav.PLACE_REQUEST, "📝 Оставить заявку"}))
 async def lead_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await state.set_state(LeadForm.equipment)
-    await message.answer("Выберите категорию техники:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=item)] for item in sorted(provider_registry.CATEGORIES)], resize_keyboard=True))
+    await LEAD_STEPS.show(message, state, LeadForm.equipment)
 
 
 @router.message(LeadForm.equipment)
@@ -226,8 +383,7 @@ async def lead_equipment(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите категорию техники кнопкой из списка.")
         return
     await state.update_data(equipment=message.text)
-    await state.set_state(LeadForm.region)
-    await message.answer("Выберите регион:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Москва"), KeyboardButton(text="Московская область")]], resize_keyboard=True))
+    await LEAD_STEPS.show(message, state, LeadForm.region)
 
 
 @router.message(LeadForm.region)
@@ -236,8 +392,7 @@ async def lead_region(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите Москву или Московскую область.")
         return
     await state.update_data(region=message.text)
-    await state.set_state(LeadForm.area)
-    await message.answer("Укажите район или населённый пункт (например, СЗАО или Химки).")
+    await LEAD_STEPS.show(message, state, LeadForm.area)
 
 
 @router.message(LeadForm.area)
@@ -245,8 +400,7 @@ async def lead_area(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 120):
         return
     await state.update_data(area=message.text.strip())
-    await state.set_state(LeadForm.place)
-    await message.answer("Укажите точный адрес, ориентир или ближайшее метро.")
+    await LEAD_STEPS.show(message, state, LeadForm.place)
 
 
 @router.message(LeadForm.place)
@@ -254,8 +408,7 @@ async def lead_place(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 300, phone=False):
         return
     await state.update_data(place=message.text)
-    await state.set_state(LeadForm.date)
-    await message.answer("На какую дату и время нужна техника?")
+    await LEAD_STEPS.show(message, state, LeadForm.date)
 
 
 @router.message(LeadForm.date)
@@ -263,8 +416,7 @@ async def lead_date(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
     await state.update_data(work_date=message.text)
-    await state.set_state(LeadForm.details)
-    await message.answer("Опишите работу: объём, срок, груз/навесное оборудование, важные условия.")
+    await LEAD_STEPS.show(message, state, LeadForm.details)
 
 
 @router.message(LeadForm.details)
@@ -272,13 +424,7 @@ async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
     await state.update_data(details=message.text)
-    await state.set_state(LeadForm.payment)
-    await message.answer("Выберите форму оплаты:", reply_markup=ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text=payment_preferences.CASH)],
-        [KeyboardButton(text=payment_preferences.VAT)],
-        [KeyboardButton(text=payment_preferences.NO_VAT)],
-        [KeyboardButton(text=payment_preferences.ANY)],
-    ], resize_keyboard=True))
+    await LEAD_STEPS.show(message, state, LeadForm.payment)
 
 
 @router.message(LeadForm.payment)
@@ -287,11 +433,7 @@ async def lead_payment(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите форму оплаты кнопкой из списка.")
         return
     await state.update_data(payment_method=message.text)
-    await state.set_state(LeadForm.phone)
-    await message.answer(
-        "Введите номер телефона для связи без пробелов, скобок и дефисов. "
-        "Например, +79123456789 или 89123456789."
-    )
+    await LEAD_STEPS.show(message, state, LeadForm.phone)
 
 
 @router.message(LeadForm.phone)
@@ -299,73 +441,47 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await valid_input(message, 32, phone=True):
         return
     data = await state.get_data()
-    async with aiosqlite.connect(storage.DB_PATH) as db:
-        cursor = await db.execute(
-            """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (message.from_user.id, message.from_user.full_name, data["equipment"], data["place"], data["work_date"], data["details"], message.text, datetime.now(timezone.utc).isoformat()),
+    created_at = datetime.now(timezone.utc).isoformat()
+    try:
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            cursor = await db.execute(
+                """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (message.from_user.id, message.from_user.full_name, data["equipment"], data["place"],
+                 data["work_date"], data["details"], message.text.strip(), created_at),
+            )
+            lead_id = cursor.lastrowid
+            await payment_preferences.write_lead(db, lead_id, data.get("payment_method", payment_preferences.ANY))
+            await lead_routing.write(db, lead_id, data["equipment"], data["region"], data["area"])
+            await db.commit()
+    except aiosqlite.Error:
+        logging.exception("Could not save lead and its routing")
+        await message.answer("Не удалось сохранить заявку. Анкета открыта. Повторите отправку номера чуть позже.")
+        return
+
+    await state.clear()
+    lead = {
+        "id": lead_id, "equipment": data["equipment"], "place": data["place"],
+        "work_date": data["work_date"], "details": data["details"], "phone": message.text.strip(),
+    }
+    # Diagnostics are optional. A saved lead must reach moderation even if they fail.
+    try:
+        shadow = await lead_shadow_review.evaluate(
+            message.from_user.id, equipment=data["equipment"],
+            region=data["region"], area=data["area"], place=data["place"],
+            work_date=data["work_date"], details=data["details"],
+            db_path=storage.DB_PATH, enabled=False, exclude_lead_id=lead_id,
         )
-        await db.commit()
-        lead_id = cursor.lastrowid
-    await payment_preferences.save_lead(lead_id, data.get("payment_method", payment_preferences.ANY), storage.DB_PATH)
-    await lead_routing.save(lead_id, data["equipment"], data["region"], data["area"], storage.DB_PATH)
-    lead = await get_lead(lead_id)
-    # Shadow evaluation only: never changes the manual approval workflow.
-    shadow = await lead_shadow_review.evaluate(
-        message.from_user.id, equipment=data["equipment"],
-        region=data["region"], area=data["area"], place=data["place"],
-        work_date=data["work_date"], details=data["details"],
-        db_path=storage.DB_PATH, enabled=False, exclude_lead_id=lead_id,
-    )
-    logging.info("Lead %s shadow route: %s", lead_id, shadow.route)
+        logging.info("Lead %s shadow route: %s", lead_id, shadow.route)
+    except aiosqlite.Error:
+        logging.exception("Shadow review unavailable for lead %s", lead_id)
     markup = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}"),
     ]])
     for admin_id in settings.admin_ids:
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
-    await state.clear()
     await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu())
-
-
-@router.message(F.text == "🚜 Я исполнитель")
-async def provider_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await state.set_state(ProviderForm.equipment)
-    await message.answer("Какую технику вы предоставляете?")
-
-
-@router.message(ProviderForm.equipment)
-async def provider_equipment(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 200, phone=False):
-        return
-    await state.update_data(equipment=message.text)
-    await state.set_state(ProviderForm.location)
-    await message.answer("В каких районах работаете?")
-
-
-@router.message(ProviderForm.location)
-async def provider_location(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 300, phone=False):
-        return
-    await state.update_data(location=message.text)
-    await state.set_state(ProviderForm.phone)
-    await message.answer("Оставьте телефон для связи.")
-
-
-@router.message(ProviderForm.phone)
-async def provider_phone(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 32, phone=True):
-        return
-    data = await state.get_data()
-    async with aiosqlite.connect(storage.DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO providers(telegram_id, name, equipment, location, phone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (message.from_user.id, message.from_user.full_name, data["equipment"], data["location"], message.text, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
-    await state.clear()
-    await message.answer("Готово. Вы зарегистрированы как исполнитель. Когда появится подходящая заявка, она будет опубликована в канале.", reply_markup=main_menu())
 
 
 @router.message(OfferForm.price)
@@ -373,16 +489,7 @@ async def offer_price(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
     await state.update_data(price=message.text)
-    await state.set_state(OfferForm.comment)
-    await message.answer(
-        "Коротко опишите условия: какая техника, подача, что включено. "
-        "Если добавить нечего, нажмите «Без комментария».",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Без комментария")]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
+    await OFFER_STEPS.show(message, state, OfferForm.comment)
 
 
 @router.message(OfferForm.comment)
@@ -390,12 +497,7 @@ async def offer_comment(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
     await state.update_data(comment=message.text)
-    await state.set_state(OfferForm.phone)
-    await message.answer(
-        "Введите свой телефон, чтобы заказчик мог с вами связаться. "
-        "Например, +7 912 345-67-89, 79123456789 или 89123456789.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await OFFER_STEPS.show(message, state, OfferForm.phone)
 
 
 @router.message(OfferForm.phone)
@@ -537,14 +639,18 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
             logging.warning("Cannot update moderation message for lead %s", lead_id)
 
 
+def create_dispatcher() -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dp.include_router(router)
+    dp.include_router(provider_ui.router)
+    return dp
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     await init_db()
     bot = Bot(token=settings.token)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    dp.include_router(provider_ui.router)
-    await dp.start_polling(bot)
+    await create_dispatcher().start_polling(bot)
 
 
 if __name__ == "__main__":
