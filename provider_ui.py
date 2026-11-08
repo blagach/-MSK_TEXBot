@@ -1,25 +1,19 @@
-"""Aiogram router for provider self-service. Attach to Dispatcher after init_schema.
-
-This module does not change existing bot.py or deploy anything.
-"""
+"""Aiogram router for provider self-service."""
 from aiogram import F, Router
 import aiosqlite
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message
 
 import provider_registry as registry
 import payment_preferences as payments
 import storage
+import navigation as nav
 
 router = Router()
+router.message.filter(F.chat.type == "private")
 
-MENU = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text="🚜 Зарегистрироваться как исполнитель")],
-    [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="💳 Способы оплаты")],
-    [KeyboardButton(text="➕ Добавить технику"), KeyboardButton(text="📋 Моя техника")],
-    [KeyboardButton(text="🔔 Уведомления вкл"), KeyboardButton(text="🔕 Уведомления выкл")],
-], resize_keyboard=True)
+MENU = nav.PROVIDER_MENU
 
 
 class Register(StatesGroup):
@@ -36,26 +30,64 @@ class AddMachine(StatesGroup):
     area = State()
 
 
-@router.message(F.text == "🚜 Зарегистрироваться как исполнитель")
-async def begin_register(message: Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(Register.consent)
-    await message.answer(
+REGISTRATION_STEPS = nav.Form({
+    Register.consent: (
         "Для регистрации сохраняем имя или название компании, телефон, "
         "Telegram ID и сведения о технике. Телефон не публикуем в канале. "
-        "Согласны на обработку этих данных для подбора заявок? Ответьте «Да» или «Нет»."
-    )
+        "Согласны на обработку этих данных для подбора заявок?",
+        ("Да", "Нет"),
+    ),
+    Register.name: ("Укажите имя или название компании.",),
+    Register.phone: ("Укажите телефон: +7XXXXXXXXXX или 8XXXXXXXXXX.",),
+    Register.payment: (
+        "Какие формы оплаты принимаете? Укажите один или несколько вариантов "
+        "через запятую либо выберите один кнопкой.",
+        *((method,) for method in sorted(payments.METHODS)),
+    ),
+})
+
+MACHINE_STEPS = nav.Form({
+    AddMachine.category: (
+        "Выберите категорию техники:",
+        *((category,) for category in sorted(registry.CATEGORIES)),
+    ),
+    AddMachine.description: ("Опишите машину: марка, модель, грузоподъёмность или характеристики.",),
+    AddMachine.region: (
+        "Выберите зону работы:",
+        ("Москва", "Московская область"), (registry.BOTH_REGIONS,),
+    ),
+    AddMachine.area: (
+        "Укажите район (например, СЗАО или Химки) либо выберите «весь регион».",
+        ("весь регион",),
+    ),
+})
+
+
+@router.message(F.text == nav.REGISTER)
+async def begin_register(message: Message, state: FSMContext):
+    await state.clear()
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM provider_profiles WHERE telegram_id=?", (message.from_user.id,)
+        ) as cursor:
+            registered = await cursor.fetchone()
+    if registered:
+        await message.answer("Вы уже зарегистрированы. Ваши данные доступны в «Моём профиле».", reply_markup=MENU)
+        return
+    await REGISTRATION_STEPS.show(message, state, Register.consent)
 
 
 @router.message(Register.consent)
 async def consent(message: Message, state: FSMContext):
-    if not message.text or message.text.strip().lower() != "да":
-        await state.clear()
-        await message.answer("Регистрация не выполнена: согласие не получено.")
+    answer = (message.text or "").strip().lower()
+    if answer not in {"да", "нет"}:
+        await message.answer("Выберите «Да» или «Нет».")
         return
-    await state.update_data(consent=True)
-    await state.set_state(Register.name)
-    await message.answer("Укажите имя или название компании.")
+    if answer == "нет":
+        await state.clear()
+        await message.answer("Регистрация не выполнена: согласие не получено.", reply_markup=MENU)
+        return
+    await REGISTRATION_STEPS.show(message, state, Register.name)
 
 
 @router.message(Register.name)
@@ -66,21 +98,18 @@ async def name(message: Message, state: FSMContext):
         await message.answer(str(exc))
         return
     await state.update_data(name=name)
-    await state.set_state(Register.phone)
-    await message.answer("Укажите телефон: +7XXXXXXXXXX или 8XXXXXXXXXX.")
+    await REGISTRATION_STEPS.show(message, state, Register.phone)
 
 
 @router.message(Register.phone)
 async def phone(message: Message, state: FSMContext):
     try:
-        data = await state.get_data()
-        await registry.register_provider(message.from_user.id, data["name"], message.text,
-                                         data["consent"], db_path=storage.DB_PATH)
+        phone_number = registry._validate_phone(message.text)
     except ValueError as exc:
         await message.answer(str(exc))
         return
-    await state.set_state(Register.payment)
-    await message.answer("Какие формы оплаты принимаете? Укажите один или несколько вариантов через запятую:\n" + "\n".join(sorted(payments.METHODS)))
+    await state.update_data(phone=phone_number)
+    await REGISTRATION_STEPS.show(message, state, Register.payment)
 
 
 @router.message(Register.payment)
@@ -89,17 +118,22 @@ async def provider_payment(message: Message, state: FSMContext):
     if not methods or not methods <= payments.METHODS:
         await message.answer("Укажите формы оплаты точно из списка, через запятую.")
         return
-    await payments.init_schema(storage.DB_PATH)
-    await payments.save_provider(message.from_user.id, methods, storage.DB_PATH)
+    data = await state.get_data()
+    created = await registry.register_new_provider(
+        message.from_user.id, data["name"], data["phone"], methods, storage.DB_PATH,
+    )
     await state.clear()
-    await message.answer("Профиль и формы оплаты сохранены. Добавьте технику через меню.", reply_markup=MENU)
+    text = (
+        "Профиль и формы оплаты сохранены. Добавьте технику через меню."
+        if created else "Вы уже зарегистрированы. Ваши данные доступны в «Моём профиле»."
+    )
+    await message.answer(text, reply_markup=MENU)
 
 
-@router.message(F.text == "➕ Добавить технику")
+@router.message(F.text == nav.ADD_MACHINE)
 async def begin_machine(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(AddMachine.category)
-    await message.answer("Выберите категорию техники:\n" + "\n".join(sorted(registry.CATEGORIES)))
+    await MACHINE_STEPS.show(message, state, AddMachine.category)
 
 
 @router.message(AddMachine.category)
@@ -108,8 +142,7 @@ async def machine_category(message: Message, state: FSMContext):
         await message.answer("Выберите категорию точно из списка.")
         return
     await state.update_data(category=message.text)
-    await state.set_state(AddMachine.description)
-    await message.answer("Опишите машину: марка, модель, грузоподъёмность или характеристики.")
+    await MACHINE_STEPS.show(message, state, AddMachine.description)
 
 
 @router.message(AddMachine.description)
@@ -118,8 +151,7 @@ async def machine_description(message: Message, state: FSMContext):
         await message.answer("Описание должно содержать от 1 до 200 символов.")
         return
     await state.update_data(description=message.text.strip())
-    await state.set_state(AddMachine.region)
-    await message.answer("Выберите зону работы: Москва, Московская область или Москва и Московская область.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Москва"), KeyboardButton(text="Московская область")], [KeyboardButton(text="Москва и Московская область")]], resize_keyboard=True))
+    await MACHINE_STEPS.show(message, state, AddMachine.region)
 
 
 @router.message(AddMachine.region)
@@ -128,7 +160,6 @@ async def machine_region(message: Message, state: FSMContext):
         await message.answer("Выберите Москву, Московскую область либо оба региона.")
         return
     await state.update_data(region=message.text)
-    await state.set_state(AddMachine.area)
     if message.text == registry.BOTH_REGIONS:
         await state.update_data(area="весь регион")
         data = await state.get_data()
@@ -140,7 +171,7 @@ async def machine_region(message: Message, state: FSMContext):
         await state.clear()
         await message.answer(f"Техника №{item_id} добавлена: выезд по Москве и всей Московской области.", reply_markup=MENU)
         return
-    await message.answer("Укажите район (например, СЗАО или Химки) либо выберите «весь регион».", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="весь регион")]], resize_keyboard=True))
+    await MACHINE_STEPS.show(message, state, AddMachine.area)
 
 
 @router.message(AddMachine.area)
@@ -158,21 +189,49 @@ async def machine_area(message: Message, state: FSMContext):
     await message.answer(f"Техника №{item_id} добавлена.", reply_markup=MENU)
 
 
-@router.message(F.text == "📋 Моя техника")
-async def my_machines(message: Message):
+async def legacy_provider(telegram_id):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT name, phone, equipment, location FROM providers WHERE telegram_id=?",
+            (telegram_id,),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+@router.message(F.text == nav.MY_MACHINES)
+async def my_machines(message: Message, state: FSMContext):
+    await state.update_data(return_to=nav.PROVIDERS)
+    detail_menu = nav.section_menu()
     items = await registry.list_equipment(message.from_user.id, storage.DB_PATH)
-    if not items:
-        await message.answer("Техника пока не добавлена.", reply_markup=MENU)
+    lines = [
+        f"№{item['id']}: {item['category']} — {item['description']}; "
+        f"{item['region']}, {item['area']}; "
+        f"{'активна' if item['active'] else 'неактивна'}"
+        for item in items
+    ]
+    old = await legacy_provider(message.from_user.id)
+    if old:
+        lines.append(f"Из прежней анкеты: {old['equipment'][:500]}; {old['location'][:300]}.")
+    if not lines:
+        await message.answer("Техника пока не добавлена.", reply_markup=detail_menu)
         return
-    lines = [f"№{item['id']}: {item['category']} — {item['description']}; "
-             f"{item['region']}, {item['area']}; "
-             f"{'активна' if item['active'] else 'неактивна'}" for item in items]
-    await message.answer("\n".join(lines), reply_markup=MENU)
+    # Separate chunks fit Telegram's message limit even for a large inventory.
+    chunk = []
+    length = 0
+    for line in lines:
+        if chunk and length + len(line) + 1 > 1800:
+            await message.answer("\n".join(chunk))
+            chunk = []
+            length = 0
+        chunk.append(line)
+        length += len(line) + 1
+    await message.answer("\n".join(chunk), reply_markup=detail_menu)
 
 
-@router.message(F.text.in_({"🔔 Уведомления вкл", "🔕 Уведомления выкл"}))
+@router.message(F.text.in_({nav.ENABLE_NOTIFICATIONS, nav.DISABLE_NOTIFICATIONS}))
 async def notifications(message: Message):
-    enabled = message.text == "🔔 Уведомления вкл"
+    enabled = message.text == nav.ENABLE_NOTIFICATIONS
     changed = await registry.set_notifications(message.from_user.id, enabled, storage.DB_PATH)
     await message.answer(
         ("Уведомления включены." if enabled else "Уведомления отключены.")
@@ -181,8 +240,12 @@ async def notifications(message: Message):
     )
 
 
-@router.message(F.text == "👤 Мой профиль")
-async def my_profile(message: Message):
+@router.message(F.text == nav.PROFILE)
+async def my_profile(message: Message, state: FSMContext):
+    section = (await state.get_data()).get("section")
+    await state.clear()
+    await state.update_data(return_to=nav.ACCOUNT if section == nav.ACCOUNT else nav.PROVIDERS)
+    detail_menu = nav.section_menu()
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -203,7 +266,17 @@ async def my_profile(message: Message):
             methods = [row[0] for row in await cursor.fetchall()]
 
     if not profile:
-        await message.answer("Профиль исполнителя не найден. Сначала зарегистрируйтесь.", reply_markup=MENU)
+        old = await legacy_provider(message.from_user.id)
+        if old:
+            await message.answer(
+                f"Прежняя анкета исполнителя\nИмя: {(old['name'] or 'Не указано')[:120]}\n"
+                f"Телефон: {old['phone']}\n"
+                "Сохранённую технику можно посмотреть в «Моей технике». "
+                "Чтобы добавить карточки техники, пройдите регистрацию в новом разделе.",
+                reply_markup=detail_menu,
+            )
+        else:
+            await message.answer("Профиль исполнителя не найден. Сначала зарегистрируйтесь.", reply_markup=detail_menu)
         return
     payment_text = ", ".join(methods) if methods else "Не указаны"
     await message.answer(
@@ -214,13 +287,14 @@ async def my_profile(message: Message):
         f"Единиц техники: {equipment_count}\n"
         f"Уведомления: {'включены' if profile['notifications_enabled'] else 'выключены'}\n"
         f"Статус: {'заблокирован' if profile['blocked'] else 'активен'}",
-        reply_markup=MENU,
+        reply_markup=detail_menu,
     )
 
 
-@router.message(F.text == "💳 Способы оплаты")
-async def my_payment_methods(message: Message):
-    await payments.init_schema(storage.DB_PATH)
+@router.message(F.text == nav.PAYMENT)
+async def my_payment_methods(message: Message, state: FSMContext):
+    await state.update_data(return_to=nav.PROVIDERS)
+    detail_menu = nav.section_menu()
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
             "SELECT method FROM provider_payment_preferences WHERE provider_id=? ORDER BY method",
@@ -228,9 +302,9 @@ async def my_payment_methods(message: Message):
         ) as cursor:
             methods = [row[0] for row in await cursor.fetchall()]
     if not methods:
-        await message.answer("Способы оплаты пока не указаны.", reply_markup=MENU)
+        await message.answer("Способы оплаты пока не указаны.", reply_markup=detail_menu)
         return
     await message.answer(
         "💳 Принимаемые формы оплаты:\n" + "\n".join(f"• {method}" for method in methods),
-        reply_markup=MENU,
+        reply_markup=detail_menu,
     )
