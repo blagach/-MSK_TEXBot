@@ -75,3 +75,6 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
             await self.bot_module.publish_lead(self.callback(3), fake_bot)
         self.assertEqual(self.status(3), "published")
         self.assertEqual(fake_bot.send_message.await_count, 1)
+        buttons = fake_bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0]
+        self.assertTrue(buttons[0].url.endswith("?start=lead_3"))
+        self.assertTrue(buttons[1].url.endswith("?start=new_request"))

@@ -3,6 +3,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from secrets import token_hex
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
@@ -74,6 +75,7 @@ class LeadForm(StatesGroup):
     place = State()
     date = State()
     details = State()
+    rate = State()
     payment = State()
     phone = State()
 
@@ -90,9 +92,11 @@ def is_admin(user_id: int) -> bool:
 
 WASTE_REQUEST = "♻️ Вывоз грунта и стройотходов"
 NO_COMMENT = "Без комментария"
+NEW_REQUEST_LINK = "new_request"
+RATE_ON_REQUEST = "Жду предложений"
 OFFER_PHONE_PROMPT = (
     "Введите свой телефон, чтобы заказчик мог с вами связаться. "
-    "Например, +7 912 345-67-89, 79123456789 или 89123456789."
+    "Начните с +7, 7 или 8. Пробелы, скобки и дефисы допустимы. Например, +7 (912) 345-67-89."
 )
 
 
@@ -111,6 +115,11 @@ LEAD_STEPS = nav.Form({
     LeadForm.place: ("Укажите точный адрес, ориентир или ближайшее метро.",),
     LeadForm.date: ("На какую дату и время нужна техника?",),
     LeadForm.details: ("Опишите работу: объём, срок, груз/навесное оборудование, важные условия.",),
+    LeadForm.rate: (
+        "Укажите ставку за работу, например 500 ₽/м³, 8 000 ₽ за рейс или 25 000 ₽ за смену. "
+        "Если ждёте предложений исполнителей, нажмите кнопку.",
+        (RATE_ON_REQUEST,),
+    ),
     LeadForm.payment: (
         "Выберите форму оплаты:",
         (payment_preferences.CASH,), (payment_preferences.VAT,),
@@ -127,7 +136,6 @@ OFFER_STEPS = nav.Form({
     OfferForm.comment: (
         "Коротко опишите условия: какая техника, подача, что включено. "
         "Если добавить нечего, нажмите «Без комментария».",
-        (NO_COMMENT,),
     ),
     OfferForm.phone: (OFFER_PHONE_PROMPT,),
 })
@@ -190,8 +198,10 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
     fields = lead.keys()
     if "region" in fields and lead["region"]:
         text += f"\nРегион: {lead['region']}, {lead['area']}"
+    if "rate" in fields and lead["rate"]:
+        text += f"\nСтавка: {lead['rate']}"
     if "payment_method" in fields and lead["payment_method"]:
-        text += f"\nРасчёт за работу: {lead['payment_method']}"
+        text += f"\nФорма оплаты: {lead['payment_method']}"
     if with_phone:
         text += f"\nКонтакт заказчика: {lead['phone']}"
     return text
@@ -202,10 +212,11 @@ async def get_lead(lead_id: int):
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """SELECT leads.*, lead_routing.region, lead_routing.area,
-                      lead_payment_preferences.method AS payment_method
+                      lead_payment_preferences.method AS payment_method, lead_rates.rate
                FROM leads
                LEFT JOIN lead_routing ON lead_routing.lead_id = leads.id
                LEFT JOIN lead_payment_preferences ON lead_payment_preferences.lead_id = leads.id
+               LEFT JOIN lead_rates ON lead_rates.lead_id = leads.id
                WHERE leads.id = ?""", (lead_id,),
         ) as cursor:
             return await cursor.fetchone()
@@ -269,6 +280,8 @@ async def back(message: Message, state: FSMContext) -> None:
                     previous = LeadForm.equipment
             if previous is None:
                 await finish_navigation(message, state, "Заполнение отменено.")
+            elif form is OFFER_STEPS:
+                await show_offer_step(message, state, previous)
             elif previous == LeadForm.details:
                 await show_lead_details(message, state)
             else:
@@ -291,7 +304,12 @@ async def back(message: Message, state: FSMContext) -> None:
         nav.ENABLE_NOTIFICATIONS, nav.DISABLE_NOTIFICATIONS,
     }),
 )
-async def keep_active_form(message: Message) -> None:
+async def keep_active_form(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    if OFFER_STEPS.contains(current):
+        step = next(step for step in OFFER_STEPS.steps if step.state == current)
+        await show_offer_step(message, state, step)
+        return
     await message.answer("Анкета ещё открыта. Продолжите её или нажмите «Главное меню», чтобы выйти.")
 
 
@@ -372,9 +390,12 @@ async def show_section(message: Message, state: FSMContext, section: str) -> Non
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
     if await state.get_state():
-        await keep_active_form(message)
+        await keep_active_form(message, state)
         return
     await state.clear()
+    if command.args == NEW_REQUEST_LINK:
+        await lead_start(message, state)
+        return
     if not command.args or not command.args.startswith("lead_"):
         await message.answer("Ссылка на заявку устарела. Откройте актуальную заявку в канале.", reply_markup=main_menu())
         return
@@ -393,13 +414,13 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
         await message.answer("Вы уже откликнулись на эту заявку.", reply_markup=main_menu())
         return
     await state.update_data(lead_id=lead_id)
-    await OFFER_STEPS.show(message, state, OfferForm.price)
+    await show_offer_step(message, state, OfferForm.price)
 
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     if await state.get_state():
-        await keep_active_form(message)
+        await keep_active_form(message, state)
         return
     await state.clear()
     await message.answer(
@@ -484,6 +505,15 @@ async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
     await state.update_data(details=message.text)
+    await LEAD_STEPS.show(message, state, LeadForm.rate)
+
+
+@router.message(LeadForm.rate)
+async def lead_rate(message: Message, state: FSMContext) -> None:
+    if not storage.valid_text(message.text, 100):
+        await LEAD_STEPS.show(message, state, LeadForm.rate)
+        return
+    await state.update_data(rate=message.text.strip())
     await LEAD_STEPS.show(message, state, LeadForm.payment)
 
 
@@ -513,6 +543,8 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
             lead_id = cursor.lastrowid
             await payment_preferences.write_lead(db, lead_id, data.get("payment_method", payment_preferences.ANY))
             await lead_routing.write(db, lead_id, data["equipment"], data["region"], data["area"])
+            if data.get("rate"):
+                await db.execute("INSERT INTO lead_rates (lead_id, rate) VALUES (?, ?)", (lead_id, data["rate"]))
             await db.commit()
     except aiosqlite.Error:
         logging.exception("Could not save lead and its routing")
@@ -524,6 +556,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         "id": lead_id, "equipment": data["equipment"], "place": data["place"],
         "work_date": data["work_date"], "details": data["details"], "phone": message.text.strip(),
         "region": data["region"], "area": data["area"], "payment_method": data.get("payment_method"),
+        "rate": data.get("rate"),
     }
     # Diagnostics are optional. A saved lead must reach moderation even if they fail.
     try:
@@ -545,22 +578,58 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu())
 
 
+async def show_offer_step(message: Message, state: FSMContext, step: State) -> None:
+    prompt, = OFFER_STEPS.steps[step]
+    nonce = token_hex(8)
+    rows = [[
+        InlineKeyboardButton(text=nav.BACK, callback_data=f"offer:back:{nonce}"),
+        InlineKeyboardButton(text=nav.HOME, callback_data=f"offer:home:{nonce}"),
+    ]]
+    if step == OfferForm.comment:
+        rows.insert(0, [InlineKeyboardButton(text=NO_COMMENT, callback_data=f"offer:skip:{nonce}")])
+    await state.set_state(step)
+    await state.update_data(offer_prompt=nonce)
+    await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.regexp(r"^offer:(home|back|skip):[0-9a-f]{16}$"), F.message.chat.type == "private")
+async def offer_navigation(callback: CallbackQuery, state: FSMContext) -> None:
+    _, action, nonce = callback.data.split(":", 2)
+    current = await state.get_state()
+    data = await state.get_data()
+    if (
+        not isinstance(callback.message, Message)
+        or not OFFER_STEPS.contains(current)
+        or nonce != data.get("offer_prompt")
+    ):
+        await callback.answer("Эта кнопка устарела. Используйте последнюю подсказку.", show_alert=True)
+        return
+    await callback.answer()
+    if action == "home":
+        await home(callback.message, state)
+    elif action == "back":
+        await back(callback.message, state)
+    elif action == "skip" and current == OfferForm.comment.state:
+        await state.update_data(comment=NO_COMMENT)
+        await show_offer_step(callback.message, state, OfferForm.phone)
+
+
 @router.message(OfferForm.price)
 async def offer_price(message: Message, state: FSMContext) -> None:
     if not storage.valid_text(message.text, 100):
-        await OFFER_STEPS.show(message, state, OfferForm.price)
+        await show_offer_step(message, state, OfferForm.price)
         return
     await state.update_data(price=message.text)
-    await OFFER_STEPS.show(message, state, OfferForm.comment)
+    await show_offer_step(message, state, OfferForm.comment)
 
 
 @router.message(OfferForm.comment)
 async def offer_comment(message: Message, state: FSMContext) -> None:
     if not storage.valid_text(message.text, 1500):
-        await OFFER_STEPS.show(message, state, OfferForm.comment)
+        await show_offer_step(message, state, OfferForm.comment)
         return
     await state.update_data(comment=message.text.strip())
-    await OFFER_STEPS.show(message, state, OfferForm.phone)
+    await show_offer_step(message, state, OfferForm.phone)
 
 
 @router.message(OfferForm.phone)
@@ -570,7 +639,7 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     if phone.startswith("7"):
         phone = "+" + phone
     if len(raw_phone) > 32 or not storage.valid_text(phone, 32, phone=True):
-        await OFFER_STEPS.show(message, state, OfferForm.phone)
+        await show_offer_step(message, state, OfferForm.phone)
         return
     phone = "+7" + phone[-10:]
     data = await state.get_data()
@@ -662,10 +731,10 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
     except TelegramAPIError:
         logging.warning("Cannot acknowledge publication callback for lead %s", lead_id)
     lead = await get_lead(lead_id)
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-        text="🚜 Откликнуться",
-        url=f"https://t.me/{settings.bot_username}?start=lead_{lead_id}",
-    )]])
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚜 Откликнуться", url=f"https://t.me/{settings.bot_username}?start=lead_{lead_id}"),
+        InlineKeyboardButton(text=nav.PLACE_REQUEST, url=f"https://t.me/{settings.bot_username}?start={NEW_REQUEST_LINK}"),
+    ]])
     try:
         sent = await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
     except (TelegramBadRequest, TelegramForbiddenError):
