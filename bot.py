@@ -88,6 +88,7 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📝 Оставить заявку")],
             [KeyboardButton(text="🚜 Я исполнитель")],
             [KeyboardButton(text="🚜 Зарегистрироваться как исполнитель")],
+            [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="💳 Способы оплаты")],
             [KeyboardButton(text="➕ Добавить технику"), KeyboardButton(text="📋 Моя техника")],
             [KeyboardButton(text="🔔 Уведомления вкл"), KeyboardButton(text="🔕 Уведомления выкл")],
         ], resize_keyboard=True,
