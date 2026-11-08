@@ -2,3 +2,7 @@
 bot.db
 __pycache__/
 .venv/
+*.db-journal
+*.db-wal
+*.db-shm
+work/
