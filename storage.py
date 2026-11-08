@@ -83,9 +83,9 @@ async def has_offer(lead_id, provider_id):
 async def save_offer(lead_id, provider_id, name, username, price, comment, phone):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        cursor = await db.execute("SELECT status, customer_id FROM leads WHERE id = ?", (lead_id,))
+        cursor = await db.execute("SELECT status FROM leads WHERE id = ?", (lead_id,))
         lead = await cursor.fetchone()
-        if not lead or lead[0] != "published" or lead[1] == provider_id:
+        if not lead or lead[0] != "published":
             return None
         cursor = await db.execute(
             """INSERT INTO offers(lead_id, provider_id, provider_name, username, price, comment, phone, created_at)
