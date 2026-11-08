@@ -3,6 +3,7 @@
 This module does not change existing bot.py or deploy anything.
 """
 from aiogram import F, Router
+import aiosqlite
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
@@ -15,6 +16,7 @@ router = Router()
 
 MENU = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🚜 Зарегистрироваться как исполнитель")],
+    [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="💳 Способы оплаты")],
     [KeyboardButton(text="➕ Добавить технику"), KeyboardButton(text="📋 Моя техника")],
     [KeyboardButton(text="🔔 Уведомления вкл"), KeyboardButton(text="🔕 Уведомления выкл")],
 ], resize_keyboard=True)
@@ -175,5 +177,60 @@ async def notifications(message: Message):
     await message.answer(
         ("Уведомления включены." if enabled else "Уведомления отключены.")
         if changed else "Сначала зарегистрируйтесь; заблокированный профиль недоступен.",
+        reply_markup=MENU,
+    )
+
+
+@router.message(F.text == "👤 Мой профиль")
+async def my_profile(message: Message):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT display_name, phone, notifications_enabled, blocked
+               FROM provider_profiles WHERE telegram_id=?""",
+            (message.from_user.id,),
+        ) as cursor:
+            profile = await cursor.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) FROM provider_equipment WHERE provider_id=?",
+            (message.from_user.id,),
+        ) as cursor:
+            equipment_count = (await cursor.fetchone())[0]
+        async with db.execute(
+            "SELECT method FROM provider_payment_preferences WHERE provider_id=? ORDER BY method",
+            (message.from_user.id,),
+        ) as cursor:
+            methods = [row[0] for row in await cursor.fetchall()]
+
+    if not profile:
+        await message.answer("Профиль исполнителя не найден. Сначала зарегистрируйтесь.", reply_markup=MENU)
+        return
+    payment_text = ", ".join(methods) if methods else "Не указаны"
+    await message.answer(
+        "👤 Ваш профиль\n"
+        f"Имя / компания: {profile['display_name']}\n"
+        f"Телефон: {profile['phone']}\n"
+        f"Способы оплаты: {payment_text}\n"
+        f"Единиц техники: {equipment_count}\n"
+        f"Уведомления: {'включены' if profile['notifications_enabled'] else 'выключены'}\n"
+        f"Статус: {'заблокирован' if profile['blocked'] else 'активен'}",
+        reply_markup=MENU,
+    )
+
+
+@router.message(F.text == "💳 Способы оплаты")
+async def my_payment_methods(message: Message):
+    await payments.init_schema(storage.DB_PATH)
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute(
+            "SELECT method FROM provider_payment_preferences WHERE provider_id=? ORDER BY method",
+            (message.from_user.id,),
+        ) as cursor:
+            methods = [row[0] for row in await cursor.fetchall()]
+    if not methods:
+        await message.answer("Способы оплаты пока не указаны.", reply_markup=MENU)
+        return
+    await message.answer(
+        "💳 Принимаемые формы оплаты:\n" + "\n".join(f"• {method}" for method in methods),
         reply_markup=MENU,
     )
