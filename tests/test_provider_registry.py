@@ -1,0 +1,62 @@
+"""Isolated tests for provider registration and matching; no live Telegram calls."""
+import asyncio
+import os
+import tempfile
+import unittest
+
+import provider_registry as registry
+
+
+class ProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.temp.name, "test.sqlite3")
+        await registry.init_schema(self.db)
+
+    async def asyncTearDown(self):
+        self.temp.cleanup()
+
+    async def test_registration_requires_consent(self):
+        with self.assertRaises(ValueError):
+            await registry.register_provider(100, "Компания", "+79991234567", False, self.db)
+
+    async def test_registration_is_idempotent_and_preserves_block(self):
+        await registry.register_provider(100, "Компания", "+79991234567", True, self.db)
+        self.assertTrue(await registry.set_blocked(100, True, admin_id=9, admin_ids={9}, db_path=self.db))
+        await registry.register_provider(100, "Новое имя", "+79991234567", True, self.db)
+        with self.assertRaises(ValueError):
+            await registry.add_equipment(100, "каток", "4 тонны", "Москва", "весь регион", self.db)
+
+    async def test_multiple_equipment_and_targeted_matching(self):
+        await registry.register_provider(100, "Компания", "+79991234567", True, self.db)
+        await registry.add_equipment(100, "каток", "4 тонны", "Москва", "весь регион", self.db)
+        await registry.add_equipment(100, "мини-погрузчик", "Bobcat", "Москва", "СЗАО", self.db)
+        self.assertEqual(len(await registry.list_equipment(100, self.db)), 2)
+        self.assertEqual(await registry.matching_providers("каток", "Москва", "ЦАО", self.db), [100])
+        self.assertEqual(await registry.matching_providers("мини-погрузчик", "Москва", "СЗАО", self.db), [100])
+        self.assertEqual(await registry.matching_providers("мини-погрузчик", "Москва", "ЦАО", self.db), [])
+
+    async def test_notifications_and_blocking(self):
+        await registry.register_provider(100, "Компания", "+79991234567", True, self.db)
+        await registry.add_equipment(100, "каток", "4 тонны", "Москва", "весь регион", self.db)
+        await registry.set_notifications(100, False, self.db)
+        self.assertEqual(await registry.matching_providers("каток", "Москва", "ЦАО", self.db), [])
+        await registry.set_notifications(100, True, self.db)
+        with self.assertRaises(PermissionError):
+            await registry.set_blocked(100, True, admin_id=10, admin_ids={9}, db_path=self.db)
+        await registry.set_blocked(100, True, admin_id=9, admin_ids={9}, db_path=self.db)
+        self.assertEqual(await registry.matching_providers("каток", "Москва", "ЦАО", self.db), [])
+
+    async def test_cannot_edit_someone_elses_equipment(self):
+        await registry.register_provider(100, "Компания", "+79991234567", True, self.db)
+        await registry.register_provider(200, "Другой", "+79991234568", True, self.db)
+        item = await registry.add_equipment(100, "каток", "4 тонны", "Москва", "весь регион", self.db)
+        result = await registry.update_equipment(
+            200, item, category="каток", description="Чужая техника",
+            region="Москва", area="весь регион", db_path=self.db)
+        self.assertFalse(result)
+        self.assertEqual((await registry.list_equipment(100, self.db))[0]["description"], "4 тонны")
+
+
+if __name__ == "__main__":
+    unittest.main()
