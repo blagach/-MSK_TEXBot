@@ -420,7 +420,7 @@ async def lead_equipment(message: Message, state: FSMContext) -> None:
         await LEAD_STEPS.show(message, state, LeadForm.waste_type)
         return
     if message.text not in provider_registry.CATEGORIES:
-        await LEAD_STEPS.show(message, state, LeadForm.equipment)
+        await message.answer("Выберите технику или вывоз отходов кнопкой из списка.")
         return
     await state.update_data(equipment=message.text)
     await LEAD_STEPS.show(message, state, LeadForm.region)
@@ -578,6 +578,10 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     if not lead or lead["status"] != "published":
         await state.clear()
         await message.answer("Заявка уже недоступна.", reply_markup=main_menu())
+        return
+    if lead["customer_id"] == message.from_user.id:
+        await state.clear()
+        await message.answer("На свою заявку откликнуться нельзя.", reply_markup=main_menu())
         return
     provider_name = message.from_user.full_name
     username = f"@{message.from_user.username}" if message.from_user.username else "без username"
