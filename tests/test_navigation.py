@@ -115,7 +115,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.state().get_state())
 
     async def test_lead_every_step_forward_and_back(self):
-        steps = list(bot.LEAD_STEPS.steps)
+        steps = [step for step in bot.LEAD_STEPS.steps if step != bot.LeadForm.waste_type]
         inputs = ["каток", "Москва", "Куркино", "ул. Тестовая", "завтра", "Укатать площадку", payments.CASH]
         await self.assert_step(await self.send("📝 Оставить заявку"), steps[0])
         for value, step in zip(inputs, steps[1:]):
@@ -134,6 +134,35 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(nav.PLACE_REQUEST, self.labels(answer))
         self.assertEqual(await self.sql("SELECT customer_id, status FROM leads"), [(501, "new")])
         self.assertIsNone(await self.state().get_state())
+        self.assertTrue(all(call.args[1].chat_id != bot.settings.leads_channel_id
+                            for call in self.session.await_args_list))
+
+    async def test_waste_requests_reach_moderation_in_both_regions(self):
+        self.assertIn("бесплатная бета", (await self.send("/start")).text)
+        for region, area, category in (
+            ("Москва", "Митино", "Вывоз грунта"),
+            ("Московская область", "Химки", "Вывоз смешанных стройотходов"),
+        ):
+            self.assertIn(bot.WASTE_REQUEST, self.labels(await self.send(nav.PLACE_REQUEST)))
+            await self.assert_step(await self.send(bot.WASTE_REQUEST), bot.LeadForm.waste_type)
+            await self.assert_step(await self.send(category), bot.LeadForm.region)
+            await self.assert_step(await self.send(nav.BACK), bot.LeadForm.waste_type)
+            await self.send(category)
+            for value in (region, area, "ул. Тестовая", "завтра"):
+                answer = await self.send(value)
+            self.assertIn("м³ или тоннах", answer.text)
+            await self.send("60 м³, нужна погрузка")
+            self.assertIn("м³ или тоннах", (await self.send(nav.BACK)).text)
+            for value in ("60 м³, нужна погрузка", payments.VAT, "+79991234567"):
+                await self.send(value)
+            lead_id = (await self.sql("SELECT max(id) FROM leads"))[0][0]
+            lead = await bot.get_lead(lead_id)
+            self.assertEqual(lead["status"], "new")
+            self.assertEqual(lead["equipment"], category)
+            card = bot.lead_text(lead)
+            self.assertIn(f"{region}, {area}", card)
+            self.assertIn(payments.VAT, card)
+            self.assertNotIn(lead["phone"], card)
         self.assertTrue(all(call.args[1].chat_id != bot.settings.leads_channel_id
                             for call in self.session.await_args_list))
 
@@ -168,20 +197,24 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_old_offer_link_navigation_and_no_duplicate(self):
         await self.add_lead()
-        await self.assert_step(await self.send("/start lead_37"), bot.OfferForm.price)
-        await self.assert_step(await self.send("25000"), bot.OfferForm.comment)
-        await self.assert_step(await self.send("Без комментария"), bot.OfferForm.phone)
+        self.assertIn("свою заявку", (await self.send("/start lead_37")).text)
+        await self.add_lead(38, owner=999)
+        await self.assert_step(await self.send("/start lead_38"), bot.OfferForm.price)
+        comment = await self.send("25000")
+        await self.assert_step(comment, bot.OfferForm.comment)
+        self.assertIn(bot.NO_COMMENT, self.labels(comment))
+        await self.assert_step(await self.send(bot.NO_COMMENT), bot.OfferForm.phone)
+        await self.assert_step(await self.send("123"), bot.OfferForm.phone)
         await self.assert_step(await self.send(nav.BACK), bot.OfferForm.comment)
         await self.assert_step(await self.send(nav.BACK), bot.OfferForm.price)
         self.assertIn("отменено", (await self.send(nav.BACK)).text)
-        for _ in range(2):
-            await self.send("/start lead_37")
-            await self.send("25000")
-            await self.send("Без комментария")
-            answer = await self.send("89991234567")
-            self.assertIn(nav.PLACE_REQUEST, self.labels(answer))
-        self.assertIn("отклик уже сохранён", answer.text)
-        self.assertEqual(await self.sql("SELECT lead_id, phone FROM offers"), [(37, "+79991234567")])
+        await self.send("/start lead_38")
+        await self.send("25000")
+        await self.send(bot.NO_COMMENT)
+        answer = await self.send("+7 (999) 123-45-67")
+        self.assertIn(nav.PLACE_REQUEST, self.labels(answer))
+        self.assertIn("уже откликнулись", (await self.send("/start lead_38")).text)
+        self.assertEqual(await self.sql("SELECT lead_id, phone FROM offers"), [(38, "+79991234567")])
         for invalid in ("/start lead_1000", "/start lead_bad", "/start obsolete"):
             self.assertIn(nav.PLACE_REQUEST, self.labels(await self.send(invalid)))
 
@@ -249,7 +282,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("включены", (await self.send(nav.ENABLE_NOTIFICATIONS)).text)
 
     async def test_home_discards_every_form_without_writes(self):
-        await self.add_lead()
+        await self.add_lead(owner=999)
         for action in (nav.PLACE_REQUEST, nav.REGISTER, "/start lead_37"):
             await self.send(action)
             self.assertIsNotNone(await self.state().get_state())
