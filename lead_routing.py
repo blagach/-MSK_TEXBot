@@ -2,6 +2,15 @@
 import aiosqlite
 import provider_registry
 
+WASTE_CATEGORIES = (
+    "Вывоз грунта",
+    "Вывоз бетона, кирпича и асфальта",
+    "Вывоз смешанных стройотходов",
+    "Вывоз древесных отходов",
+    "Вывоз отходов — состав уточняется",
+)
+
+
 async def init_schema(db_path="bot.db"):
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS lead_routing (
@@ -13,7 +22,7 @@ async def init_schema(db_path="bot.db"):
         await db.commit()
 
 def validate(category, region, area):
-    if category not in provider_registry.CATEGORIES:
+    if category not in provider_registry.CATEGORIES and category not in WASTE_CATEGORIES:
         raise ValueError("Выберите категорию техники из списка")
     if region not in provider_registry.REGIONS:
         raise ValueError("Выберите Москву или Московскую область")
