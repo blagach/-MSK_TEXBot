@@ -34,7 +34,7 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
             )""")
             for i in (1, 2, 3):
                 db.execute("""INSERT INTO leads VALUES (?,777,'Заказчик','каток','СЗАО','завтра','Работа','+79990000000','new','now')""", (i,))
-        await storage.init_schema()
+        await bot.init_db()
 
     async def asyncTearDown(self):
         for p in reversed(self.patchers):
