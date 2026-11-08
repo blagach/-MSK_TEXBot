@@ -86,7 +86,8 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 async def init_db() -> None:
-    async with aiosqlite.connect("bot.db") as db:
+    storage.prepare_database()
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS leads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,7 +131,7 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
 
 
 async def get_lead(lead_id: int):
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)) as cursor:
             return await cursor.fetchone()
@@ -198,7 +199,7 @@ async def lead_details(message: Message, state: FSMContext) -> None:
 @router.message(LeadForm.phone)
 async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -240,7 +241,7 @@ async def provider_location(message: Message, state: FSMContext) -> None:
 @router.message(ProviderForm.phone)
 async def provider_phone(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO providers(telegram_id, name, equipment, location, phone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (message.from_user.id, message.from_user.full_name, data["equipment"], data["location"], message.text, datetime.now(timezone.utc).isoformat()),
@@ -303,7 +304,7 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
         url=f"https://t.me/{settings.bot_username}?start=lead_{lead_id}",
     )]])
     await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
-    async with aiosqlite.connect("bot.db") as db:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
         await db.execute("UPDATE leads SET status = 'published' WHERE id = ?", (lead_id,))
         await db.commit()
     await callback.message.edit_text("✅ Заявка опубликована в канале.\n\n" + lead_text(lead, True))
@@ -318,7 +319,7 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
     lead_id = int(callback.data.split(":")[1])
     lead = await get_lead(lead_id)
     if lead:
-        async with aiosqlite.connect("bot.db") as db:
+        async with aiosqlite.connect(storage.DB_PATH) as db:
             await db.execute("UPDATE leads SET status = 'rejected' WHERE id = ?", (lead_id,))
             await db.commit()
         await bot.send_message(lead["customer_id"], "К сожалению, сейчас не сможем подобрать исполнителя по этой заявке.")
