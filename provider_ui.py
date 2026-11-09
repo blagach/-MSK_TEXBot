@@ -1,12 +1,11 @@
-"""Aiogram router for provider self-service. Attach to Dispatcher after init_schema.
-
-This module does not change existing bot.py or deploy anything.
-"""
+"""Aiogram router for provider self-service. Attach after init_schema."""
 from aiogram import F, Router
 import aiosqlite
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+
+from draft_storage import draft_slot
 
 import provider_registry as registry
 import payment_preferences as payments
@@ -14,12 +13,56 @@ import storage
 
 router = Router()
 
-MENU = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text="🚜 Зарегистрироваться как исполнитель")],
-    [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="💳 Способы оплаты")],
-    [KeyboardButton(text="➕ Добавить технику"), KeyboardButton(text="📋 Моя техника")],
-    [KeyboardButton(text="🔔 Уведомления вкл"), KeyboardButton(text="🔕 Уведомления выкл")],
-], resize_keyboard=True)
+AVAILABLE_LEADS = "🔎 Смотреть заявки"
+MY_OFFERS = "📋 Мои отклики"
+OFFER_DRAFT = "▶️ Продолжить отклик"
+HOME = "🏠 Главное меню"
+REGISTER_PROVIDER = "🚜 Зарегистрироваться как исполнитель"
+LEGACY_PROVIDER = "🛠 Обновить быструю регистрацию"
+MY_TECH = "🚜 Моя техника"
+PAYMENT_METHOD = "💳 Способ оплаты"
+NOTIFICATIONS_ON = "🔔 Уведомления включены"
+NOTIFICATIONS_OFF = "🔕 Уведомления выключены"
+NOTIFICATION_ACTIONS = {
+    NOTIFICATIONS_ON: False,
+    NOTIFICATIONS_OFF: True,
+    "🔔 Уведомления вкл": True,
+    "🔕 Уведомления выкл": False,
+}
+
+
+def section_keyboard(*rows: tuple[str, ...]) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=label) for label in row] for row in rows],
+        resize_keyboard=True, is_persistent=True,
+    )
+
+
+async def executor_keyboard(user_id: int, state: FSMContext) -> ReplyKeyboardMarkup:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute(
+            """SELECT (SELECT notifications_enabled FROM provider_profiles WHERE telegram_id=?),
+                      EXISTS(SELECT 1 FROM providers WHERE telegram_id=?)""", (user_id, user_id),
+        ) as cursor:
+            notifications_enabled, legacy = await cursor.fetchone()
+
+    draft = (OFFER_DRAFT,) if await draft_slot(state, "offer").get_state() else ()
+    if notifications_enabled is not None:
+        notifications = NOTIFICATIONS_ON if notifications_enabled else NOTIFICATIONS_OFF
+        rows = [
+            (AVAILABLE_LEADS, MY_OFFERS),
+            ("👤 Мой профиль", MY_TECH),
+            ("➕ Добавить технику", PAYMENT_METHOD),
+            (notifications, *draft),
+        ]
+    else:
+        rows = [(AVAILABLE_LEADS, MY_OFFERS)] if legacy else []
+        rows.append((REGISTER_PROVIDER,))
+        if legacy:
+            rows.append((LEGACY_PROVIDER,))
+        if draft:
+            rows.append(draft)
+    return section_keyboard(*rows, (HOME,))
 
 
 class Register(StatesGroup):
@@ -36,7 +79,7 @@ class AddMachine(StatesGroup):
     area = State()
 
 
-@router.message(F.text == "🚜 Зарегистрироваться как исполнитель")
+@router.message(F.text == REGISTER_PROVIDER)
 async def begin_register(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(Register.consent)
@@ -92,7 +135,7 @@ async def provider_payment(message: Message, state: FSMContext):
     await payments.init_schema(storage.DB_PATH)
     await payments.save_provider(message.from_user.id, methods, storage.DB_PATH)
     await state.clear()
-    await message.answer("Профиль и формы оплаты сохранены. Добавьте технику через меню.", reply_markup=MENU)
+    await message.answer("Профиль и формы оплаты сохранены. Добавьте технику через меню.", reply_markup=await executor_keyboard(message.from_user.id, state))
 
 
 @router.message(F.text == "➕ Добавить технику")
@@ -138,7 +181,7 @@ async def machine_region(message: Message, state: FSMContext):
             await message.answer(str(exc))
             return
         await state.clear()
-        await message.answer(f"Техника №{item_id} добавлена: выезд по Москве и всей Московской области.", reply_markup=MENU)
+        await message.answer(f"Техника №{item_id} добавлена: выезд по Москве и всей Московской области.", reply_markup=await executor_keyboard(message.from_user.id, state))
         return
     await message.answer("Укажите район (например, СЗАО или Химки) либо выберите «весь регион».", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="весь регион")]], resize_keyboard=True))
 
@@ -155,38 +198,39 @@ async def machine_area(message: Message, state: FSMContext):
         await message.answer(str(exc))
         return
     await state.clear()
-    await message.answer(f"Техника №{item_id} добавлена.", reply_markup=MENU)
+    await message.answer(f"Техника №{item_id} добавлена.", reply_markup=await executor_keyboard(message.from_user.id, state))
 
 
-@router.message(F.text == "📋 Моя техника")
-async def my_machines(message: Message):
+@router.message(F.text.in_({MY_TECH, "📋 Моя техника"}))
+async def my_machines(message: Message, state: FSMContext):
     items = await registry.list_equipment(message.from_user.id, storage.DB_PATH)
     if not items:
-        await message.answer("Техника пока не добавлена.", reply_markup=MENU)
+        await message.answer("Техника пока не добавлена.", reply_markup=await executor_keyboard(message.from_user.id, state))
         return
     lines = [f"№{item['id']}: {item['category']} — {item['description']}; "
              f"{item['region']}, {item['area']}; "
              f"{'активна' if item['active'] else 'неактивна'}" for item in items]
-    await message.answer("\n".join(lines), reply_markup=MENU)
+    await message.answer("\n".join(lines), reply_markup=await executor_keyboard(message.from_user.id, state))
 
 
-@router.message(F.text.in_({"🔔 Уведомления вкл", "🔕 Уведомления выкл"}))
-async def notifications(message: Message):
-    enabled = message.text == "🔔 Уведомления вкл"
+@router.message(F.text.in_(NOTIFICATION_ACTIONS))
+async def notifications(message: Message, state: FSMContext):
+    enabled = NOTIFICATION_ACTIONS[message.text]
     changed = await registry.set_notifications(message.from_user.id, enabled, storage.DB_PATH)
     await message.answer(
         ("Уведомления включены." if enabled else "Уведомления отключены.")
         if changed else "Сначала зарегистрируйтесь; заблокированный профиль недоступен.",
-        reply_markup=MENU,
+        reply_markup=await executor_keyboard(message.from_user.id, state),
     )
 
 
 @router.message(F.text == "👤 Мой профиль")
-async def my_profile(message: Message):
+async def my_profile(message: Message, state: FSMContext):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            """SELECT display_name, phone, notifications_enabled, blocked
+            """SELECT display_name, phone, notifications_enabled, blocked,
+                      EXISTS(SELECT 1 FROM providers WHERE providers.telegram_id=provider_profiles.telegram_id) AS legacy
                FROM provider_profiles WHERE telegram_id=?""",
             (message.from_user.id,),
         ) as cursor:
@@ -203,7 +247,7 @@ async def my_profile(message: Message):
             methods = [row[0] for row in await cursor.fetchall()]
 
     if not profile:
-        await message.answer("Профиль исполнителя не найден. Сначала зарегистрируйтесь.", reply_markup=MENU)
+        await message.answer("Профиль исполнителя не найден. Сначала зарегистрируйтесь.", reply_markup=await executor_keyboard(message.from_user.id, state))
         return
     payment_text = ", ".join(methods) if methods else "Не указаны"
     await message.answer(
@@ -214,12 +258,14 @@ async def my_profile(message: Message):
         f"Единиц техники: {equipment_count}\n"
         f"Уведомления: {'включены' if profile['notifications_enabled'] else 'выключены'}\n"
         f"Статус: {'заблокирован' if profile['blocked'] else 'активен'}",
-        reply_markup=MENU,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=LEGACY_PROVIDER, callback_data="provider_legacy:edit"),
+        ]]) if profile["legacy"] else await executor_keyboard(message.from_user.id, state),
     )
 
 
-@router.message(F.text == "💳 Способы оплаты")
-async def my_payment_methods(message: Message):
+@router.message(F.text.in_({PAYMENT_METHOD, "💳 Способы оплаты"}))
+async def my_payment_methods(message: Message, state: FSMContext):
     await payments.init_schema(storage.DB_PATH)
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
@@ -228,9 +274,9 @@ async def my_payment_methods(message: Message):
         ) as cursor:
             methods = [row[0] for row in await cursor.fetchall()]
     if not methods:
-        await message.answer("Способы оплаты пока не указаны.", reply_markup=MENU)
+        await message.answer("Способы оплаты пока не указаны.", reply_markup=await executor_keyboard(message.from_user.id, state))
         return
     await message.answer(
         "💳 Принимаемые формы оплаты:\n" + "\n".join(f"• {method}" for method in methods),
-        reply_markup=MENU,
+        reply_markup=await executor_keyboard(message.from_user.id, state),
     )

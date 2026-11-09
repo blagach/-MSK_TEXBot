@@ -348,20 +348,80 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.state.get_data())["lead_id"], lead_id)
         self.assertEqual(await self.state.get_state(), bot.OfferForm.price.state)
 
-    async def test_role_menus_keep_existing_provider_features_and_scope_personal_lists(self):
-        self.assertEqual([row[0].text for row in bot.main_menu().keyboard], [bot.CUSTOMER_ROLE, bot.PROVIDER_ROLE])
+    def keyboard_rows(self):
+        markup = self.message.answer.await_args.kwargs["reply_markup"]
+        return [[button.text for button in row] for row in markup.keyboard]
+
+    async def test_compact_menus_keep_drafts_and_notification_setting_after_reopen(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
+        await bot.lead_start(self.message, self.state)
+        await self.pick_lead_option(0)
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_1"))
+        self.message.text = "28000"
+        await bot.offer_price(self.message, self.state)
         await bot.executor_menu(self.message, self.state)
-        keyboard = self.message.answer.await_args.kwargs["reply_markup"]
-        self.assertEqual([row[0].text for row in keyboard.keyboard], [bot.REGISTER_PROVIDER, bot.OFFER_HOME])
+        self.assertEqual(self.keyboard_rows()[3:], [
+            ["🔔 Уведомления включены", "▶️ Продолжить отклик"], ["🏠 Главное меню"],
+        ])
+        self.message.text = "🔔 Уведомления включены"
+        await bot.provider_ui.notifications(self.message, self.state)
+        self.assertEqual(self.keyboard_rows()[3], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
+        await bot.provider_ui.notifications(self.message, self.state)
+        self.assertEqual(self.keyboard_rows()[3][0], "🔕 Уведомления выключены")
+
+        self.state = self.reopen_sqlite_state()
+        await bot.customer_menu(self.message, self.state)
+        self.assertEqual(self.keyboard_rows(), [
+            ["📝 Оставить заявку", "📋 Мои заявки"], ["▶️ Продолжить заявку"], ["🏠 Главное меню"],
+        ])
+        self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.region.state)
+        await bot.executor_menu(self.message, self.state)
+        self.assertEqual(self.keyboard_rows()[3], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
+        self.assertEqual((await bot.draft_slot(self.state, "offer").get_data())["price"], "28000")
+        self.message.text = "🔕 Уведомления выключены"
+        await bot.provider_ui.notifications(self.message, self.state)
+        self.assertEqual(self.keyboard_rows()[3][0], "🔔 Уведомления включены")
+        for handler in (bot.provider_ui.my_profile, bot.provider_ui.my_machines, bot.provider_ui.my_payment_methods):
+            await handler(self.message, self.state)
+            self.assertEqual(self.keyboard_rows()[3], ["🔔 Уведомления включены", "▶️ Продолжить отклик"])
+
+    async def test_legacy_registration_remains_accessible_with_compact_menu(self):
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO providers VALUES (20, 'Профиль', 'кран', 'Москва', '+79990000001', 'now')"
+            )
+            await db.commit()
+        await bot.executor_menu(self.message, self.state)
+        self.assertIn([bot.provider_ui.LEGACY_PROVIDER], self.keyboard_rows())
         await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
         await bot.executor_menu(self.message, self.state)
-        labels = [row[0].text for row in self.message.answer.await_args.kwargs["reply_markup"].keyboard]
-        for label in (bot.AVAILABLE_LEADS, bot.MY_OFFERS, "👤 Мой профиль", "💳 Способы оплаты",
-                      "➕ Добавить технику", "📋 Моя техника", "🔔 Уведомления вкл", "🔕 Уведомления выкл"):
-            self.assertIn(label, labels)
-        self.assertNotIn(bot.REGISTER_PROVIDER, labels)
+        self.assertNotIn([bot.provider_ui.LEGACY_PROVIDER], self.keyboard_rows())
+        await bot.provider_ui.my_profile(self.message, self.state)
+        button = self.message.answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(button.text, bot.provider_ui.LEGACY_PROVIDER)
+        callback = self.step("legacy", 200)
+        callback.data = button.callback_data
+        await bot.edit_legacy_provider(callback, self.state)
+        self.assertEqual(await self.state.get_state(), bot.ProviderForm.equipment.state)
+
+    async def test_role_menus_keep_existing_provider_features_and_scope_personal_lists(self):
+        self.assertEqual([[button.text for button in row] for row in bot.main_menu().keyboard],
+                         [[bot.CUSTOMER_ROLE, bot.PROVIDER_ROLE]])
+        await bot.executor_menu(self.message, self.state)
+        self.assertEqual(self.keyboard_rows(), [[bot.provider_ui.REGISTER_PROVIDER], [bot.OFFER_HOME]])
+        await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
+        await bot.executor_menu(self.message, self.state)
+        self.assertEqual(self.keyboard_rows(), [
+            ["🔎 Смотреть заявки", "📋 Мои отклики"],
+            ["👤 Мой профиль", "🚜 Моя техника"],
+            ["➕ Добавить технику", "💳 Способ оплаты"],
+            ["🔔 Уведомления включены"],
+            ["🏠 Главное меню"],
+        ])
         await bot.customer_menu(self.message, self.state)
-        self.assertIn(bot.MY_LEADS, [row[0].text for row in self.message.answer.await_args.kwargs["reply_markup"].keyboard])
+        self.assertEqual(self.keyboard_rows(), [["📝 Оставить заявку", "📋 Мои заявки"], ["🏠 Главное меню"]])
         await bot.my_leads(self.message, self.state)
         self.assertIn("пока нет", self.message.answer.await_args.args[0])
         await storage.save_offer(1, 90, "Другой", "", "Скрытая цена", "", "+79990000003")

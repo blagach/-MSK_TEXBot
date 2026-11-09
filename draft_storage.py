@@ -1,10 +1,16 @@
 """SQLite-backed FSM for the isolated Render worker."""
 import json
+from dataclasses import replace
 from typing import Any, Mapping
 
 import aiosqlite
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import BaseStorage, DefaultKeyBuilder, StateType, StorageKey
+
+
+def draft_slot(state: FSMContext, form: str) -> FSMContext:
+    return FSMContext(state.storage, replace(state.key, destiny=f"draft_{form}"))
 
 
 class SQLiteDraftStorage(BaseStorage):

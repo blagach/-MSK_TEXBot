@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -27,11 +27,12 @@ from aiogram.types import (
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
-from draft_storage import SQLiteDraftStorage
+from draft_storage import SQLiteDraftStorage, draft_slot
 
 import storage
 import provider_registry
 import provider_ui
+from provider_ui import AVAILABLE_LEADS, LEGACY_PROVIDER, MY_OFFERS, OFFER_DRAFT, section_keyboard
 import provider_dispatch
 import notification_reservations
 import lead_routing
@@ -133,14 +134,9 @@ LEAD_CHOICES = {
 }
 FORM_STEPS = {step.state: step for step in (*LeadForm.__all_states__, *OfferForm.__all_states__)}
 LEAD_DRAFT = "▶️ Продолжить заявку"
-OFFER_DRAFT = "▶️ Продолжить отклик"
 CUSTOMER_ROLE = "📋 Я заказчик"
 PROVIDER_ROLE = "🚜 Я исполнитель"
 MY_LEADS = "📋 Мои заявки"
-AVAILABLE_LEADS = "🚜 Смотреть заявки"
-MY_OFFERS = "📋 Мои отклики"
-REGISTER_PROVIDER = "🚜 Зарегистрироваться как исполнитель"
-LEGACY_PROVIDER = "🛠 Обновить быструю регистрацию"
 OFFER_EDIT_FIELDS = {
     "price": ("💰 Стоимость", OfferForm.price),
     "comment": ("📝 Комментарий", OfferForm.comment),
@@ -152,15 +148,8 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
-def section_keyboard(*labels: str) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=label)] for label in labels],
-        resize_keyboard=True, is_persistent=True,
-    )
-
-
 def main_menu() -> ReplyKeyboardMarkup:
-    return section_keyboard(CUSTOMER_ROLE, PROVIDER_ROLE)
+    return section_keyboard((CUSTOMER_ROLE, PROVIDER_ROLE))
 
 
 def respond_button(lead_id: int) -> InlineKeyboardButton:
@@ -286,11 +275,6 @@ async def show_lead_step(message: Message, state: FSMContext, step: State, **fie
     navigation.append(InlineKeyboardButton(text=OFFER_HOME, callback_data="form_nav:home"))
     rows.append(navigation)
     await send_form_panel(message, state, LEAD_PROMPTS[step], rows)
-
-
-def draft_slot(state: FSMContext, form: str) -> FSMContext:
-    # Separate from active state, which other bot sections may clear.
-    return FSMContext(state.storage, replace(state.key, destiny=f"draft_{form}"))
 
 
 def form_kind(current: str | None) -> str | None:
@@ -527,35 +511,17 @@ async def show_main_menu(message: Message, state: FSMContext) -> None:
 @router.message(F.text.in_({CUSTOMER_ROLE, "🧾 Заказчик"}))
 async def customer_menu(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
-    labels = ["📝 Оставить заявку", MY_LEADS]
+    rows = [("📝 Оставить заявку", MY_LEADS)]
     if await draft_slot(state, "lead").get_state():
-        labels.append(LEAD_DRAFT)
-    await message.answer("Меню заказчика.", reply_markup=section_keyboard(*labels, OFFER_HOME))
+        rows.append((LEAD_DRAFT,))
+    await message.answer("Меню заказчика.", reply_markup=section_keyboard(*rows, (OFFER_HOME,)))
 
 
 @router.message(F.text.in_({PROVIDER_ROLE, "🛠 Исполнитель"}))
 async def executor_menu(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
-    async with aiosqlite.connect(storage.DB_PATH) as db:
-        async with db.execute(
-            """SELECT EXISTS(SELECT 1 FROM provider_profiles WHERE telegram_id=?),
-                      EXISTS(SELECT 1 FROM providers WHERE telegram_id=?)""",
-            (message.from_user.id, message.from_user.id),
-        ) as cursor:
-            registered, legacy = await cursor.fetchone()
-    labels = []
-    if registered or legacy:
-        labels.extend((AVAILABLE_LEADS, MY_OFFERS))
-    if registered:
-        labels.extend(("👤 Мой профиль", "💳 Способы оплаты", "➕ Добавить технику", "📋 Моя техника",
-                       "🔔 Уведомления вкл", "🔕 Уведомления выкл"))
-    else:
-        labels.append(REGISTER_PROVIDER)
-    if legacy:
-        labels.append(LEGACY_PROVIDER)
-    if await draft_slot(state, "offer").get_state():
-        labels.append(OFFER_DRAFT)
-    await message.answer("Меню исполнителя.", reply_markup=section_keyboard(*labels, OFFER_HOME))
+    await message.answer("Меню исполнителя.",
+                         reply_markup=await provider_ui.executor_keyboard(message.from_user.id, state))
 
 
 @router.message(F.text == MY_LEADS)
@@ -573,7 +539,7 @@ async def my_leads(message: Message, state: FSMContext) -> None:
     await message.answer("Ваши последние заявки:\n" + "\n".join(lines) if lines else "У вас пока нет заявок.")
 
 
-@router.message(F.text == AVAILABLE_LEADS)
+@router.message(F.text.in_({AVAILABLE_LEADS, "🚜 Смотреть заявки"}))
 async def available_leads(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     async with aiosqlite.connect(storage.DB_PATH) as db:
@@ -764,6 +730,18 @@ async def provider_start(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await state.set_state(ProviderForm.equipment)
     await message.answer("Какую технику вы предоставляете?", reply_markup=ReplyKeyboardRemove())
+
+
+@router.callback_query(F.data == "provider_legacy:edit")
+async def edit_legacy_provider(callback: CallbackQuery, state: FSMContext) -> None:
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM providers WHERE telegram_id=?", (callback.from_user.id,)) as cursor:
+            legacy = await cursor.fetchone()
+    if not legacy or not isinstance(callback.message, Message):
+        await callback.answer("Быстрая регистрация недоступна.", show_alert=True)
+        return
+    await callback.answer()
+    await provider_start(callback.message, state)
 
 
 @router.message(ProviderForm.equipment)
