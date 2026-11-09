@@ -10,6 +10,7 @@ from typing import Mapping
 from aiogram import Bot
 from aiogram.exceptions import TelegramConflictError
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, MenuButtonCommands
+from draft_storage import SQLiteDraftStorage
 
 from render_test_backup import snapshot, verify_small_snapshot
 from render_test_guard import IsolationError, TelegramIsolation, verify_identity
@@ -96,7 +97,9 @@ async def start() -> None:
         app = importlib.import_module("bot")
         app.storage.DB_PATH = str(database)
         await app.init_db()
-        dispatcher = app.create_dispatcher()
+        drafts = SQLiteDraftStorage(str(database))
+        await drafts.init_schema()
+        dispatcher = app.create_dispatcher(drafts)
         dispatcher.update.outer_middleware(guard.incoming)
         await telegram.set_my_commands([
             BotCommand(command="start", description="Главное меню"),

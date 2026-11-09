@@ -13,11 +13,17 @@ async def init_schema(db_path="bot.db"):
         await db.execute("CREATE TABLE IF NOT EXISTS provider_payment_preferences (provider_id INTEGER NOT NULL, method TEXT NOT NULL, PRIMARY KEY(provider_id, method))")
         await db.commit()
 
-async def save_lead(lead_id, method, db_path="bot.db"):
+async def write_lead(db, lead_id, method):
     if method not in METHODS | {ANY}:
         raise ValueError("Некорректная форма оплаты")
+    await db.execute(
+        "INSERT INTO lead_payment_preferences VALUES (?,?) ON CONFLICT(lead_id) DO UPDATE SET method=excluded.method",
+        (lead_id, method),
+    )
+
+async def save_lead(lead_id, method, db_path="bot.db"):
     async with aiosqlite.connect(db_path) as db:
-        await db.execute("INSERT INTO lead_payment_preferences VALUES (?,?) ON CONFLICT(lead_id) DO UPDATE SET method=excluded.method", (lead_id, method))
+        await write_lead(db, lead_id, method)
         await db.commit()
 
 async def save_provider(provider_id, methods, db_path="bot.db"):

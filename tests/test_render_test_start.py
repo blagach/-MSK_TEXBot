@@ -83,6 +83,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             poll.assert_awaited_once()
             dispatcher, telegram = poll.await_args.args
             self.assertIs(telegram, self.telegram)
+            self.assertIsInstance(dispatcher.fsm.storage, worker.SQLiteDraftStorage)
+            self.assertEqual(dispatcher.fsm.storage.db_path, str(self.database))
             self.assertIn(app.router, dispatcher.sub_routers)
             self.assertIn(app.provider_ui.router, dispatcher.sub_routers)
         with closing(sqlite3.connect(self.database)) as db:

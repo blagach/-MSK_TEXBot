@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
@@ -25,6 +26,8 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
+
+from draft_storage import SQLiteDraftStorage
 
 import storage
 import provider_registry
@@ -249,9 +252,20 @@ async def send_form_panel(message: Message, state: FSMContext, prompt: str, rows
     await state.update_data(form_keyboard_id=sent.message_id)
 
 
-async def show_lead_step(message: Message, state: FSMContext, step: State) -> None:
+async def checkpoint_form(state: FSMContext, step: State, **fields) -> None:
+    if isinstance(state.storage, SQLiteDraftStorage):
+        data = await state.get_data()
+        data.update(fields)
+        await state.storage.checkpoint(state.key, step, data)
+    else:
+        if fields:
+            await state.update_data(**fields)
+        await state.set_state(step)
+
+
+async def show_lead_step(message: Message, state: FSMContext, step: State, **fields) -> None:
     await clear_form_keyboard(message, state)
-    await state.set_state(step)
+    await checkpoint_form(state, step, **fields)
     options = LEAD_CHOICES[step][0] if step in LEAD_CHOICES else ()
     rows = [[InlineKeyboardButton(text=label, callback_data=f"lead_step:{index}")]
             for index, label in enumerate(options)]
@@ -282,6 +296,9 @@ async def pause_form(message: Message, state: FSMContext) -> None:
     await clear_form_keyboard(message, state)
     if kind:
         draft = draft_slot(state, kind)
+        if isinstance(state.storage, SQLiteDraftStorage):
+            await state.storage.transfer(state.key, draft.key)
+            return
         data = await state.get_data()
         data.pop("form_keyboard_id", None)
         await draft.set_data(data)
@@ -314,10 +331,14 @@ async def resume_draft(message: Message, state: FSMContext, kind: str) -> bool:
         await open_navigation(message, state)
         return True
     await pause_form(message, state)
+    if isinstance(state.storage, SQLiteDraftStorage):
+        await state.storage.transfer(draft.key, state.key)
+    else:
+        await state.set_data(await draft.get_data())
+        await state.set_state(current)
+        await draft.clear()
     await message.answer("Продолжаем анкету.", reply_markup=ReplyKeyboardRemove())
-    await state.set_data(await draft.get_data())
     await restore_form_step(message, state, current)
-    await draft.clear()
     return True
 
 
@@ -379,10 +400,10 @@ async def resume_form_from_menu(message: Message, state: FSMContext) -> None:
         await open_navigation(message, state)
 
 
-async def show_offer_step(message: Message, state: FSMContext, step: State) -> None:
+async def show_offer_step(message: Message, state: FSMContext, step: State, **fields) -> None:
     previous = await state.get_state()
     await clear_form_keyboard(message, state)
-    await state.set_state(step)
+    await checkpoint_form(state, step, **fields)
     if step == OfferForm.phone:
         await message.answer(OFFER_PROMPTS[step], reply_markup=ReplyKeyboardMarkup(
             keyboard=[
@@ -462,9 +483,8 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
         await resume_draft(message, state, "offer")
         return
     await pause_form(message, state)
-    await state.update_data(lead_id=lead_id)
     await message.answer(f"Отклик на заявку №{lead_id}.", reply_markup=ReplyKeyboardRemove())
-    await show_offer_step(message, state, OfferForm.price)
+    await show_offer_step(message, state, OfferForm.price, lead_id=lead_id)
 
 
 @router.message(CommandStart())
@@ -502,13 +522,13 @@ async def lead_start(message: Message, state: FSMContext) -> None:
     elif not await resume_draft(message, state, "lead"):
         await pause_form(message, state)
         await message.answer("Оформляем заявку.", reply_markup=ReplyKeyboardRemove())
-        await show_lead_step(message, state, LeadForm.equipment)
+        draft_fields = {"draft_id": uuid4().hex} if isinstance(state.storage, SQLiteDraftStorage) else {}
+        await show_lead_step(message, state, LeadForm.equipment, **draft_fields)
 
 
 async def apply_lead_choice(message: Message, state: FSMContext, step: State, choice: str) -> None:
     _, field, next_step = LEAD_CHOICES[step]
-    await state.update_data(**{field: choice})
-    await show_lead_step(message, state, next_step)
+    await show_lead_step(message, state, next_step, **{field: choice})
 
 
 @router.callback_query(F.data.startswith("lead_step:"))
@@ -548,32 +568,28 @@ async def lead_region(message: Message, state: FSMContext) -> None:
 async def lead_area(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 120):
         return
-    await state.update_data(area=message.text.strip())
-    await show_lead_step(message, state, LeadForm.place)
+    await show_lead_step(message, state, LeadForm.place, area=message.text.strip())
 
 
 @router.message(LeadForm.place)
 async def lead_place(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 300, phone=False):
         return
-    await state.update_data(place=message.text)
-    await show_lead_step(message, state, LeadForm.date)
+    await show_lead_step(message, state, LeadForm.date, place=message.text)
 
 
 @router.message(LeadForm.date)
 async def lead_date(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
-    await state.update_data(work_date=message.text)
-    await show_lead_step(message, state, LeadForm.details)
+    await show_lead_step(message, state, LeadForm.details, work_date=message.text)
 
 
 @router.message(LeadForm.details)
 async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
-    await state.update_data(details=message.text)
-    await show_lead_step(message, state, LeadForm.payment)
+    await show_lead_step(message, state, LeadForm.payment, details=message.text)
 
 
 @router.message(LeadForm.payment)
@@ -584,21 +600,41 @@ async def lead_payment(message: Message, state: FSMContext) -> None:
     await apply_lead_choice(message, state, LeadForm.payment, message.text)
 
 
+async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[int, bool]:
+    draft_id = data.get("draft_id")
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        if draft_id:
+            async with db.execute("SELECT lead_id FROM lead_draft_submissions WHERE draft_id=?", (draft_id,)) as cursor:
+                previous = await cursor.fetchone()
+            if previous:
+                return previous[0], False
+        cursor = await db.execute(
+            """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (customer.id, customer.full_name, data["equipment"], data["place"], data["work_date"],
+             data["details"], phone, datetime.now(timezone.utc).isoformat()),
+        )
+        lead_id = cursor.lastrowid
+        await payment_preferences.write_lead(db, lead_id, data.get("payment_method", payment_preferences.ANY))
+        await lead_routing.write_lead(db, lead_id, data["equipment"], data["region"], data["area"])
+        if draft_id:
+            await db.execute("INSERT INTO lead_draft_submissions VALUES (?,?)", (draft_id, lead_id))
+        await db.commit()
+        return lead_id, True
+
+
 @router.message(LeadForm.phone)
 async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await valid_input(message, 32, phone=True):
         return
     data = await state.get_data()
-    async with aiosqlite.connect(storage.DB_PATH) as db:
-        cursor = await db.execute(
-            """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (message.from_user.id, message.from_user.full_name, data["equipment"], data["place"], data["work_date"], data["details"], message.text, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
-        lead_id = cursor.lastrowid
-    await payment_preferences.save_lead(lead_id, data.get("payment_method", payment_preferences.ANY), storage.DB_PATH)
-    await lead_routing.save(lead_id, data["equipment"], data["region"], data["area"], storage.DB_PATH)
+    lead_id, created = await save_lead_from_draft(message.from_user, message.text, data)
+    if not created:
+        await clear_form_keyboard(message, state)
+        await state.clear()
+        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu())
+        return
     lead = await get_lead(lead_id)
     # Shadow evaluation only: never changes the manual approval workflow.
     shadow = await lead_shadow_review.evaluate(
@@ -663,23 +699,21 @@ async def provider_phone(message: Message, state: FSMContext) -> None:
 async def offer_price(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
-    await state.update_data(price=message.text)
-    await next_offer_step(message, state, OfferForm.comment)
+    await next_offer_step(message, state, OfferForm.comment, price=message.text)
 
 
 @router.message(OfferForm.comment)
 async def offer_comment(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
-    await state.update_data(comment=message.text)
-    await next_offer_step(message, state, OfferForm.phone)
+    await next_offer_step(message, state, OfferForm.phone, comment=message.text)
 
 
-async def next_offer_step(message: Message, state: FSMContext, step: State) -> None:
+async def next_offer_step(message: Message, state: FSMContext, step: State, **fields) -> None:
     if (await state.get_data()).get("offer_editing"):
-        await state.update_data(offer_editing=False)
+        fields["offer_editing"] = False
         step = OfferForm.review
-    await show_offer_step(message, state, step)
+    await show_offer_step(message, state, step, **fields)
 
 
 @router.callback_query(F.data.startswith("offer_step:"))
@@ -704,15 +738,13 @@ async def offer_step_action(callback: CallbackQuery, state: FSMContext, bot: Bot
     if action == "home":
         await show_main_menu(message, state)
     elif action == "skip" and current == OfferForm.comment.state:
-        await state.update_data(comment="Без комментария")
-        await next_offer_step(message, state, OfferForm.phone)
+        await next_offer_step(message, state, OfferForm.phone, comment="Без комментария")
     elif action == "back":
         await back_in_form(message, state, current)
     elif action == "edit" and current == OfferForm.review.state:
         await show_offer_step(message, state, OfferForm.edit)
     elif current == OfferForm.edit.state and action in OFFER_EDIT_FIELDS:
-        await state.update_data(offer_editing=True)
-        await show_offer_step(message, state, OFFER_EDIT_FIELDS[action][1])
+        await show_offer_step(message, state, OFFER_EDIT_FIELDS[action][1], offer_editing=True)
     elif action == "send" and current == OfferForm.review.state:
         await send_offer(message, callback.from_user, state, bot)
 
@@ -738,8 +770,7 @@ async def offer_phone(message: Message, state: FSMContext) -> None:
     if len(raw_phone) > 32 or not storage.valid_text(phone, 32, phone=True):
         await message.answer("Проверьте номер и повторите ввод. Например: +79123456789 или 89123456789.")
         return
-    await state.update_data(phone="+7" + phone[-10:])
-    await next_offer_step(message, state, OfferForm.review)
+    await next_offer_step(message, state, OfferForm.review, phone="+7" + phone[-10:])
 
 
 @router.message(OfferForm.review)
@@ -908,8 +939,8 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
             logging.warning("Cannot update moderation message for lead %s", lead_id)
 
 
-def create_dispatcher() -> Dispatcher:
-    dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatcher:
+    dispatcher = Dispatcher(storage=fsm_storage or MemoryStorage(), events_isolation=SimpleEventIsolation())
     dispatcher.include_router(router)
     dispatcher.include_router(provider_ui.router)
     return dispatcher

@@ -164,6 +164,88 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("send")
         self.assertEqual(await self.saved_offers(), [("28000", "Без комментария", "+79990000001")])
 
+    def reopen_sqlite_state(self, user_id=20):
+        return FSMContext(bot.SQLiteDraftStorage(storage.DB_PATH), StorageKey(bot_id=1, chat_id=user_id, user_id=user_id))
+
+    async def test_sqlite_restores_active_and_paused_drafts_for_separate_users(self):
+        existing_offer = await storage.save_offer(1, 90, "Существующий", "", "5000", "", "+79990000003")
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        await self.state.storage.init_schema()
+        self.assertEqual((await bot.get_lead(1))["status"], "published")
+        self.assertIsNotNone(existing_offer)
+        self.assertEqual(await self.saved_offers(), [("5000", "", "+79990000003")])
+
+        await bot.lead_start(self.message, self.state)
+        await self.pick_lead_option(0)
+        await self.pick_lead_option(0)
+        original_draft_id = (await self.state.get_data())["draft_id"]
+        self.state = self.reopen_sqlite_state()
+        await self.recover_current_step()
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.area.state)
+        self.assertEqual((await self.state.get_data())["region"], "Москва")
+
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_1"))
+        self.message.text = "28000"
+        await bot.offer_price(self.message, self.state)
+        await self.click("skip")
+        self.message.text = "+79990000001"
+        await bot.offer_phone(self.message, self.state)
+        await self.click("home")
+        self.state = self.reopen_sqlite_state()
+
+        another = self.reopen_sqlite_state(21)
+        self.assertEqual(await another.get_data(), {})
+        self.assertIsNone(await bot.draft_slot(another, "lead").get_state())
+        self.assertIsNone(await bot.draft_slot(another, "offer").get_state())
+        await bot.open_navigation(self.message, self.state)
+        keyboard = self.message.answer.await_args.kwargs["reply_markup"]
+        self.assertEqual([row[0].text for row in keyboard.keyboard[:2]], [bot.LEAD_DRAFT, bot.OFFER_DRAFT])
+        await bot.resume_draft(self.message, self.state, "lead")
+        self.assertEqual((await self.state.get_data())["draft_id"], original_draft_id)
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.area.state)
+        await bot.resume_draft(self.message, self.state, "offer")
+        self.assertEqual(await self.state.get_state(), bot.OfferForm.review.state)
+        self.assertEqual((await self.state.get_data())["phone"], "+79990000001")
+        review_id = (await self.state.get_data())["form_keyboard_id"]
+        await self.click("send")
+        sends = self.telegram.send_message.await_count
+        self.state = self.reopen_sqlite_state()
+        await bot.offer_step_action(self.step("send", review_id), self.state, self.telegram)
+        self.assertEqual(self.telegram.send_message.await_count, sends)
+        self.assertEqual(len(await self.saved_offers()), 2)
+
+    async def test_sqlite_draft_submission_is_idempotent_across_restart(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        await bot.lead_start(self.message, self.state)
+        await self.pick_lead_option(0)
+        await self.pick_lead_option(0)
+        for handler, value in (
+            (bot.lead_area, "СЗАО"),
+            (bot.lead_place, "улица Свободы"),
+            (bot.lead_date, "завтра"),
+            (bot.lead_details, "Работа на смену"),
+        ):
+            self.message.text = value
+            await handler(self.message, self.state)
+        await self.pick_lead_option(0)
+        self.message.text = "+79990000001"
+        data = await self.state.get_data()
+        # Crash window: SQLite commit succeeded but active state has not cleared.
+        lead_id, created = await bot.save_lead_from_draft(self.message.from_user, self.message.text, data)
+        self.assertTrue(created)
+        self.state = self.reopen_sqlite_state()
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.phone.state)
+        await bot.lead_phone(self.message, self.state, self.telegram)
+        self.telegram.send_message.assert_not_awaited()
+        self.assertIn(f"Заявка №{lead_id} уже сохранена", self.message.answer.await_args.args[0])
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            self.assertEqual(await (await db.execute("SELECT id FROM leads WHERE customer_id=20")).fetchall(), [(lead_id,)])
+            self.assertEqual(await (await db.execute("SELECT method FROM lead_payment_preferences WHERE lead_id=?", (lead_id,))).fetchone(), (bot.payment_preferences.CASH,))
+            self.assertEqual(await (await db.execute("SELECT region, area FROM lead_routing WHERE lead_id=?", (lead_id,))).fetchone(), ("Москва", "СЗАО"))
+        self.assertEqual((await bot.get_lead(lead_id))["status"], "new")
+
     async def test_keyboard_replacement_back_and_home(self):
         comment_markup = await self.enter_comment()
         await self.click("skip")
