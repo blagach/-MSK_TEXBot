@@ -648,6 +648,13 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
             logging.warning("Cannot update moderation message for lead %s", lead_id)
 
 
+def create_dispatcher() -> Dispatcher:
+    dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dispatcher.include_router(router)
+    dispatcher.include_router(provider_ui.router)
+    return dispatcher
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     await init_db()
@@ -657,10 +664,7 @@ async def main() -> None:
         BotCommand(command="menu", description="Открыть меню"),
         BotCommand(command="cancel", description="Отменить действие"),
     ])
-    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
-    dp.include_router(router)
-    dp.include_router(provider_ui.router)
-    await dp.start_polling(bot)
+    await create_dispatcher().start_polling(bot)
 
 
 if __name__ == "__main__":
