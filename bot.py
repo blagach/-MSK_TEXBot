@@ -19,6 +19,7 @@ from aiogram.types import (
     Message,
     KeyboardButton,
     CopyTextButton,
+    ReplyKeyboardRemove,
 )
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
@@ -297,6 +298,25 @@ async def notify(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
         return False
 
 
+async def remove_offer_markup(message: Message, message_id: int | None) -> None:
+    if message_id is None:
+        return
+    try:
+        await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message_id)
+    except TelegramAPIError as exc:
+        logging.warning("Could not clear an offer keyboard: %s", type(exc).__name__)
+
+
+async def clear_offer_keyboards(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    prompt_id = data.get("offer_keyboard_id")
+    switch_id = (data.get("offer_switch") or {}).get("message_id")
+    if prompt_id is not None or switch_id is not None:
+        await state.update_data(offer_keyboard_id=None, offer_switch=None)
+        await remove_offer_markup(message, prompt_id)
+        await remove_offer_markup(message, switch_id)
+
+
 async def finish_navigation(message: Message, state: FSMContext, text: str) -> None:
     current = await state.get_state()
     if current in provider_ui.MACHINE_EDIT_STATES:
@@ -309,6 +329,11 @@ async def finish_navigation(message: Message, state: FSMContext, text: str) -> N
             or current in provider_ui.PROFILE_STATES):
         await nav.return_to_provider_menu(state)
         await message.answer(text, reply_markup=await provider_ui.provider_keyboard(message.from_user.id))
+        return
+    if OFFER_STEPS.contains(current):
+        await clear_offer_keyboards(message, state)
+        await state.clear()
+        await message.answer(text, reply_markup=main_menu())
         return
     history = (await state.get_data()).get("screens", [])
     if history:
@@ -328,6 +353,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
 @router.message(Command("menu"))
 @router.message(F.text.in_({nav.HOME, "Главное меню"}))
 async def home(message: Message, state: FSMContext) -> None:
+    await clear_offer_keyboards(message, state)
     await state.clear()
     await message.answer("Главное меню", reply_markup=main_menu())
 
@@ -473,6 +499,7 @@ async def open_offer(message, state, user_id, lead_id, *, confirmed=False):
     current = await state.get_state()
     if await storage.has_offer(lead_id, user_id):
         if OFFER_STEPS.contains(current) and (await state.get_data()).get("lead_id") == lead_id:
+            await clear_offer_keyboards(message, state)
             await state.clear()
             await message.answer("Вы уже откликнулись на эту заявку", reply_markup=main_menu())
         else:
@@ -488,17 +515,25 @@ async def open_offer(message, state, user_id, lead_id, *, confirmed=False):
             await show_offer_step(message, state, step)
             return
         token = token_hex(8)
-        await state.update_data(offer_switch={"token": token, "state": current, "lead_id": lead_id})
+        previous_switch = (await state.get_data()).get("offer_switch") or {}
+        await remove_offer_markup(message, previous_switch.get("message_id"))
         buttons = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Продолжить текущую анкету", callback_data=f"offer_switch:{token}:keep")],
             [InlineKeyboardButton(text="Отменить черновик и перейти", callback_data=f"offer_switch:{token}:switch")],
         ])
-        await message.answer(
+        sent = await message.answer(
             f"Анкета ещё открыта. Можно продолжить её или перейти к заявке №{lead_id}. "
             "При переходе несохранённый черновик будет закрыт. Сохранённые данные останутся.",
             reply_markup=buttons,
         )
+        await state.update_data(offer_switch={
+            "token": token, "state": current, "lead_id": lead_id,
+            "message_id": getattr(sent, "message_id", None),
+        })
         return
+    if current == OfferForm.phone.state:
+        await message.answer("Открываем другую заявку.", reply_markup=ReplyKeyboardRemove())
+    await clear_offer_keyboards(message, state)
     await state.clear()
     await state.update_data(lead_id=lead_id)
     await show_offer_step(message, state, OfferForm.price)
@@ -514,6 +549,7 @@ async def choose_offer_switch(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Этот выбор уже неактуален.")
         return
     await state.update_data(offer_switch=None)
+    await remove_offer_markup(callback.message, pending.get("message_id"))
     if action == "keep":
         await callback.answer("Продолжайте текущую анкету.")
     else:
@@ -750,6 +786,10 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
 
 async def show_offer_step(message: Message, state: FSMContext, step: State) -> None:
     prompt, *_ = OFFER_STEPS.steps[step]
+    previous = await state.get_state()
+    await clear_offer_keyboards(message, state)
+    if previous == OfferForm.phone.state and step != OfferForm.phone:
+        await message.answer("Возвращаемся к предыдущему шагу.", reply_markup=ReplyKeyboardRemove())
     token = token_hex(8)
     await state.update_data(offer_prompt=token)
     await state.set_state(step)
@@ -764,7 +804,8 @@ async def show_offer_step(message: Message, state: FSMContext, step: State) -> N
         InlineKeyboardButton(text=nav.BACK, callback_data=f"offer_step:{token}:back"),
         InlineKeyboardButton(text=nav.HOME, callback_data=f"offer_step:{token}:home"),
     ])
-    await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    sent = await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await state.update_data(offer_keyboard_id=getattr(sent, "message_id", None))
 
 
 @router.callback_query(F.data.startswith("offer_step:"))
@@ -774,6 +815,9 @@ async def offer_step_action(callback: CallbackQuery, state: FSMContext) -> None:
     current = await state.get_state()
     if not token or not OFFER_STEPS.contains(current) or token != (await state.get_data()).get("offer_prompt"):
         await callback.answer("Этот шаг уже неактуален.")
+        # Also retire keyboards left by versions that did not track their IDs.
+        if isinstance(callback.message, Message):
+            await remove_offer_markup(callback.message, callback.message.message_id)
         return
     if action == "skip" and current == OfferForm.comment.state:
         await callback.answer()
@@ -820,6 +864,7 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     lead = await get_lead(int(data["lead_id"]))
     if not lead or lead["status"] != "published":
+        await clear_offer_keyboards(message, state)
         await state.clear()
         await message.answer("Заявка уже недоступна.", reply_markup=main_menu())
         return
@@ -842,6 +887,7 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         lead["id"], message.from_user.id, provider_name, username,
         data["price"], data["comment"], phone,
     )
+    await clear_offer_keyboards(message, state)
     await state.clear()
     if offer_id is None:
         duplicate = await storage.has_offer(lead["id"], provider_id)
@@ -852,11 +898,8 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     chat_url = f"https://t.me/{handle}" if handle and re.fullmatch(r"[A-Za-z0-9_]+", handle) else f"tg://user?id={provider_id}"
     contact_buttons = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Написать исполнителю", url=chat_url)],
-        [
-            InlineKeyboardButton(text="📱 Показать номер", callback_data=f"offer_call:{offer_id}"),
-            InlineKeyboardButton(text="📞 Позвонить", callback_data=f"offer_dial:{offer_id}"),
-        ],
+        [InlineKeyboardButton(text="✉️ Написать исполнителю", url=chat_url)],
+        [InlineKeyboardButton(text="📞 Показать номер", callback_data=f"offer_call:{offer_id}")],
     ])
     delivered = await notify(
         bot, lead["customer_id"], offer,
@@ -880,18 +923,20 @@ async def call_provider(callback: CallbackQuery, bot: Bot) -> None:
     if not contact:
         await callback.answer("Контакт недоступен", show_alert=True)
         return
-    await callback.answer("Откройте номер в карточке контакта" if dial else None)
+    await callback.answer()
+    if dial and isinstance(callback.message, Message) and callback.message.reply_markup:
+        rows = [[button for button in row if not (button.callback_data or "").startswith("offer_dial:")]
+                for row in callback.message.reply_markup.inline_keyboard]
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[row for row in rows if row]),
+            )
+        except TelegramAPIError as exc:
+            logging.warning("Could not update a previous contact keyboard: %s", type(exc).__name__)
     try:
         phone = provider_registry._validate_phone(contact[1])
     except ValueError:
         phone = contact[1]  # Older saved offers remain readable.
-    else:
-        if dial:
-            try:
-                await bot.send_contact(callback.from_user.id, phone, contact[0][:64] or "Исполнитель")
-                return
-            except TelegramAPIError:
-                pass  # Fall back to a copyable number if the contact cannot be delivered.
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Скопировать номер", copy_text=CopyTextButton(text=phone)),
     ]]) if 1 <= len(phone) <= 256 else None

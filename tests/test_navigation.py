@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 from aiogram import Bot
-from aiogram.types import Update
+from aiogram.types import ReplyKeyboardRemove, Update
 
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("ADMIN_IDS", "1,2")
@@ -70,7 +70,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(self.session.await_count, count, f"No reply to {text}")
         return self.session.await_args.args[1]
 
-    async def click(self, data):
+    async def click(self, data, *, markup=None):
         self.update_id += 1
         await self.dispatcher.feed_update(self.telegram, Update.model_validate({
             "update_id": self.update_id,
@@ -78,7 +78,8 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
                 "id": str(self.update_id), "chat_instance": "test", "data": data,
                 "from": {"id": self.user_id, "is_bot": False, "first_name": "Тест"},
                 "message": {"message_id": 900, "date": 1700000000,
-                            "chat": {"id": self.user_id, "type": "private"}, "text": "Анкета"},
+                            "chat": {"id": self.user_id, "type": "private"}, "text": "Анкета",
+                            "reply_markup": markup},
             },
         }))
 
@@ -370,6 +371,71 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await self.send("89991234567")
         self.assertEqual(await self.sql("SELECT price,comment FROM offers"),
                          [("28 000 рублей", "Без комментария")])
+
+    async def test_offer_retires_each_keyboard_and_restores_main_menu(self):
+        sent_ids = iter(range(1000, 1100))
+
+        async def telegram_call(_, method, **kwargs):
+            if method.__api_method__ == "sendMessage":
+                return SimpleNamespace(message_id=next(sent_ids))
+            return True
+
+        self.session.side_effect = telegram_call
+        await self.add_lead(37)
+        await self.add_lead(38)
+        await self.send("/start lead_37")
+        price_id = (await self.state().get_data())["offer_keyboard_id"]
+        comment = await self.send("28000")
+        comment_id = (await self.state().get_data())["offer_keyboard_id"]
+        self.assertNotEqual(price_id, comment_id)
+        edits = [c.args[1] for c in self.session.await_args_list if c.args[1].__api_method__ == "editMessageReplyMarkup"]
+        self.assertEqual([method.message_id for method in edits], [price_id])
+        self.assertIsNone(edits[0].reply_markup)
+
+        self.session.reset_mock()
+        await self.click(comment.reply_markup.inline_keyboard[0][0].callback_data)
+        methods = [c.args[1] for c in self.session.await_args_list]
+        self.assertEqual([m.message_id for m in methods if m.__api_method__ == "editMessageReplyMarkup"], [comment_id])
+        self.assertEqual(sum(m.__api_method__ == "sendMessage" for m in methods), 1)
+        self.assertEqual(self.labels(methods[-1]), [nav.SHARE_PHONE, nav.PROFILE_PHONE, nav.BACK, nav.HOME])
+
+        self.session.reset_mock()
+        await self.send(nav.BACK)
+        self.assertTrue(any(isinstance(getattr(c.args[1], "reply_markup", None), ReplyKeyboardRemove)
+                            for c in self.session.await_args_list))
+        comment_id = (await self.state().get_data())["offer_keyboard_id"]
+        self.session.reset_mock()
+        main = await self.send("/cancel")
+        self.assertEqual(self.labels(main), self.labels(SimpleNamespace(reply_markup=nav.main_menu())))
+        self.assertEqual([c.args[1].message_id for c in self.session.await_args_list
+                          if c.args[1].__api_method__ == "editMessageReplyMarkup"], [comment_id])
+        self.assertIsNone(await self.state().get_state())
+        self.assertEqual(await self.sql("SELECT id FROM offers"), [])
+
+        await self.send("/start lead_38")
+        await self.send("28000")
+        await self.send("Без комментария")
+        main = await self.send("89991234567")
+        self.assertEqual(self.labels(main), self.labels(SimpleNamespace(reply_markup=nav.main_menu())))
+        self.assertEqual(await self.sql("SELECT lead_id, phone FROM offers"), [(38, "+79991234567")])
+        self.assertEqual((await self.send("/start lead_38")).text, "Вы уже откликнулись на эту заявку")
+        self.assertFalse(any(c.args[1].__api_method__ == "deleteMessage" for c in self.session.await_args_list))
+
+    async def test_legacy_dial_button_is_retired_without_deleting_offer_message(self):
+        await self.add_lead(37)
+        offer_id = await storage.save_offer(37, 502, "Исполнитель", "@test", "1000", "—", "+79991234567")
+        old_markup = {"inline_keyboard": [
+            [{"text": "Написать", "url": "https://t.me/test"}],
+            [{"text": "Показать номер", "callback_data": f"offer_call:{offer_id}"},
+             {"text": "Позвонить", "callback_data": f"offer_dial:{offer_id}"}],
+        ]}
+        await self.click(f"offer_dial:{offer_id}", markup=old_markup)
+        requests = [call.args[1] for call in self.session.await_args_list]
+        self.assertEqual([request.__api_method__ for request in requests],
+                         ["answerCallbackQuery", "editMessageReplyMarkup", "sendMessage"])
+        self.assertEqual(requests[1].message_id, 900)
+        self.assertEqual(len(requests[1].reply_markup.inline_keyboard[1]), 1)
+        self.assertEqual(requests[2].reply_markup.inline_keyboard[0][0].copy_text.text, "+79991234567")
 
     async def test_payment_editor_is_available_directly_and_updates_offer(self):
         provider_id = self.user_id
@@ -727,25 +793,29 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("+79991234567", offer.text)
             self.assertEqual(offer.reply_markup.inline_keyboard[0][0].url, "tg://user?id=1")
             buttons = offer.reply_markup.inline_keyboard[1]
-            self.assertEqual([button.text for button in buttons], ["📱 Показать номер", "📞 Позвонить"])
+            self.assertEqual(
+                [button.text for row in offer.reply_markup.inline_keyboard for button in row],
+                ["✉️ Написать исполнителю", "📞 Показать номер"],
+            )
             self.assertEqual((await self.send("/start lead_1")).text, "Вы уже откликнулись на эту заявку")
             self.assertEqual(await self.sql("SELECT count(*) FROM offers"), [(1,)])
             call = SimpleNamespace(from_user=SimpleNamespace(id=customer), data=buttons[0].callback_data,
-                                   answer=AsyncMock())
+                                   answer=AsyncMock(), message=None)
             phone_bot = SimpleNamespace(send_message=AsyncMock(), send_contact=AsyncMock())
             await bot.call_provider(call, phone_bot)
             self.assertEqual(phone_bot.send_message.await_args.args, (customer, "Телефон исполнителя: +79991234567"))
             copy = phone_bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
             self.assertEqual(copy.copy_text.text, "+79991234567")
-            call.data = buttons[1].callback_data
+            call.data = buttons[0].callback_data.replace("offer_call:", "offer_dial:")
             await bot.call_provider(call, phone_bot)
-            phone_bot.send_contact.assert_awaited_once_with(customer, "+79991234567", "MST Тест")
+            self.assertEqual(phone_bot.send_message.await_count, 2)
             call.from_user.id = 12345
             await bot.call_provider(call, phone_bot)
             call.data = buttons[0].callback_data
             await bot.call_provider(call, phone_bot)
-            phone_bot.send_contact.assert_awaited_once()
-            phone_bot.send_message.assert_awaited_once()
+            phone_bot.send_contact.assert_not_awaited()
+            self.assertEqual(phone_bot.send_message.await_count, 2)
+            self.assertEqual(await self.sql("SELECT phone FROM offers"), [("+79991234567",)])
 
     async def test_rejection_reason_is_stored_and_sent_once(self):
         await self.add_lead(status="new")
