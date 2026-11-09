@@ -1,6 +1,7 @@
 """Aiogram router for provider self-service."""
 from aiogram import F, Router
 import aiosqlite
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message
@@ -17,7 +18,17 @@ CONFIRM = "✅ Подтвердить выбор"
 SAVE = "✅ Сохранить изменения"
 CANCEL = "❌ Отменить изменения"
 SKIP = "Пропустить"
-KEEP = "Оставить текущее"
+EDIT_PAYMENTS = "✏️ Изменить способы оплаты"
+PAYMENT_LABELS = {
+    payments.CASH: "💵 Наличные",
+    payments.NO_VAT: "🏦 Безналичный расчёт без НДС",
+    payments.VAT: "🧾 Безналичный расчёт с НДС",
+}
+MACHINE_LABELS = {
+    "category": "Категория", "brand": "Марка", "model": "Модель",
+    "specifications": "Характеристики", "attachments": "Навесное оборудование",
+    "notes": "Описание", "region": "Регион", "area": "Район",
+}
 EDIT_FIELDS = {"Имя или компания": "name", "Телефон": "phone", "Способы оплаты": "payment"}
 
 
@@ -37,6 +48,15 @@ class AddMachine(StatesGroup):
     notes = State()
     region = State()
     area = State()
+
+
+class MachineEdit(StatesGroup):
+    field = State()
+    value = State()
+    confirm = State()
+
+
+MACHINE_EDIT_STATES = {step.state for step in MachineEdit.__all_states__}
 
 
 class EditProfile(StatesGroup):
@@ -71,11 +91,11 @@ MACHINE_STEPS = nav.Form({
         "Выберите категорию техники:",
         *((category,) for category in sorted(registry.CATEGORIES)),
     ),
-    AddMachine.brand: ("Укажите марку техники.", (KEEP,)),
-    AddMachine.model: ("Укажите модель техники.", (KEEP,)),
-    AddMachine.specifications: ("Укажите характеристики техники.", (SKIP, KEEP)),
-    AddMachine.attachments: ("Укажите навесное оборудование.", (SKIP, KEEP)),
-    AddMachine.notes: ("Добавьте свободное описание.", (SKIP, KEEP)),
+    AddMachine.brand: ("Укажите марку техники.",),
+    AddMachine.model: ("Укажите модель техники.",),
+    AddMachine.specifications: ("Укажите характеристики техники.", (SKIP,)),
+    AddMachine.attachments: ("Укажите навесное оборудование.", (SKIP,)),
+    AddMachine.notes: ("Добавьте свободное описание.", (SKIP,)),
     AddMachine.region: (
         "Выберите зону работы:",
         ("Москва", "Московская область"), (registry.BOTH_REGIONS,),
@@ -95,7 +115,8 @@ async def provider_keyboard(telegram_id):
 async def show_selection(message, state, step, options):
     await state.set_state(step)
     selected = (await state.get_data()).get("selection", [])
-    rows = [((f"✅ {value}" if value in selected else value),) for value in options]
+    labels = {} if step == Services.select else PAYMENT_LABELS
+    rows = [(f"{'✅ ' if value in selected else ''}{labels.get(value, value)}",) for value in options]
     label = "Выберите направления услуг." if step == Services.select else "Выберите способы оплаты."
     await message.answer(label + " Нажмите «Подтвердить выбор», когда закончите.",
                          reply_markup=nav.section_menu(*rows, (CONFIRM,), (CANCEL,)))
@@ -103,6 +124,8 @@ async def show_selection(message, state, step, options):
 
 async def change_selection(message, state, step, options):
     text = (message.text or "").removeprefix("✅ ")
+    if step != Services.select:
+        text = next((value for value, label in PAYMENT_LABELS.items() if label == text), text)
     if text not in options:
         await message.answer("Выберите вариант из списка.")
         return
@@ -113,6 +136,11 @@ async def change_selection(message, state, step, options):
 
 
 async def cancel_provider_change(message, state):
+    if (await state.get_data()).get("from_payments"):
+        await state.set_state(None)
+        await message.answer("Изменения отменены.")
+        await my_payment_methods(message, state)
+        return
     await nav.return_to_provider_menu(state)
     await message.answer("Изменения отменены.", reply_markup=await provider_keyboard(message.from_user.id))
 
@@ -225,13 +253,10 @@ async def machine_details(message: Message, state: FSMContext):
     fields = (AddMachine.brand, AddMachine.model, AddMachine.specifications, AddMachine.attachments, AddMachine.notes)
     index = next(index for index, step in enumerate(fields) if step.state == current)
     field = registry.MACHINE_FIELDS[index]
-    data = await state.get_data()
     value = (message.text or "").strip()
-    if value == KEEP and data.get("machine_id"):
-        value = data.get(field, "")
-    elif value == SKIP and index >= 2:
+    if value == SKIP and index >= 2:
         value = ""
-    elif value in (KEEP, SKIP) or not 1 <= len(value) <= 200:
+    elif value == SKIP or not 1 <= len(value) <= 200:
         await message.answer("Введите от 1 до 200 символов или используйте доступную кнопку.")
         return
     await state.update_data(**{field: value})
@@ -260,18 +285,11 @@ async def save_machine(message, state, area):
     fields = {key: data.get(key, "") for key in registry.MACHINE_FIELDS}
     description = " ".join(value for value in fields.values() if value)[:200] or data["category"]
     try:
-        if machine_id := data.get("machine_id"):
-            changed = await registry.update_equipment(
-                message.from_user.id, machine_id, category=data["category"], description=description,
-                region=data["region"], area=area, active=None, db_path=storage.DB_PATH, fields=fields,
-            )
-            text = f"Техника №{machine_id} обновлена." if changed else "Карточка недоступна."
-        else:
-            machine_id = await registry.add_equipment(
-                message.from_user.id, data["category"], description, data["region"], area,
-                storage.DB_PATH, fields=fields,
-            )
-            text = f"Техника №{machine_id} добавлена."
+        machine_id = await registry.add_equipment(
+            message.from_user.id, data["category"], description, data["region"], area,
+            storage.DB_PATH, fields=fields,
+        )
+        text = f"Техника №{machine_id} добавлена."
     except ValueError as exc:
         await message.answer(str(exc))
         return
@@ -310,8 +328,8 @@ def machine_card(item):
     if item["brand"] is None:
         text.append(f"Описание: {item['description']}")
     else:
-        for key, label in zip(registry.MACHINE_FIELDS, ("Марка", "Модель", "Характеристики", "Навесное оборудование", "Описание")):
-            text.append(f"{label}: {item[key] or 'Не указано'}")
+        for key in registry.MACHINE_FIELDS:
+            text.append(f"{MACHINE_LABELS[key]}: {item[key] or 'Не указано'}")
     text.extend((f"Регион: {item['region']}, {item['area']}",
                  "✅ Активна" if item["active"] else "⏸ Приостановлена"))
     return "\n".join(text)
@@ -343,12 +361,13 @@ async def machine_action(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Сначала завершите или отмените открытую анкету.", show_alert=True)
             return
         await nav.return_to_provider_menu(state)
-        fields = {key: item[key] or "" for key in registry.MACHINE_FIELDS}
-        if item["brand"] is None:
-            fields["notes"] = item["description"]
-        await state.update_data(machine_id=machine_id, **fields)
+        await state.update_data(machine_id=machine_id)
+        await state.set_state(MachineEdit.field)
         await callback.answer()
-        await MACHINE_STEPS.show(callback.message, state, AddMachine.category)
+        await callback.message.answer(
+            f"Что изменить в карточке техники №{machine_id}?",
+            reply_markup=nav.section_menu(*((label,) for label in MACHINE_LABELS.values()), (CANCEL,)),
+        )
         return
     active = operation == "activate"
     if not await registry.change_equipment_status(user_id, machine_id, active, storage.DB_PATH):
@@ -358,6 +377,70 @@ async def machine_action(callback: CallbackQuery, state: FSMContext):
     if bool(item["active"]) != active:
         item["active"] = active
         await callback.message.edit_text(machine_card(item), reply_markup=machine_buttons(item))
+
+
+async def return_to_machine_card(message, state, status):
+    machine_id = (await state.get_data()).get("machine_id")
+    items = await registry.list_equipment(message.from_user.id, storage.DB_PATH)
+    item = next((item for item in items if item["id"] == machine_id), None)
+    await nav.return_to_provider_menu(state)
+    await nav.remember_screen(state, nav.MY_MACHINES, default_parent=nav.PROVIDERS)
+    await message.answer(status, reply_markup=nav.section_menu())
+    if item:
+        await message.answer(machine_card(item), reply_markup=machine_buttons(item))
+
+
+@router.message(StateFilter(*MACHINE_EDIT_STATES), F.text == CANCEL)
+async def cancel_machine_edit(message: Message, state: FSMContext):
+    await return_to_machine_card(message, state, "Изменения отменены.")
+
+
+@router.message(MachineEdit.field)
+async def select_machine_field(message: Message, state: FSMContext):
+    field = next((field for field, label in MACHINE_LABELS.items() if label == message.text), None)
+    if field is None:
+        await message.answer("Выберите поле из списка.")
+        return
+    await state.update_data(machine_field=field)
+    await state.set_state(MachineEdit.value)
+    choices = {
+        "category": sorted(registry.CATEGORIES), "region": sorted(registry.SERVICE_REGIONS),
+        "area": ["весь регион"], "specifications": [SKIP], "attachments": [SKIP], "notes": [SKIP],
+    }
+    await message.answer(f"Новое значение: {MACHINE_LABELS[field]}",
+                         reply_markup=nav.section_menu(*((value,) for value in choices.get(field, [])), (CANCEL,)))
+
+
+@router.message(MachineEdit.value)
+async def enter_machine_field(message: Message, state: FSMContext):
+    if message.text is None:
+        await message.answer("Введите значение текстом.")
+        return
+    field = (await state.get_data())["machine_field"]
+    value = message.text.strip()
+    if value == SKIP and field in {"specifications", "attachments", "notes"}:
+        value = ""
+    try:
+        registry.validate_equipment_field(field, value)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    await state.update_data(machine_value=value)
+    await state.set_state(MachineEdit.confirm)
+    await message.answer(f"{MACHINE_LABELS[field]}: {value or 'Не указано'}",
+                         reply_markup=nav.section_menu((SAVE,), (CANCEL,)))
+
+
+@router.message(MachineEdit.confirm)
+async def confirm_machine_field(message: Message, state: FSMContext):
+    if message.text != SAVE:
+        await message.answer("Подтвердите или отмените изменения.")
+        return
+    data = await state.get_data()
+    updated = await registry.edit_equipment_field(
+        message.from_user.id, data["machine_id"], data["machine_field"], data["machine_value"], storage.DB_PATH,
+    )
+    await return_to_machine_card(message, state, "Изменение сохранено." if updated else "Карточка недоступна.")
 
 
 @router.message(F.text.in_({
@@ -428,7 +511,8 @@ async def my_profile(message: Message, state: FSMContext):
 @router.message(F.text == nav.PAYMENT)
 async def my_payment_methods(message: Message, state: FSMContext):
     await nav.remember_screen(state, nav.PAYMENT, default_parent=nav.PROVIDERS)
-    detail_menu = nav.section_menu()
+    profile = await registry.get_profile(message.from_user.id, storage.DB_PATH)
+    detail_menu = nav.section_menu((EDIT_PAYMENTS,)) if profile and not profile["blocked"] else nav.section_menu()
     async with aiosqlite.connect(storage.DB_PATH) as db:
         methods = await payments.read_provider(db, message.from_user.id)
     if not methods:
@@ -438,6 +522,23 @@ async def my_payment_methods(message: Message, state: FSMContext):
         "💳 Принимаемые формы оплаты:\n" + "\n".join(f"• {method}" for method in methods),
         reply_markup=detail_menu,
     )
+
+@router.message(F.text == EDIT_PAYMENTS)
+async def edit_payment_methods(message: Message, state: FSMContext):
+    profile = await registry.get_profile(message.from_user.id, storage.DB_PATH)
+    if not profile or profile["blocked"]:
+        await message.answer("Редактирование профиля недоступно.")
+        return
+    await nav.remember_screen(state, nav.PAYMENT, default_parent=nav.PROVIDERS)
+    await begin_payment_edit(message, state, from_payments=True)
+
+
+async def begin_payment_edit(message, state, *, from_payments=False):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        current = await payments.read_provider(db, message.from_user.id)
+    await state.update_data(edit_field="payment", selection=current, from_payments=from_payments)
+    await show_selection(message, state, EditProfile.payment, payments.PAYMENT_OPTIONS)
+
 
 @router.message(F.text == nav.EDIT_PROFILE)
 async def edit_profile_menu(message: Message, state: FSMContext):
@@ -462,10 +563,7 @@ async def edit_profile_field(message: Message, state: FSMContext):
         return
     await state.update_data(edit_field=field)
     if field == "payment":
-        async with aiosqlite.connect(storage.DB_PATH) as db:
-            current = await payments.read_provider(db, message.from_user.id)
-        await state.update_data(selection=current)
-        await show_selection(message, state, EditProfile.payment, payments.PAYMENT_OPTIONS)
+        await begin_payment_edit(message, state)
     else:
         await state.set_state(EditProfile.value)
         keyboard = nav.section_menu((CANCEL,))
@@ -513,10 +611,15 @@ async def edit_profile_confirm(message: Message, state: FSMContext):
             return
         value = data["edit_value"]
     updated = await registry.edit_profile(message.from_user.id, field, value, storage.DB_PATH)
-    await nav.return_to_provider_menu(state)
-    if updated:
+    if updated and data.get("from_payments"):
+        await state.set_state(None)
+        await message.answer("Способы оплаты сохранены.")
+        await my_payment_methods(message, state)
+    elif updated:
+        await nav.return_to_provider_menu(state)
         await my_profile(message, state)
     else:
+        await nav.return_to_provider_menu(state)
         await message.answer("Редактирование профиля недоступно.")
 
 

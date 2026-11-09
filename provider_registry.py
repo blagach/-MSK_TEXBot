@@ -171,6 +171,46 @@ async def update_equipment(telegram_id, equipment_id, *, category, description,
         return cursor.rowcount == 1
 
 
+def validate_equipment_field(field, value):
+    if field in ("category", "region"):
+        options = CATEGORIES if field == "category" else SERVICE_REGIONS
+        if value not in options:
+            raise ValueError("Выберите значение из списка.")
+    elif field in {*MACHINE_FIELDS, "area"}:
+        limit = 120 if field == "area" else 200
+        required = field in {"area", "brand", "model"}
+        if not isinstance(value, str) or len(value) > limit or (required and not value):
+            raise ValueError(f"Введите значение длиной до {limit} символов.")
+    else:
+        raise ValueError("Неизвестное поле техники.")
+    return value
+
+
+async def edit_equipment_field(telegram_id, equipment_id, field, value, db_path=DEFAULT_DB_PATH):
+    value = validate_equipment_field(field, value)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        owned = await (await db.execute(
+            """SELECT e.description FROM provider_equipment e
+               JOIN provider_profiles p ON p.telegram_id=e.provider_id
+               WHERE e.id=? AND e.provider_id=? AND p.blocked=0""",
+            (equipment_id, telegram_id),
+        )).fetchone()
+        if not owned:
+            return False
+        if field in MACHINE_FIELDS:
+            await db.execute(
+                "INSERT OR IGNORE INTO provider_equipment_details VALUES (?,'','','','',?)",
+                (equipment_id, owned[0]),
+            )
+            await db.execute(f"UPDATE provider_equipment_details SET {field}=? WHERE equipment_id=?",
+                             (value, equipment_id))
+        else:
+            await db.execute(f"UPDATE provider_equipment SET {field}=? WHERE id=?", (value, equipment_id))
+        await db.commit()
+        return True
+
+
 async def write_machine_details(db, equipment_id, fields):
     await db.execute("""INSERT INTO provider_equipment_details VALUES (?,?,?,?,?,?)
         ON CONFLICT(equipment_id) DO UPDATE SET brand=excluded.brand, model=excluded.model,
