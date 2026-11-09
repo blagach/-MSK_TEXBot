@@ -2,6 +2,7 @@
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -123,8 +124,10 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.open_navigation(self.message, self.state)
         await self.nav("home")
         self.assertIsNone(await self.state.get_state())
+        self.assertEqual(self.message.answer.await_args.kwargs["reply_markup"], bot.main_menu())
+        await bot.customer_menu(self.message, self.state)
         keyboard = self.message.answer.await_args.kwargs["reply_markup"]
-        self.assertEqual(keyboard.keyboard[0][0].text, bot.LEAD_DRAFT)
+        self.assertIn(bot.LEAD_DRAFT, [row[0].text for row in keyboard.keyboard])
         self.message.text = bot.LEAD_DRAFT
         await bot.resume_form_from_menu(self.message, self.state)
         self.assertEqual(await self.state.get_state(), bot.LeadForm.phone.state)
@@ -192,6 +195,12 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.message.text = "+79990000001"
         await bot.offer_phone(self.message, self.state)
         await self.click("home")
+        copied_path = storage.DB_PATH + ".restore-test"
+        async with aiosqlite.connect(storage.DB_PATH) as source, aiosqlite.connect(copied_path) as copied:
+            await source.backup(copied)
+        copied_database = patch.object(storage, "DB_PATH", copied_path)
+        copied_database.start()
+        self.addCleanup(copied_database.stop)
         self.state = self.reopen_sqlite_state()
 
         another = self.reopen_sqlite_state(21)
@@ -199,8 +208,13 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await bot.draft_slot(another, "lead").get_state())
         self.assertIsNone(await bot.draft_slot(another, "offer").get_state())
         await bot.open_navigation(self.message, self.state)
+        self.assertEqual(self.message.answer.await_args.kwargs["reply_markup"], bot.main_menu())
+        await bot.customer_menu(self.message, self.state)
         keyboard = self.message.answer.await_args.kwargs["reply_markup"]
-        self.assertEqual([row[0].text for row in keyboard.keyboard[:2]], [bot.LEAD_DRAFT, bot.OFFER_DRAFT])
+        self.assertIn(bot.LEAD_DRAFT, [row[0].text for row in keyboard.keyboard])
+        await bot.executor_menu(self.message, self.state)
+        keyboard = self.message.answer.await_args.kwargs["reply_markup"]
+        self.assertIn(bot.OFFER_DRAFT, [row[0].text for row in keyboard.keyboard])
         await bot.resume_draft(self.message, self.state, "lead")
         self.assertEqual((await self.state.get_data())["draft_id"], original_draft_id)
         self.assertEqual(await self.state.get_state(), bot.LeadForm.area.state)
@@ -246,6 +260,116 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await (await db.execute("SELECT region, area FROM lead_routing WHERE lead_id=?", (lead_id,))).fetchone(), ("Москва", "СЗАО"))
         self.assertEqual((await bot.get_lead(lead_id))["status"], "new")
 
+    async def test_offer_cancel_requires_confirmation_and_keeps_sqlite_archive(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        existing = await storage.save_offer(1, 90, "Существующий", "", "5000", "", "+79990000003")
+        await self.enter_comment()
+        await self.click("skip")
+        self.message.text = "+79990000001"
+        await bot.offer_phone(self.message, self.state)
+        review = self.message.answer.await_args.kwargs["reply_markup"]
+        self.assertEqual([row[0].text for row in review.inline_keyboard], [
+            "✅ Отправить отклик", "✏️ Изменить данные", "❌ Отменить отклик", bot.OFFER_HOME,
+        ])
+        await self.click("cancel")
+        self.assertEqual(await self.state.get_state(), bot.OfferForm.cancel_confirmation.state)
+        await self.click("back")
+        self.assertEqual((await self.state.get_data())["phone"], "+79990000001")
+        await self.click("cancel")
+        confirm_id = (await self.state.get_data())["form_keyboard_id"]
+        await self.click("cancel_confirm")
+        self.state = self.reopen_sqlite_state()
+        self.assertIsNone(await self.state.get_state())
+        self.assertIsNone(await bot.draft_slot(self.state, "offer").get_state())
+        await bot.offer_step_action(self.step("cancel_confirm", confirm_id), self.state, self.telegram)
+        self.assertIsNotNone(existing)
+        self.assertEqual(await self.saved_offers(), [("5000", "", "+79990000003")])
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            archived = await (await db.execute(
+                "SELECT json_extract(data, '$.phone') FROM form_drafts "
+                "WHERE storage_key LIKE '%:draft_cancelled_offer_%'"
+            )).fetchall()
+            self.assertEqual(archived, [("+79990000001",)])
+        self.telegram.send_message.assert_not_awaited()
+
+    async def test_existing_offer_blocks_deep_link_without_touching_other_draft(self):
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            await db.execute("INSERT INTO leads SELECT 11, customer_id, customer_name, equipment, place, "
+                             "work_date, details, phone, status, created_at FROM leads WHERE id=1")
+            await db.commit()
+        await storage.save_offer(11, 20, "Исполнитель", "", "1000", "", "+79990000001")
+        await bot.lead_start(self.message, self.state)
+        await self.pick_lead_option(0)
+        before = await self.state.get_data()
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_11"))
+        self.assertIn("уже откликнулись на заявку №11", self.message.answer.await_args.args[0])
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.region.state)
+        self.assertEqual(await self.state.get_data(), before)
+
+    async def test_skip_description_publish_and_open_offer_from_button(self):
+        await bot.lead_start(self.message, self.state)
+        await self.pick_lead_option(0)
+        await self.pick_lead_option(0)
+        for handler, value in ((bot.lead_area, "ЦАО"), (bot.lead_place, "Тверская"), (bot.lead_date, "завтра")):
+            self.message.text = value
+            await handler(self.message, self.state)
+        prompt = (await self.state.get_data())["form_keyboard_id"]
+        skip = self.step("skip", prompt)
+        skip.data = "lead_skip_details"
+        await bot.skip_lead_details(skip, self.state)
+        await self.pick_lead_option(0)
+        self.message.text = "+79990000001"
+        await bot.lead_phone(self.message, self.state, self.telegram)
+        lead_id = 2
+        self.assertEqual((await bot.get_lead(lead_id))["details"], "")
+        self.telegram.send_message.reset_mock()
+        self.telegram.send_message.return_value = SimpleNamespace(chat=SimpleNamespace(id=-100123), message_id=201)
+        callback = SimpleNamespace(
+            from_user=SimpleNamespace(id=next(iter(bot.settings.admin_ids))),
+            data=f"publish:{lead_id}", answer=AsyncMock(), message=None,
+        )
+        await bot.provider_registry.register_provider(30, "Получатель", "+79990000003", True, storage.DB_PATH)
+        with (
+            patch.object(bot, "settings", replace(bot.settings, test_notification_provider_ids=frozenset({30}))),
+            patch.object(bot.provider_dispatch, "recipients_for_lead", new=AsyncMock(return_value=[30])),
+        ):
+            await bot.publish_lead(callback, self.telegram)
+        self.assertEqual((await bot.get_lead(lead_id))["status"], "published")
+        channel, notification = self.telegram.send_message.await_args_list
+        self.assertIn("Детали: не указаны", channel.args[1])
+        self.assertNotIn("https://", notification.args[1])
+        self.assertNotIn("Описание:", notification.args[1])
+        for send in (channel, notification):
+            button = send.kwargs["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(button.text, "🚜 Откликнуться")
+            self.assertTrue(button.url.endswith("?start=lead_2"))
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_2"))
+        self.assertEqual((await self.state.get_data())["lead_id"], lead_id)
+        self.assertEqual(await self.state.get_state(), bot.OfferForm.price.state)
+
+    async def test_role_menus_keep_existing_provider_features_and_scope_personal_lists(self):
+        self.assertEqual([row[0].text for row in bot.main_menu().keyboard], [bot.CUSTOMER_ROLE, bot.PROVIDER_ROLE])
+        await bot.executor_menu(self.message, self.state)
+        keyboard = self.message.answer.await_args.kwargs["reply_markup"]
+        self.assertEqual([row[0].text for row in keyboard.keyboard], [bot.REGISTER_PROVIDER, bot.OFFER_HOME])
+        await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
+        await bot.executor_menu(self.message, self.state)
+        labels = [row[0].text for row in self.message.answer.await_args.kwargs["reply_markup"].keyboard]
+        for label in (bot.AVAILABLE_LEADS, bot.MY_OFFERS, "👤 Мой профиль", "💳 Способы оплаты",
+                      "➕ Добавить технику", "📋 Моя техника", "🔔 Уведомления вкл", "🔕 Уведомления выкл"):
+            self.assertIn(label, labels)
+        self.assertNotIn(bot.REGISTER_PROVIDER, labels)
+        await bot.customer_menu(self.message, self.state)
+        self.assertIn(bot.MY_LEADS, [row[0].text for row in self.message.answer.await_args.kwargs["reply_markup"].keyboard])
+        await bot.my_leads(self.message, self.state)
+        self.assertIn("пока нет", self.message.answer.await_args.args[0])
+        await storage.save_offer(1, 90, "Другой", "", "Скрытая цена", "", "+79990000003")
+        await storage.save_offer(1, 20, "Исполнитель", "", "28000", "", "+79990000001")
+        await bot.my_offers(self.message, self.state)
+        self.assertIn("28000", self.message.answer.await_args.args[0])
+        self.assertNotIn("Скрытая цена", self.message.answer.await_args.args[0])
+
     async def test_keyboard_replacement_back_and_home(self):
         comment_markup = await self.enter_comment()
         await self.click("skip")
@@ -265,7 +389,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("home")
         self.assertIsNone(await self.state.get_state())
         self.assertEqual(await self.state.get_data(), {})
-        self.assertEqual(self.message.answer.await_args.kwargs["reply_markup"], bot.main_menu((bot.OFFER_DRAFT,)))
+        self.assertEqual(self.message.answer.await_args.kwargs["reply_markup"], bot.main_menu())
         self.assertEqual(await bot.draft_slot(self.state, "offer").get_state(), bot.OfferForm.comment.state)
         self.assertEqual(await self.saved_offers(), [])
 

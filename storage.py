@@ -88,6 +88,12 @@ async def save_offer(lead_id, provider_id, name, username, price, comment, phone
         return cursor.lastrowid if cursor.rowcount == 1 else None
 
 
+async def has_offer(lead_id, provider_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM offers WHERE lead_id=? AND provider_id=?", (lead_id, provider_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+
 async def offer_phone_for_customer(offer_id, customer_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(

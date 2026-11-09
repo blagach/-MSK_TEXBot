@@ -52,7 +52,7 @@ class MoscowProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_notification_excludes_customer_phone(self):
         message = notification_text(lead_id=77, category="каток", region="Москва",
-            area="СЗАО", work_date="завтра", details="Укатать площадку",
-            bot_username="@MSK_TEXBot")
-        self.assertIn("lead_77", message)
+            area="СЗАО", work_date="завтра", details="Укатать площадку")
+        self.assertIn("№77", message)
+        self.assertNotIn("https://", message)
         self.assertNotIn("+79991234567", message)

@@ -40,8 +40,9 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [])
 
     def test_notification_contains_no_phone(self):
-        text = notification_text(lead_id=17, category="мини-погрузчик", region="Московская область", area="Химки", work_date="завтра", details="Погрузка грунта", bot_username="MSK_TEXBot")
-        self.assertIn("lead_17", text)
+        text = notification_text(lead_id=17, category="мини-погрузчик", region="Московская область", area="Химки", work_date="завтра", details="Погрузка грунта")
+        self.assertIn("№17", text)
+        self.assertNotIn("https://", text)
         self.assertIn("Химки", text)
         self.assertNotIn("+79991234567", text)
 
