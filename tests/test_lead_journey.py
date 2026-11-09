@@ -23,7 +23,7 @@ class LeadJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.db_patch.start()
         await bot.init_db()
         self.fake_bot = SimpleNamespace(send_message=AsyncMock(
-            return_value=SimpleNamespace(chat=SimpleNamespace(id=-100123), message_id=87)))
+            return_value=SimpleNamespace(chat=SimpleNamespace(id=-100123, username="OfflinePublicChannel"), message_id=87)))
         self.state = SimpleNamespace(
             get_data=AsyncMock(return_value={
                 "equipment": "каток", "region": "Москва", "area": "СЗАО",

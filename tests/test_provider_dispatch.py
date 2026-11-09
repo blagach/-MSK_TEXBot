@@ -3,7 +3,8 @@ import tempfile
 import unittest
 
 import provider_registry as registry
-from provider_dispatch import notification_text, recipients_for_lead
+from provider_dispatch import notification_text, recipients_for_lead, recipients_for_service, service_direction
+import waste_requests
 
 
 class DispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -39,9 +40,43 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         result = await recipients_for_lead(category="мини-погрузчик", region="Московская область", area="Химки", db_path=self.db)
         self.assertEqual(result, [])
 
+    async def test_paused_machine_does_not_match_equipment_request(self):
+        item = (await registry.list_equipment(101, self.db))[0]
+        await registry.change_equipment_status(101, item["id"], False, self.db)
+        result = await recipients_for_lead(category="мини-погрузчик", region="Московская область", area="Химки", db_path=self.db)
+        self.assertEqual(result, [103])
+
+    async def test_reactivation_and_independent_service_matching(self):
+        item = (await registry.list_equipment(101, self.db))[0]
+        equipment = dict(category="мини-погрузчик", region="Московская область", area="Химки", db_path=self.db)
+        service = dict(direction="Вывоз грунта", region="Московская область", area="Химки", db_path=self.db)
+        await registry.save_services(102, {"Вывоз грунта"}, self.db)
+        await registry.save_services(103, {"Вывоз снега"}, self.db)
+        await registry.change_equipment_status(101, item["id"], False, self.db)
+        self.assertEqual(await recipients_for_lead(**equipment), [103])
+        await registry.change_equipment_status(101, item["id"], True, self.db)
+        self.assertEqual(await recipients_for_lead(**equipment), [101, 103])
+        self.assertEqual(await recipients_for_service(**service), [])
+        await registry.save_services(101, {"Вывоз грунта"}, self.db)
+        self.assertEqual(await recipients_for_service(**service), [101])
+        self.assertEqual(await recipients_for_service(**{**service, "region": "Москва"}), [])
+        await registry.set_notifications(101, False, db_path=self.db)
+        self.assertEqual(await recipients_for_service(**service), [])
+        self.assertEqual(await recipients_for_lead(**equipment), [103])
+
+    def test_services_use_structured_values_and_classification_gate(self):
+        for direction in registry.SERVICE_DIRECTIONS:
+            self.assertEqual(service_direction(direction), direction)
+        self.assertEqual(service_direction(waste_requests.CATEGORY, "snow"), "Вывоз снега")
+        self.assertEqual(service_direction(waste_requests.CATEGORY, "construction", "V"),
+                         "Вывоз строительных отходов")
+        for hazard in (None, "Не знаю", "I", "II", "III", "IV"):
+            self.assertIsNone(service_direction(waste_requests.CATEGORY, "construction", hazard))
+        self.assertIsNone(service_direction("самосвал"))
+
     def test_notification_contains_no_phone(self):
-        text = notification_text(lead_id=17, category="мини-погрузчик", region="Московская область", area="Химки", work_date="завтра", details="Погрузка грунта", bot_username="MSK_TEXBot")
-        self.assertIn("lead_17", text)
+        text = notification_text(lead_id=17, category="мини-погрузчик", region="Московская область", area="Химки", work_date="завтра", details="Погрузка грунта")
+        self.assertNotIn("https://t.me/", text)
         self.assertIn("Химки", text)
         self.assertNotIn("+79991234567", text)
 

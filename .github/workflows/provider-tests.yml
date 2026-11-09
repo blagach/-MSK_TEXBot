@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feature/provider-registration-moscow
+      - test/render-waste-pr9
   pull_request:
     paths:
       - bot.py
@@ -21,6 +22,9 @@ on:
       - provider_dispatch.py
       - tests/test_provider_dispatch.py
       - tests/test_provider_registry.py
+      - render.test.yaml
+      - render_test_*.py
+      - tests/test_render_test_*.py
       - .github/workflows/provider-tests.yml
 
 jobs:

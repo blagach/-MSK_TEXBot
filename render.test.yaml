@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: msk-texbot-test
+    runtime: python
+    branch: test/render-waste-pr9
+    plan: 0.5c-512mb
+    autoDeployTrigger: "off"
+    numInstances: 1
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: python render_test_start.py
+    disk:
+      name: msk-texbot-test-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.14"
+      - key: TEST_BOT_TOKEN
+        sync: false
+      - key: TEST_ADMIN_ID
+        sync: false
+      - key: TEST_CHANNEL_ID
+        sync: false
+      - key: TESTER_IDS
+        sync: false

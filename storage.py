@@ -56,6 +56,9 @@ async def init_schema():
             loading TEXT NOT NULL,
             destination TEXT
         )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS lead_rejection_reasons (
+            lead_id INTEGER PRIMARY KEY REFERENCES leads(id), reason TEXT NOT NULL
+        )""")
         await db.commit()
 
 
@@ -97,6 +100,35 @@ async def save_offer(lead_id, provider_id, name, username, price, comment, phone
         )
         await db.commit()
         return cursor.lastrowid if cursor.rowcount == 1 else None
+
+
+async def has_offer(lead_id, provider_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            "SELECT 1 FROM offers WHERE lead_id=? AND provider_id=?", (lead_id, provider_id)
+        )).fetchone()
+        return row is not None
+
+
+async def offer_contact(offer_id, customer_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        return await (await db.execute(
+            """SELECT o.provider_name, o.phone FROM offers o
+               JOIN leads l ON l.id=o.lead_id WHERE o.id=? AND l.customer_id=?""",
+            (offer_id, customer_id),
+        )).fetchone()
+
+
+async def reject_with_reason(lead_id, reason):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE leads SET status='rejected' WHERE id=? AND status='new'", (lead_id,)
+        )
+        if cursor.rowcount != 1:
+            return False
+        await db.execute("INSERT INTO lead_rejection_reasons VALUES (?,?)", (lead_id, reason))
+        await db.commit()
+        return True
 
 
 async def mark_offer(offer_id, status):

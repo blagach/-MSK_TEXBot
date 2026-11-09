@@ -71,11 +71,11 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await storage.transition(2, "new", "publishing"))
 
     async def test_successful_publication_is_idempotent(self):
-        fake_bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(chat=SimpleNamespace(id=-10012345), message_id=44)))
+        fake_bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(chat=SimpleNamespace(id=-10012345, username="OfflinePublicChannel"), message_id=44)))
         with patch.object(self.bot_module.moderation_history, "record_approval", new_callable=AsyncMock), patch.object(
             self.bot_module.lead_routing, "get", new_callable=AsyncMock, return_value=None
         ):
             await self.bot_module.publish_lead(self.callback(3), fake_bot)
             await self.bot_module.publish_lead(self.callback(3), fake_bot)
         self.assertEqual(self.status(3), "published")
-        self.assertEqual(fake_bot.send_message.await_count, 1)
+        self.assertEqual(fake_bot.send_message.await_count, 2)
