@@ -5,6 +5,7 @@ from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
@@ -136,6 +137,63 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.state().get_state())
         self.assertTrue(all(call.args[1].chat_id != bot.settings.leads_channel_id
                             for call in self.session.await_args_list))
+
+    async def test_saved_payment_is_shown_at_moderation_and_publication(self):
+        await self.send(nav.PLACE_REQUEST)
+        for value in (
+            "автокран", "Московская область", "Химки", "станция Химки",
+            "завтра 09:00", "Работа на смену, 8 часов", payments.VAT, "+70000000000",
+        ):
+            await self.send(value)
+
+        self.assertEqual(await self.sql("SELECT lead_id, method FROM lead_payment_preferences"), [(1, payments.VAT)])
+        moderation_cards = [
+            call.args[1] for call in self.session.await_args_list
+            if call.args[1].text.startswith("Новая заявка на проверку")
+        ]
+        self.assertEqual({card.chat_id for card in moderation_cards}, bot.settings.admin_ids)
+        for card in moderation_cards:
+            self.assertIn(f"Форма оплаты: {payments.VAT}", card.text)
+            self.assertIn("+70000000000", card.text)
+
+        callback = SimpleNamespace(
+            from_user=SimpleNamespace(id=moderation_cards[0].chat_id),
+            data=moderation_cards[0].reply_markup.inline_keyboard[0][0].callback_data,
+            answer=AsyncMock(),
+            message=SimpleNamespace(edit_text=AsyncMock()),
+        )
+        sent = SimpleNamespace(chat=SimpleNamespace(id=bot.settings.leads_channel_id), message_id=77)
+        telegram = SimpleNamespace(send_message=AsyncMock(return_value=sent))
+
+        await bot.publish_lead(callback, telegram)
+        await bot.publish_lead(callback, telegram)
+
+        self.assertEqual(telegram.send_message.await_count, 1)
+        channel_id, public_card = telegram.send_message.await_args.args
+        self.assertEqual(channel_id, bot.settings.leads_channel_id)
+        self.assertIn(f"Форма оплаты: {payments.VAT}", public_card)
+        self.assertNotIn("+70000000000", public_card)
+        callback.message.edit_text.assert_awaited_once()
+        confirmation = callback.message.edit_text.await_args.args[0]
+        self.assertIn("Заявка опубликована", confirmation)
+        self.assertIn(f"Форма оплаты: {payments.VAT}", confirmation)
+        self.assertEqual(await self.sql("SELECT status FROM leads WHERE id = 1"), [("published",)])
+        self.assertEqual(
+            await self.sql("SELECT lead_id, chat_id, message_id FROM lead_publications"),
+            [(1, bot.settings.leads_channel_id, 77)],
+        )
+        self.assertIn("уже обработана", callback.answer.await_args.args[0])
+
+    async def test_legacy_payment_is_distinct_from_any_payment(self):
+        await self.add_lead()
+        await self.add_lead(38)
+        await payments.save_lead(38, payments.ANY, storage.DB_PATH)
+
+        legacy = await bot.get_lead(37)
+        any_payment = await bot.get_lead(38)
+        self.assertIn("Форма оплаты: Не указана", bot.lead_text(legacy))
+        self.assertIn(f"Форма оплаты: {payments.ANY}", bot.lead_text(any_payment))
+        self.assertEqual(await self.sql("SELECT lead_id, method FROM lead_payment_preferences"), [(38, payments.ANY)])
 
     async def test_my_requests_is_private_and_back_returns_to_account(self):
         await self.add_lead()

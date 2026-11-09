@@ -17,14 +17,14 @@ class ShadowFlowGuardTests(unittest.IsolatedAsyncioTestCase):
         fake_bot = SimpleNamespace(send_message=AsyncMock())
         with patch.object(bot.lead_shadow_review, "evaluate",
                           new_callable=AsyncMock) as shadow, \
-             patch.object(bot, "get_lead", new_callable=AsyncMock) as get_lead, \
+             patch.object(bot, "read_lead", new_callable=AsyncMock) as read_lead, \
              patch.object(bot.lead_routing, "save", new_callable=AsyncMock), \
              patch.object(bot.aiosqlite, "connect") as connect:
             shadow.return_value = SimpleNamespace(route="candidate")
-            get_lead.return_value = {"id":1,"customer_id":501,
+            read_lead.return_value = {"id":1,"customer_id":501,
                 "customer_name":"Тест","equipment":"каток","place":"улица Свободы",
                 "work_date":"завтра","details":"Работы","phone":"+79991234567",
-                "status":"new"}
+                "status":"new","payment_method":None}
             db = AsyncMock()
             cursor = SimpleNamespace(lastrowid=1)
             db.execute.return_value = cursor
