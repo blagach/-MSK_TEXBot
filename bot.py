@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -9,10 +10,11 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -88,6 +90,13 @@ class OfferForm(StatesGroup):
     price = State()
     comment = State()
     phone = State()
+
+
+OFFER_PROMPTS = {
+    OfferForm.price: "Укажите вашу цену по заявке. Например: 28 000 ₽ за смену.",
+    OfferForm.comment: "Коротко опишите условия: какая техника, подача, что включено.",
+    OfferForm.phone: "Введите свой телефон для связи. Например: +7 912 345-67-89.",
+}
 
 
 def is_admin(user_id: int) -> bool:
@@ -182,14 +191,45 @@ async def notify(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
         return False
 
 
+async def remove_offer_keyboard(message: Message, message_id: int) -> None:
+    try:
+        await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message_id)
+    except TelegramAPIError as exc:
+        logging.warning("Could not clear an offer keyboard: %s", type(exc).__name__)
+
+
+async def clear_offer_keyboard(message: Message, state: FSMContext) -> None:
+    message_id = (await state.get_data()).get("offer_keyboard_id")
+    if message_id is not None:
+        await state.update_data(offer_keyboard_id=None)
+        await remove_offer_keyboard(message, message_id)
+
+
+async def show_offer_step(message: Message, state: FSMContext, step: State) -> None:
+    await clear_offer_keyboard(message, state)
+    await state.set_state(step)
+    rows = []
+    if step == OfferForm.comment:
+        rows.append([InlineKeyboardButton(text="Без комментария", callback_data="offer_step:skip")])
+    navigation = []
+    if step != OfferForm.price:
+        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="offer_step:back"))
+    navigation.append(InlineKeyboardButton(text="🏠 Главное меню", callback_data="offer_step:home"))
+    rows.append(navigation)
+    sent = await message.answer(OFFER_PROMPTS[step], reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await state.update_data(offer_keyboard_id=sent.message_id)
+
+
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
+    await clear_offer_keyboard(message, state)
     await state.clear()
     await message.answer("Заполнение отменено.", reply_markup=main_menu())
 
 
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
+    await clear_offer_keyboard(message, state)
     await state.clear()
     if not command.args or not command.args.startswith("lead_"):
         await message.answer("Ссылка на заявку устарела. Откройте актуальную заявку в канале.", reply_markup=main_menu())
@@ -203,12 +243,13 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
         await message.answer("Эта заявка уже недоступна.", reply_markup=main_menu())
         return
     await state.update_data(lead_id=lead_id)
-    await state.set_state(OfferForm.price)
-    await message.answer("Укажите вашу цену по заявке. Например: 28 000 ₽ за смену.")
+    await message.answer(f"Отклик на заявку №{lead_id}.", reply_markup=ReplyKeyboardRemove())
+    await show_offer_step(message, state, OfferForm.price)
 
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
+    await clear_offer_keyboard(message, state)
     await state.clear()
     await message.answer(
         "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
@@ -219,6 +260,7 @@ async def start(message: Message, state: FSMContext) -> None:
 @router.message(Command("menu"))
 @router.message(F.text == "🏠 Главное меню")
 async def show_main_menu(message: Message, state: FSMContext) -> None:
+    await clear_offer_keyboard(message, state)
     await state.clear()
     await message.answer("Главное меню MSK_TEX. Выберите нужный раздел:", reply_markup=main_menu())
 
@@ -230,12 +272,14 @@ async def customer_menu(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "🛠 Исполнитель")
 async def executor_menu(message: Message, state: FSMContext) -> None:
+    await clear_offer_keyboard(message, state)
     await state.clear()
     await message.answer("Раздел исполнителя. Выберите действие:", reply_markup=main_menu())
 
 
 @router.message(F.text == "📝 Оставить заявку")
 async def lead_start(message: Message, state: FSMContext) -> None:
+    await clear_offer_keyboard(message, state)
     await state.clear()
     await state.set_state(LeadForm.equipment)
     await message.answer("Выберите категорию техники:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=item)] for item in sorted(provider_registry.CATEGORIES)], resize_keyboard=True))
@@ -351,6 +395,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.message(F.text == "🚜 Я исполнитель")
 async def provider_start(message: Message, state: FSMContext) -> None:
+    await clear_offer_keyboard(message, state)
     await state.clear()
     await state.set_state(ProviderForm.equipment)
     await message.answer("Какую технику вы предоставляете?")
@@ -394,16 +439,7 @@ async def offer_price(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
     await state.update_data(price=message.text)
-    await state.set_state(OfferForm.comment)
-    await message.answer(
-        "Коротко опишите условия: какая техника, подача, что включено. "
-        "Если добавить нечего, нажмите «Без комментария».",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Без комментария")]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
+    await show_offer_step(message, state, OfferForm.comment)
 
 
 @router.message(OfferForm.comment)
@@ -411,12 +447,37 @@ async def offer_comment(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
     await state.update_data(comment=message.text)
-    await state.set_state(OfferForm.phone)
-    await message.answer(
-        "Введите свой телефон, чтобы заказчик мог с вами связаться. "
-        "Например, +7 912 345-67-89, 79123456789 или 89123456789.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await show_offer_step(message, state, OfferForm.phone)
+
+
+@router.callback_query(F.data.startswith("offer_step:"))
+async def offer_step_action(callback: CallbackQuery, state: FSMContext) -> None:
+    message = callback.message
+    current = await state.get_state()
+    data = await state.get_data()
+    if (
+        not isinstance(message, Message)
+        or current not in {step.state for step in OFFER_PROMPTS}
+        or message.message_id != data.get("offer_keyboard_id")
+    ):
+        await callback.answer("Этот шаг уже неактуален.")
+        if isinstance(message, Message) and message.reply_markup and any(
+            (button.callback_data or "").startswith("offer_step:")
+            for row in message.reply_markup.inline_keyboard for button in row
+        ):
+            await remove_offer_keyboard(message, message.message_id)
+        return
+    await callback.answer()
+    if callback.data == "offer_step:home":
+        await show_main_menu(message, state)
+    elif callback.data == "offer_step:skip" and current == OfferForm.comment.state:
+        await state.update_data(comment="Без комментария")
+        await show_offer_step(message, state, OfferForm.phone)
+    elif callback.data == "offer_step:back":
+        if current == OfferForm.phone.state:
+            await show_offer_step(message, state, OfferForm.comment)
+        elif current == OfferForm.comment.state:
+            await show_offer_step(message, state, OfferForm.price)
 
 
 @router.message(OfferForm.phone)
@@ -432,6 +493,7 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     lead = await get_lead(int(data["lead_id"]))
     if not lead or lead["status"] != "published":
+        await clear_offer_keyboard(message, state)
         await state.clear()
         await message.answer("Заявка уже недоступна.", reply_markup=main_menu())
         return
@@ -441,26 +503,54 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         f"🚜 Отклик на заявку №{lead['id']}\n\n"
         f"Исполнитель: {provider_name} ({username})\n"
         f"Цена: {data['price']}\n"
-        f"Условия: {data['comment']}\n"
-        f"Телефон: {phone}"
+        f"Условия: {data['comment']}"
     )
     offer_id = await storage.save_offer(
         lead["id"], message.from_user.id, provider_name, username,
         data["price"], data["comment"], phone,
     )
+    await clear_offer_keyboard(message, state)
     await state.clear()
     if offer_id is None:
         await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu())
         return
-    delivered = await notify(bot, lead["customer_id"], "По вашей заявке появился отклик:\n\n" + offer)
+    handle = message.from_user.username or ""
+    chat_url = (
+        f"https://t.me/{handle}" if re.fullmatch(r"[A-Za-z0-9_]+", handle)
+        else f"tg://user?id={message.from_user.id}"
+    )
+    contacts = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✉️ Написать исполнителю", url=chat_url)],
+        [InlineKeyboardButton(text="📞 Показать номер", callback_data=f"offer_call:{offer_id}")],
+    ])
+    delivered = await notify(
+        bot, lead["customer_id"], "По вашей заявке появился отклик:\n\n" + offer,
+        reply_markup=contacts,
+    )
     await storage.mark_offer(offer_id, "sent" if delivered else "unconfirmed")
     for admin_id in settings.admin_ids:
-        await notify(bot, admin_id, offer + ("" if delivered else "\n⚠️ Доставка заказчику не подтверждена. Отклик сохранён."))
+        await notify(bot, admin_id, offer + f"\nТелефон: {phone}" + (
+            "" if delivered else "\n⚠️ Доставка заказчику не подтверждена. Отклик сохранён."
+        ))
     await message.answer(
         "✅ Отклик сохранён и отправлен заказчику." if delivered else
         "Отклик сохранён. Доставка заказчику не подтверждена, требуется проверка диспетчера.",
         reply_markup=main_menu(),
     )
+
+
+@router.callback_query(F.data.startswith("offer_call:"))
+async def show_provider_phone(callback: CallbackQuery, bot: Bot) -> None:
+    offer_id = storage.parse_id(callback.data, "offer_call:")
+    phone = await storage.offer_phone_for_customer(offer_id, callback.from_user.id) if offer_id else None
+    if not phone:
+        await callback.answer("Контакт недоступен", show_alert=True)
+        return
+    await callback.answer()
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Скопировать номер", copy_text=CopyTextButton(text=phone)),
+    ]]) if len(phone) <= 256 else None
+    await notify(bot, callback.from_user.id, f"Телефон исполнителя: {phone}", reply_markup=markup)
 
 
 async def admin_lead_id(callback: CallbackQuery, prefix: str):
@@ -567,7 +657,7 @@ async def main() -> None:
         BotCommand(command="menu", description="Открыть меню"),
         BotCommand(command="cancel", description="Отменить действие"),
     ])
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
     dp.include_router(provider_ui.router)
     await dp.start_polling(bot)

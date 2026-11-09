@@ -88,6 +88,17 @@ async def save_offer(lead_id, provider_id, name, username, price, comment, phone
         return cursor.lastrowid if cursor.rowcount == 1 else None
 
 
+async def offer_phone_for_customer(offer_id, customer_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT offers.phone FROM offers JOIN leads ON leads.id = offers.lead_id
+               WHERE offers.id = ? AND leads.customer_id = ?""",
+            (offer_id, customer_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else None
+
+
 async def mark_offer(offer_id, status):
     if status not in {"sent", "unconfirmed"}:
         raise ValueError("Unsupported delivery status")
