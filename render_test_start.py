@@ -9,6 +9,7 @@ from typing import Mapping
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramConflictError
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, MenuButtonCommands
 
 from render_test_backup import snapshot, verify_small_snapshot
 from render_test_guard import IsolationError, TelegramIsolation, verify_identity
@@ -97,6 +98,12 @@ async def start() -> None:
         await app.init_db()
         dispatcher = app.create_dispatcher()
         dispatcher.update.outer_middleware(guard.incoming)
+        await telegram.set_my_commands([
+            BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="menu", description="Восстановить кнопки и продолжить анкету"),
+            BotCommand(command="cancel", description="Отменить текущую анкету"),
+        ], scope=BotCommandScopeAllPrivateChats())
+        await telegram.set_chat_menu_button(menu_button=MenuButtonCommands())
         logging.info("Starting isolated @%s at %s", TEST_BOT, os.getenv("RENDER_GIT_COMMIT", "local"))
         polling = asyncio.create_task(dispatcher.start_polling(
             telegram, allowed_updates=POLLING_UPDATES, close_bot_session=False,

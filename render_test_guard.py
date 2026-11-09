@@ -1,6 +1,8 @@
 """Fail-closed Telegram boundary for the Render test worker."""
 from contextvars import ContextVar
 
+from aiogram.types import BotCommandScopeAllPrivateChats, MenuButtonCommands
+
 
 class IsolationError(RuntimeError):
     pass
@@ -59,6 +61,10 @@ class TelegramIsolation:
     async def outgoing(self, make_request, bot, method):
         api = method.__api_method__
         if api in self.read_methods:
+            return await make_request(bot, method)
+        if api == "setMyCommands" and isinstance(method.scope, BotCommandScopeAllPrivateChats):
+            return await make_request(bot, method)
+        if api == "setChatMenuButton" and method.chat_id is None and isinstance(method.menu_button, MenuButtonCommands):
             return await make_request(bot, method)
         if api in {"sendMessage", "editMessageText", "editMessageReplyMarkup", "sendContact"}:
             destination = method.chat_id

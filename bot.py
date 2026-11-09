@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -106,6 +106,30 @@ OFFER_PROMPTS = {
 }
 OFFER_BACK = "⬅️ Назад"
 OFFER_HOME = "🏠 Главное меню"
+LEAD_PROMPTS = {
+    LeadForm.equipment: "Выберите категорию техники:",
+    LeadForm.region: "Выберите регион:",
+    LeadForm.area: "Укажите район или населённый пункт (например, СЗАО или Химки).",
+    LeadForm.place: "Укажите точный адрес, ориентир или ближайшее метро.",
+    LeadForm.date: "На какую дату и время нужна техника?",
+    LeadForm.details: "Опишите работу: объём, срок, груз/навесное оборудование, важные условия.",
+    LeadForm.payment: "Выберите форму оплаты:",
+    LeadForm.phone: (
+        "Введите номер телефона для связи без пробелов, скобок и дефисов. "
+        "Например, +79123456789 или 89123456789."
+    ),
+}
+LEAD_CHOICES = {
+    LeadForm.equipment: (tuple(sorted(provider_registry.CATEGORIES)), "equipment", LeadForm.region),
+    LeadForm.region: (("Москва", "Московская область"), "region", LeadForm.area),
+    LeadForm.payment: (
+        (payment_preferences.CASH, payment_preferences.VAT, payment_preferences.NO_VAT, payment_preferences.ANY),
+        "payment_method", LeadForm.phone,
+    ),
+}
+FORM_STEPS = {step.state: step for step in (*LeadForm.__all_states__, *OfferForm.__all_states__)}
+LEAD_DRAFT = "▶️ Продолжить заявку"
+OFFER_DRAFT = "▶️ Продолжить отклик"
 OFFER_EDIT_FIELDS = {
     "price": ("💰 Стоимость", OfferForm.price),
     "comment": ("📝 Комментарий", OfferForm.comment),
@@ -117,9 +141,10 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
-def main_menu() -> ReplyKeyboardMarkup:
+def main_menu(drafts: tuple[str, ...] = ()) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            *([KeyboardButton(text=draft)] for draft in drafts),
             [KeyboardButton(text="🧾 Заказчик"), KeyboardButton(text="🛠 Исполнитель")],
             [KeyboardButton(text="🏠 Главное меню")],
             [KeyboardButton(text="📝 Оставить заявку")],
@@ -205,23 +230,158 @@ async def notify(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
         return False
 
 
-async def remove_offer_keyboard(message: Message, message_id: int) -> None:
+async def remove_form_keyboard(message: Message, message_id: int) -> None:
     try:
         await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message_id)
     except TelegramAPIError as exc:
-        logging.warning("Could not clear an offer keyboard: %s", type(exc).__name__)
+        logging.warning("Could not clear a form keyboard: %s", type(exc).__name__)
 
 
-async def clear_offer_keyboard(message: Message, state: FSMContext) -> None:
-    message_id = (await state.get_data()).get("offer_keyboard_id")
+async def clear_form_keyboard(message: Message, state: FSMContext) -> None:
+    message_id = (await state.get_data()).get("form_keyboard_id")
     if message_id is not None:
-        await state.update_data(offer_keyboard_id=None)
-        await remove_offer_keyboard(message, message_id)
+        await state.update_data(form_keyboard_id=None)
+        await remove_form_keyboard(message, message_id)
+
+
+async def send_form_panel(message: Message, state: FSMContext, prompt: str, rows: list) -> None:
+    sent = await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await state.update_data(form_keyboard_id=sent.message_id)
+
+
+async def show_lead_step(message: Message, state: FSMContext, step: State) -> None:
+    await clear_form_keyboard(message, state)
+    await state.set_state(step)
+    options = LEAD_CHOICES[step][0] if step in LEAD_CHOICES else ()
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"lead_step:{index}")]
+            for index, label in enumerate(options)]
+    navigation = []
+    if step != LeadForm.equipment:
+        navigation.append(InlineKeyboardButton(text=OFFER_BACK, callback_data="form_nav:back"))
+    navigation.append(InlineKeyboardButton(text=OFFER_HOME, callback_data="form_nav:home"))
+    rows.append(navigation)
+    await send_form_panel(message, state, LEAD_PROMPTS[step], rows)
+
+
+def draft_slot(state: FSMContext, form: str) -> FSMContext:
+    # Separate from active state, which other bot sections may clear.
+    return FSMContext(state.storage, replace(state.key, destiny=f"draft_{form}"))
+
+
+def form_kind(current: str | None) -> str | None:
+    if current in LeadForm.__all_states_names__:
+        return "lead"
+    if current in OfferForm.__all_states_names__:
+        return "offer"
+    return None
+
+
+async def pause_form(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    kind = form_kind(current)
+    await clear_form_keyboard(message, state)
+    if kind:
+        draft = draft_slot(state, kind)
+        data = await state.get_data()
+        data.pop("form_keyboard_id", None)
+        await draft.set_data(data)
+        await draft.set_state(current)
+    await state.clear()
+
+
+async def menu_with_drafts(state: FSMContext) -> ReplyKeyboardMarkup:
+    labels = []
+    for kind, label in (("lead", LEAD_DRAFT), ("offer", OFFER_DRAFT)):
+        if await draft_slot(state, kind).get_state():
+            labels.append(label)
+    return main_menu(tuple(labels))
+
+
+async def restore_form_step(message: Message, state: FSMContext, current: str) -> None:
+    step = FORM_STEPS[current]
+    if form_kind(current) == "lead":
+        await show_lead_step(message, state, step)
+    else:
+        await show_offer_step(message, state, step)
+
+
+async def resume_draft(message: Message, state: FSMContext, kind: str) -> bool:
+    draft = draft_slot(state, kind)
+    current = await draft.get_state()
+    if current is None:
+        return False
+    if form_kind(await state.get_state()) == kind:
+        await open_navigation(message, state)
+        return True
+    await pause_form(message, state)
+    await message.answer("Продолжаем анкету.", reply_markup=ReplyKeyboardRemove())
+    await state.set_data(await draft.get_data())
+    await restore_form_step(message, state, current)
+    await draft.clear()
+    return True
+
+
+async def back_in_form(message: Message, state: FSMContext, current: str) -> None:
+    if form_kind(current) == "lead":
+        steps = LeadForm.__all_states__
+        index = steps.index(FORM_STEPS[current])
+        await show_lead_step(message, state, steps[max(0, index - 1)])
+    elif current == OfferForm.phone.state:
+        await offer_phone_back(message, state)
+    elif current == OfferForm.comment.state and not (await state.get_data()).get("offer_editing"):
+        await show_offer_step(message, state, OfferForm.price)
+    elif current in (OfferForm.price.state, OfferForm.comment.state) and (await state.get_data()).get("offer_editing"):
+        await next_offer_step(message, state, OfferForm.review)
+    elif current == OfferForm.edit.state:
+        await show_offer_step(message, state, OfferForm.review)
+    elif current == OfferForm.review.state:
+        await show_offer_step(message, state, OfferForm.phone)
+    else:
+        await restore_form_step(message, state, current)
+
+
+@router.message(Command("menu"))
+async def open_navigation(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    if not form_kind(current):
+        await show_main_menu(message, state)
+        return
+    await clear_form_keyboard(message, state)
+    await send_form_panel(message, state, "Анкета открыта. Как продолжим?", [
+        [InlineKeyboardButton(text="▶️ Продолжить анкету", callback_data="form_nav:continue")],
+        [InlineKeyboardButton(text=OFFER_BACK, callback_data="form_nav:back"),
+         InlineKeyboardButton(text=OFFER_HOME, callback_data="form_nav:home")],
+    ])
+
+
+@router.callback_query(F.data.startswith("form_nav:"))
+async def form_navigation(callback: CallbackQuery, state: FSMContext) -> None:
+    current = await state.get_state()
+    if (
+        not form_kind(current) or not isinstance(callback.message, Message)
+        or callback.message.message_id != (await state.get_data()).get("form_keyboard_id")
+    ):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    await callback.answer()
+    action = callback.data.removeprefix("form_nav:")
+    if action == "continue":
+        await restore_form_step(callback.message, state, current)
+    elif action == "back":
+        await back_in_form(callback.message, state, current)
+    elif action == "home":
+        await show_main_menu(callback.message, state)
+
+
+@router.message(F.text.in_({LEAD_DRAFT, OFFER_DRAFT}))
+async def resume_form_from_menu(message: Message, state: FSMContext) -> None:
+    if not await resume_draft(message, state, "lead" if message.text == LEAD_DRAFT else "offer"):
+        await open_navigation(message, state)
 
 
 async def show_offer_step(message: Message, state: FSMContext, step: State) -> None:
     previous = await state.get_state()
-    await clear_offer_keyboard(message, state)
+    await clear_form_keyboard(message, state)
     await state.set_state(step)
     if step == OfferForm.phone:
         await message.answer(OFFER_PROMPTS[step], reply_markup=ReplyKeyboardMarkup(
@@ -229,7 +389,7 @@ async def show_offer_step(message: Message, state: FSMContext, step: State) -> N
                 [KeyboardButton(text="📲 Поделиться номером телефона", request_contact=True)],
                 [KeyboardButton(text=OFFER_BACK), KeyboardButton(text=OFFER_HOME)],
             ],
-            resize_keyboard=True,
+            resize_keyboard=True, is_persistent=True,
         ))
         return
     if previous == OfferForm.phone.state:
@@ -269,32 +429,39 @@ async def show_offer_step(message: Message, state: FSMContext, step: State) -> N
         if step != OfferForm.price or data.get("offer_editing"):
             navigation.append(InlineKeyboardButton(text=OFFER_BACK, callback_data="offer_step:back"))
         rows.append([*navigation, home])
-    sent = await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await state.update_data(offer_keyboard_id=sent.message_id)
+    await send_form_panel(message, state, prompt, rows)
 
 
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
-    await clear_offer_keyboard(message, state)
+    await clear_form_keyboard(message, state)
     await state.clear()
-    await message.answer("Заполнение отменено.", reply_markup=main_menu())
+    await message.answer("Заполнение отменено.", reply_markup=await menu_with_drafts(state))
 
 
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
-    await clear_offer_keyboard(message, state)
-    await state.clear()
-    if not command.args or not command.args.startswith("lead_"):
-        await message.answer("Ссылка на заявку устарела. Откройте актуальную заявку в канале.", reply_markup=main_menu())
-        return
     lead_id = storage.parse_id(command.args, "lead_")
-    if lead_id is None:
-        await message.answer("Некорректная ссылка на заявку.", reply_markup=main_menu())
-        return
-    lead = await get_lead(lead_id)
+    lead = await get_lead(lead_id) if lead_id else None
     if not lead or lead["status"] != "published":
-        await message.answer("Эта заявка уже недоступна.", reply_markup=main_menu())
+        await message.answer("Ссылка на заявку устарела или заявка недоступна.")
+        await open_navigation(message, state)
         return
+    current = await state.get_state()
+    if form_kind(current) == "offer":
+        if (await state.get_data()).get("lead_id") == lead_id:
+            await restore_form_step(message, state, current)
+        else:
+            await message.answer("У вас открыт другой отклик. Продолжите его или отмените командой /cancel.")
+            await open_navigation(message, state)
+        return
+    saved = draft_slot(state, "offer")
+    if await saved.get_state():
+        if (await saved.get_data()).get("lead_id") != lead_id:
+            await message.answer("У вас есть черновик другого отклика. Сначала завершите его или отмените командой /cancel.")
+        await resume_draft(message, state, "offer")
+        return
+    await pause_form(message, state)
     await state.update_data(lead_id=lead_id)
     await message.answer(f"Отклик на заявку №{lead_id}.", reply_markup=ReplyKeyboardRemove())
     await show_offer_step(message, state, OfferForm.price)
@@ -302,20 +469,18 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
-    await clear_offer_keyboard(message, state)
-    await state.clear()
+    await pause_form(message, state)
     await message.answer(
         "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
-        reply_markup=main_menu(),
+        reply_markup=await menu_with_drafts(state),
     )
 
 
-@router.message(Command("menu"))
-@router.message(F.text == "🏠 Главное меню")
+@router.message(F.text == OFFER_HOME)
 async def show_main_menu(message: Message, state: FSMContext) -> None:
-    await clear_offer_keyboard(message, state)
-    await state.clear()
-    await message.answer("Главное меню MSK_TEX. Выберите нужный раздел:", reply_markup=main_menu())
+    await pause_form(message, state)
+    await message.answer("Главное меню MSK_TEX. Выберите нужный раздел:",
+                         reply_markup=await menu_with_drafts(state))
 
 
 @router.message(F.text == "🧾 Заказчик")
@@ -325,37 +490,58 @@ async def customer_menu(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "🛠 Исполнитель")
 async def executor_menu(message: Message, state: FSMContext) -> None:
-    await clear_offer_keyboard(message, state)
-    await state.clear()
-    await message.answer("Раздел исполнителя. Выберите действие:", reply_markup=main_menu())
+    await pause_form(message, state)
+    await message.answer("Раздел исполнителя. Выберите действие:", reply_markup=await menu_with_drafts(state))
 
 
 @router.message(F.text == "📝 Оставить заявку")
 async def lead_start(message: Message, state: FSMContext) -> None:
-    await clear_offer_keyboard(message, state)
-    await state.clear()
-    await state.set_state(LeadForm.equipment)
-    await message.answer("Выберите категорию техники:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=item)] for item in sorted(provider_registry.CATEGORIES)], resize_keyboard=True))
+    current = await state.get_state()
+    if form_kind(current) == "lead":
+        await restore_form_step(message, state, current)
+    elif not await resume_draft(message, state, "lead"):
+        await pause_form(message, state)
+        await message.answer("Оформляем заявку.", reply_markup=ReplyKeyboardRemove())
+        await show_lead_step(message, state, LeadForm.equipment)
+
+
+async def apply_lead_choice(message: Message, state: FSMContext, step: State, choice: str) -> None:
+    _, field, next_step = LEAD_CHOICES[step]
+    await state.update_data(**{field: choice})
+    await show_lead_step(message, state, next_step)
+
+
+@router.callback_query(F.data.startswith("lead_step:"))
+async def lead_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    step = FORM_STEPS.get(await state.get_state())
+    suffix = callback.data.removeprefix("lead_step:")
+    data = await state.get_data()
+    if (
+        step not in LEAD_CHOICES or not isinstance(callback.message, Message)
+        or callback.message.message_id != data.get("form_keyboard_id")
+        or not re.fullmatch(r"[0-9]{1,3}", suffix)
+        or int(suffix) >= len(LEAD_CHOICES[step][0])
+    ):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    await callback.answer()
+    await apply_lead_choice(callback.message, state, step, LEAD_CHOICES[step][0][int(suffix)])
 
 
 @router.message(LeadForm.equipment)
 async def lead_equipment(message: Message, state: FSMContext) -> None:
     if message.text not in provider_registry.CATEGORIES:
-        await message.answer("Выберите категорию техники кнопкой из списка.")
+        await message.answer("Выберите категорию техники кнопкой из списка или введите /menu.")
         return
-    await state.update_data(equipment=message.text)
-    await state.set_state(LeadForm.region)
-    await message.answer("Выберите регион:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Москва"), KeyboardButton(text="Московская область")]], resize_keyboard=True))
+    await apply_lead_choice(message, state, LeadForm.equipment, message.text)
 
 
 @router.message(LeadForm.region)
 async def lead_region(message: Message, state: FSMContext) -> None:
     if message.text not in provider_registry.REGIONS:
-        await message.answer("Выберите Москву или Московскую область.")
+        await message.answer("Выберите Москву или Московскую область. Чтобы вернуть кнопки, введите /menu.")
         return
-    await state.update_data(region=message.text)
-    await state.set_state(LeadForm.area)
-    await message.answer("Укажите район или населённый пункт (например, СЗАО или Химки).")
+    await apply_lead_choice(message, state, LeadForm.region, message.text)
 
 
 @router.message(LeadForm.area)
@@ -363,8 +549,7 @@ async def lead_area(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 120):
         return
     await state.update_data(area=message.text.strip())
-    await state.set_state(LeadForm.place)
-    await message.answer("Укажите точный адрес, ориентир или ближайшее метро.")
+    await show_lead_step(message, state, LeadForm.place)
 
 
 @router.message(LeadForm.place)
@@ -372,8 +557,7 @@ async def lead_place(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 300, phone=False):
         return
     await state.update_data(place=message.text)
-    await state.set_state(LeadForm.date)
-    await message.answer("На какую дату и время нужна техника?")
+    await show_lead_step(message, state, LeadForm.date)
 
 
 @router.message(LeadForm.date)
@@ -381,8 +565,7 @@ async def lead_date(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
     await state.update_data(work_date=message.text)
-    await state.set_state(LeadForm.details)
-    await message.answer("Опишите работу: объём, срок, груз/навесное оборудование, важные условия.")
+    await show_lead_step(message, state, LeadForm.details)
 
 
 @router.message(LeadForm.details)
@@ -390,13 +573,7 @@ async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
     await state.update_data(details=message.text)
-    await state.set_state(LeadForm.payment)
-    await message.answer("Выберите форму оплаты:", reply_markup=ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text=payment_preferences.CASH)],
-        [KeyboardButton(text=payment_preferences.VAT)],
-        [KeyboardButton(text=payment_preferences.NO_VAT)],
-        [KeyboardButton(text=payment_preferences.ANY)],
-    ], resize_keyboard=True))
+    await show_lead_step(message, state, LeadForm.payment)
 
 
 @router.message(LeadForm.payment)
@@ -404,12 +581,7 @@ async def lead_payment(message: Message, state: FSMContext) -> None:
     if not message.text or message.text not in payment_preferences.METHODS | {payment_preferences.ANY}:
         await message.answer("Выберите форму оплаты кнопкой из списка.")
         return
-    await state.update_data(payment_method=message.text)
-    await state.set_state(LeadForm.phone)
-    await message.answer(
-        "Введите номер телефона для связи без пробелов, скобок и дефисов. "
-        "Например, +79123456789 или 89123456789."
-    )
+    await apply_lead_choice(message, state, LeadForm.payment, message.text)
 
 
 @router.message(LeadForm.phone)
@@ -442,16 +614,16 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     ]])
     for admin_id in settings.admin_ids:
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
+    await clear_form_keyboard(message, state)
     await state.clear()
     await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu())
 
 
 @router.message(F.text == "🚜 Я исполнитель")
 async def provider_start(message: Message, state: FSMContext) -> None:
-    await clear_offer_keyboard(message, state)
-    await state.clear()
+    await pause_form(message, state)
     await state.set_state(ProviderForm.equipment)
-    await message.answer("Какую технику вы предоставляете?")
+    await message.answer("Какую технику вы предоставляете?", reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(ProviderForm.equipment)
@@ -518,14 +690,14 @@ async def offer_step_action(callback: CallbackQuery, state: FSMContext, bot: Bot
     if (
         not isinstance(message, Message)
         or current not in OfferForm.__all_states_names__
-        or message.message_id != data.get("offer_keyboard_id")
+        or message.message_id != data.get("form_keyboard_id")
     ):
         await callback.answer("Этот шаг уже неактуален.")
         if isinstance(message, Message) and message.reply_markup and any(
             (button.callback_data or "").startswith("offer_step:")
             for row in message.reply_markup.inline_keyboard for button in row
         ):
-            await remove_offer_keyboard(message, message.message_id)
+            await remove_form_keyboard(message, message.message_id)
         return
     await callback.answer()
     action = callback.data.removeprefix("offer_step:")
@@ -535,10 +707,7 @@ async def offer_step_action(callback: CallbackQuery, state: FSMContext, bot: Bot
         await state.update_data(comment="Без комментария")
         await next_offer_step(message, state, OfferForm.phone)
     elif action == "back":
-        if current == OfferForm.edit.state or data.get("offer_editing"):
-            await next_offer_step(message, state, OfferForm.review)
-        elif current == OfferForm.comment.state:
-            await show_offer_step(message, state, OfferForm.price)
+        await back_in_form(message, state, current)
     elif action == "edit" and current == OfferForm.review.state:
         await show_offer_step(message, state, OfferForm.edit)
     elif current == OfferForm.edit.state and action in OFFER_EDIT_FIELDS:
@@ -584,7 +753,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
     phone = data["phone"]
     lead = await get_lead(int(data["lead_id"]))
     if not lead or lead["status"] != "published":
-        await clear_offer_keyboard(message, state)
+        await clear_form_keyboard(message, state)
         await state.clear()
         await message.answer("Заявка уже недоступна.", reply_markup=main_menu())
         return
@@ -600,7 +769,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
         lead["id"], provider.id, provider_name, username,
         data["price"], data["comment"], phone,
     )
-    await clear_offer_keyboard(message, state)
+    await clear_form_keyboard(message, state)
     await state.clear()
     if offer_id is None:
         await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu())

@@ -42,7 +42,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.message.forward_origin = None
         self.message.from_user = SimpleNamespace(id=20, full_name="Исполнитель", username="test_provider")
         self.message.answer = AsyncMock(side_effect=[
-            SimpleNamespace(message_id=i) for i in range(100, 145)
+            SimpleNamespace(message_id=i) for i in range(100, 220)
         ])
 
     def step(self, action, message_id, markup=None):
@@ -56,7 +56,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
                                data=f"offer_step:{action}", answer=AsyncMock())
 
     async def click(self, action):
-        prompt = (await self.state.get_data())["offer_keyboard_id"]
+        prompt = (await self.state.get_data())["form_keyboard_id"]
         await bot.offer_step_action(self.step(action, prompt), self.state, self.telegram)
 
     async def saved_offers(self):
@@ -69,6 +69,100 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.message.text = "28000"
         await bot.offer_price(self.message, self.state)
         return self.message.answer.await_args.kwargs["reply_markup"]
+
+    async def nav(self, action):
+        prompt = (await self.state.get_data())["form_keyboard_id"]
+        callback = self.step(action, prompt)
+        callback.data = f"form_nav:{action}"
+        await bot.form_navigation(callback, self.state)
+        return callback
+
+    async def recover_current_step(self):
+        current = await self.state.get_state()
+        data = await self.state.get_data()
+        data.pop("form_keyboard_id", None)
+        await bot.open_navigation(self.message, self.state)
+        panel = self.message.answer.await_args.kwargs["reply_markup"]
+        self.assertEqual([b.text for row in panel.inline_keyboard for b in row],
+                         ["▶️ Продолжить анкету", bot.OFFER_BACK, bot.OFFER_HOME])
+        await self.nav("continue")
+        self.assertEqual(await self.state.get_state(), current)
+        restored = await self.state.get_data()
+        restored.pop("form_keyboard_id", None)
+        self.assertEqual(restored, data)
+
+    async def pick_lead_option(self, index):
+        prompt = (await self.state.get_data())["form_keyboard_id"]
+        callback = self.step(str(index), prompt)
+        callback.data = f"lead_step:{index}"
+        await bot.lead_choice(callback, self.state)
+
+    async def test_lead_recovers_all_steps_and_keeps_values_in_main_menu(self):
+        await bot.lead_start(self.message, self.state)
+        await self.recover_current_step()
+        await self.pick_lead_option(0)
+        await self.recover_current_step()
+        await self.pick_lead_option(0)
+        await self.recover_current_step()
+        await bot.open_navigation(self.message, self.state)
+        await self.nav("back")
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.region.state)
+        self.assertEqual((await self.state.get_data())["region"], "Москва")
+        await self.pick_lead_option(0)
+        for handler, value in (
+            (bot.lead_area, "СЗАО"),
+            (bot.lead_place, "улица Свободы"),
+            (bot.lead_date, "завтра в 9"),
+            (bot.lead_details, "Работа на смену"),
+        ):
+            self.message.text = value
+            await handler(self.message, self.state)
+            await self.recover_current_step()
+        await self.pick_lead_option(0)
+        await self.recover_current_step()
+        await bot.open_navigation(self.message, self.state)
+        await self.nav("home")
+        self.assertIsNone(await self.state.get_state())
+        keyboard = self.message.answer.await_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard.keyboard[0][0].text, bot.LEAD_DRAFT)
+        self.message.text = bot.LEAD_DRAFT
+        await bot.resume_form_from_menu(self.message, self.state)
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.phone.state)
+        self.assertEqual((await self.state.get_data())["details"], "Работа на смену")
+        self.assertEqual((await self.state.get_data())["payment_method"], bot.payment_preferences.CASH)
+        self.message.text = "+79990000001"
+        await bot.lead_phone(self.message, self.state, self.telegram)
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            rows = await (await db.execute("SELECT place, work_date, details FROM leads WHERE customer_id=20")).fetchall()
+        self.assertEqual(rows, [("улица Свободы", "завтра в 9", "Работа на смену")])
+
+    async def test_offer_recovers_all_steps_and_resumes_unsubmitted_review(self):
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_1"))
+        await self.recover_current_step()
+        self.message.text = "28000"
+        await bot.offer_price(self.message, self.state)
+        await self.recover_current_step()
+        await self.click("skip")
+        await self.recover_current_step()
+        self.assertTrue(self.message.answer.await_args.kwargs["reply_markup"].keyboard[0][0].request_contact)
+        self.message.text = "+79990000001"
+        await bot.offer_phone(self.message, self.state)
+        await self.recover_current_step()
+        await self.click("edit")
+        await self.recover_current_step()
+        await bot.open_navigation(self.message, self.state)
+        await self.nav("back")
+        self.assertEqual(await self.state.get_state(), bot.OfferForm.review.state)
+        await self.click("home")
+        self.assertEqual(await self.saved_offers(), [])
+        await bot.lead_start(self.message, self.state)
+        self.message.text = bot.OFFER_DRAFT
+        await bot.resume_form_from_menu(self.message, self.state)
+        self.assertEqual(await self.state.get_state(), bot.OfferForm.review.state)
+        self.assertEqual((await self.state.get_data())["phone"], "+79990000001")
+        self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.equipment.state)
+        await self.click("send")
+        self.assertEqual(await self.saved_offers(), [("28000", "Без комментария", "+79990000001")])
 
     async def test_keyboard_replacement_back_and_home(self):
         comment_markup = await self.enter_comment()
@@ -89,7 +183,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("home")
         self.assertIsNone(await self.state.get_state())
         self.assertEqual(await self.state.get_data(), {})
-        self.assertEqual(self.message.answer.await_args.kwargs["reply_markup"], bot.main_menu())
+        self.assertEqual(self.message.answer.await_args.kwargs["reply_markup"], bot.main_menu((bot.OFFER_DRAFT,)))
+        self.assertEqual(await bot.draft_slot(self.state, "offer").get_state(), bot.OfferForm.comment.state)
         self.assertEqual(await self.saved_offers(), [])
 
     async def test_phone_validation_and_own_contact(self):
@@ -119,7 +214,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("skip")
         self.message.text = "+79990000001"
         await bot.offer_phone(self.message, self.state)
-        old_review = (await self.state.get_data())["offer_keyboard_id"]
+        old_review = (await self.state.get_data())["form_keyboard_id"]
         await self.click("edit")
         await self.click("price")
         self.message.text = "30000"
@@ -156,7 +251,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.offer_phone(self.message, self.state)
         self.assertEqual(await self.saved_offers(), [])
         self.telegram.send_message.assert_not_awaited()
-        confirm_id = (await self.state.get_data())["offer_keyboard_id"]
+        confirm_id = (await self.state.get_data())["form_keyboard_id"]
         await self.click("send")
         sends = self.telegram.send_message.await_count
         await bot.offer_step_action(self.step("send", confirm_id), self.state, self.telegram)

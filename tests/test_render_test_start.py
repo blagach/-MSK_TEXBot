@@ -34,6 +34,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             username=worker.TEST_BOT, is_bot=True,
         ))
         self.telegram.get_webhook_info = AsyncMock(return_value=SimpleNamespace(url=""))
+        self.telegram.set_my_commands = AsyncMock()
+        self.telegram.set_chat_menu_button = AsyncMock()
         self.bot = MagicMock()
         self.bot.return_value.__aenter__.return_value = self.telegram
         self.dispatcher = MagicMock()
@@ -59,6 +61,10 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.app.init_db.assert_awaited_once()
         self.telegram.session.middleware.assert_called()
         self.dispatcher.update.outer_middleware.assert_called_once()
+        commands = self.telegram.set_my_commands.await_args
+        self.assertEqual([item.command for item in commands.args[0]], ["start", "menu", "cancel"])
+        self.assertEqual(commands.kwargs["scope"].type, "all_private_chats")
+        self.assertEqual(self.telegram.set_chat_menu_button.await_args.kwargs["menu_button"].type, "commands")
         self.dispatcher.start_polling.assert_awaited_once_with(
             self.telegram, allowed_updates=["message", "callback_query"], close_bot_session=False,
         )
@@ -93,6 +99,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 await self.launch(env)
         self.bot.assert_not_called()
         self.app.init_db.assert_not_awaited()
+        self.telegram.set_my_commands.assert_not_awaited()
 
     async def test_worker_rejects_production_token_and_existing_webhook(self):
         self.telegram.get_me.return_value.username = "MSK_TEXBot"

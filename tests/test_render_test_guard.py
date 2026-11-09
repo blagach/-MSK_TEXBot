@@ -2,6 +2,9 @@ import unittest
 from types import SimpleNamespace as Record
 from unittest.mock import AsyncMock
 
+from aiogram.methods import SetChatMenuButton, SetMyCommands
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeDefault, MenuButtonCommands
+
 from render_test_guard import IsolationError, TelegramIsolation, verify_identity
 
 
@@ -105,6 +108,18 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(method=name), self.assertRaises(IsolationError):
                 await self.send(api(name, chat_id=101))
         self.request.assert_not_awaited()
+
+    async def test_only_private_command_menu_configuration_is_allowed(self):
+        commands = [BotCommand(command="menu", description="Восстановить кнопки")]
+        await self.send(SetMyCommands(commands=commands, scope=BotCommandScopeAllPrivateChats()))
+        await self.send(SetChatMenuButton(menu_button=MenuButtonCommands()))
+        for method in (
+            SetMyCommands(commands=commands, scope=BotCommandScopeDefault()),
+            SetChatMenuButton(chat_id=999, menu_button=MenuButtonCommands()),
+        ):
+            with self.assertRaises(IsolationError):
+                await self.send(method)
+        self.assertEqual(self.request.await_count, 2)
 
     async def test_unknown_incoming_ignored(self):
         handler = AsyncMock()
