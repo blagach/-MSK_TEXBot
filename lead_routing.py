@@ -1,6 +1,7 @@
 """Structured lead routing fields; additive and backward compatible."""
 import aiosqlite
 import provider_registry
+import waste_requests
 
 async def init_schema(db_path="bot.db"):
     async with aiosqlite.connect(db_path) as db:
@@ -13,7 +14,7 @@ async def init_schema(db_path="bot.db"):
         await db.commit()
 
 def validate(category, region, area):
-    if category not in provider_registry.CATEGORIES:
+    if category not in provider_registry.CATEGORIES and category not in waste_requests.DIRECTIONS.values():
         raise ValueError("Выберите категорию техники из списка")
     if region not in provider_registry.REGIONS:
         raise ValueError("Выберите Москву или Московскую область")
