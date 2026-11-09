@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
+import payment_preferences
 import storage
 
 
@@ -35,6 +36,7 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
             for i in (1, 2, 3):
                 db.execute("""INSERT INTO leads VALUES (?,777,'Заказчик','каток','СЗАО','завтра','Работа','+79990000000','new','now')""", (i,))
         await storage.init_schema()
+        await payment_preferences.init_schema(self.db_path)
 
     async def asyncTearDown(self):
         for p in reversed(self.patchers):

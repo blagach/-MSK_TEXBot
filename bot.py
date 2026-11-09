@@ -175,16 +175,28 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
         f"Когда: {lead['work_date']}\n"
         f"Детали: {lead['details']}"
     )
+    payment_method = lead["payment_method"] or "Не указана"
+    text += f"\nФорма оплаты: {payment_method}"
     if with_phone:
         text += f"\nКонтакт заказчика: {lead['phone']}"
     return text
 
 
-async def get_lead(lead_id: int):
+async def read_lead(db: aiosqlite.Connection, lead_id: int) -> aiosqlite.Row | None:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(
+        """SELECT leads.*, lead_payment_preferences.method AS payment_method
+           FROM leads
+           LEFT JOIN lead_payment_preferences ON lead_payment_preferences.lead_id = leads.id
+           WHERE leads.id = ?""",
+        (lead_id,),
+    ) as cursor:
+        return await cursor.fetchone()
+
+
+async def get_lead(lead_id: int) -> aiosqlite.Row | None:
     async with aiosqlite.connect(storage.DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)) as cursor:
-            return await cursor.fetchone()
+        return await read_lead(db, lead_id)
 
 
 async def valid_input(message: Message, limit: int, phone: bool = False) -> bool:
@@ -451,8 +463,10 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
                  data["work_date"], data["details"], message.text.strip(), created_at),
             )
             lead_id = cursor.lastrowid
-            await payment_preferences.write_lead(db, lead_id, data.get("payment_method", payment_preferences.ANY))
+            if (payment_method := data.get("payment_method")) is not None:
+                await payment_preferences.write_lead(db, lead_id, payment_method)
             await lead_routing.write(db, lead_id, data["equipment"], data["region"], data["area"])
+            lead = await read_lead(db, lead_id)
             await db.commit()
     except aiosqlite.Error:
         logging.exception("Could not save lead and its routing")
@@ -460,10 +474,6 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         return
 
     await state.clear()
-    lead = {
-        "id": lead_id, "equipment": data["equipment"], "place": data["place"],
-        "work_date": data["work_date"], "details": data["details"], "phone": message.text.strip(),
-    }
     # Diagnostics are optional. A saved lead must reach moderation even if they fail.
     try:
         shadow = await lead_shadow_review.evaluate(
