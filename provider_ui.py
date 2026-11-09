@@ -385,7 +385,7 @@ async def return_to_machine_card(message, state, status):
     item = next((item for item in items if item["id"] == machine_id), None)
     await nav.return_to_provider_menu(state)
     await nav.remember_screen(state, nav.MY_MACHINES, default_parent=nav.PROVIDERS)
-    await message.answer(status, reply_markup=nav.section_menu())
+    await message.answer(status, reply_markup=nav.main_menu())
     if item:
         await message.answer(machine_card(item), reply_markup=machine_buttons(item))
 

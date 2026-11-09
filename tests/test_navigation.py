@@ -70,6 +70,18 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(self.session.await_count, count, f"No reply to {text}")
         return self.session.await_args.args[1]
 
+    async def click(self, data):
+        self.update_id += 1
+        await self.dispatcher.feed_update(self.telegram, Update.model_validate({
+            "update_id": self.update_id,
+            "callback_query": {
+                "id": str(self.update_id), "chat_instance": "test", "data": data,
+                "from": {"id": self.user_id, "is_bot": False, "first_name": "Тест"},
+                "message": {"message_id": 900, "date": 1700000000,
+                            "chat": {"id": self.user_id, "type": "private"}, "text": "Анкета"},
+            },
+        }))
+
     async def sql(self, query, args=()):
         async with aiosqlite.connect(storage.DB_PATH) as db:
             cursor = await db.execute(query, args)
@@ -342,24 +354,18 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         buttons = {button.text: button.callback_data
                    for row in prompt.reply_markup.inline_keyboard for button in row}
 
-        async def click(data):
-            self.update_id += 1
-            await self.dispatcher.feed_update(self.telegram, Update.model_validate({
-                "update_id": self.update_id,
-                "callback_query": {
-                    "id": str(self.update_id), "chat_instance": "test", "data": data,
-                    "from": {"id": self.user_id, "is_bot": False, "first_name": "Тест"},
-                    "message": {"message_id": 900, "date": 1700000000,
-                                "chat": {"id": self.user_id, "type": "private"}, "text": "Анкета"},
-                },
-            }))
-
-        await click(buttons[nav.BACK])
+        await self.click(buttons[nav.BACK])
         self.assertEqual(await self.state().get_state(), bot.OfferForm.price.state)
-        await click(buttons["Без комментария"])
+        await self.click(buttons["Без комментария"])
         self.assertEqual(await self.state().get_state(), bot.OfferForm.price.state)
         prompt = await self.send("28 000 рублей")
-        await click(prompt.reply_markup.inline_keyboard[0][0].callback_data)
+        before_phone = self.session.await_count
+        await self.click(prompt.reply_markup.inline_keyboard[0][0].callback_data)
+        phone_messages = [call.args[1] for call in self.session.await_args_list[before_phone:]
+                          if call.args[1].__api_method__ == "sendMessage"]
+        self.assertEqual(len(phone_messages), 1)
+        self.assertIn("Укажите номер телефона для связи с заказчиком", phone_messages[0].text)
+        self.assertTrue({nav.SHARE_PHONE, nav.PROFILE_PHONE, nav.BACK, nav.HOME} <= set(self.labels(phone_messages[0])))
         self.assertEqual(await self.state().get_state(), bot.OfferForm.phone.state)
         await self.send("89991234567")
         self.assertEqual(await self.sql("SELECT price,comment FROM offers"),
@@ -385,7 +391,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         for value in ("/start lead_37", "28000", "Без комментария", nav.PROFILE_PHONE):
             await self.send(value)
         offer = next(c.args[1] for c in self.session.await_args_list
-                     if getattr(c.args[1], "chat_id", None) == 502 and "появился отклик" in c.args[1].text)
+                     if getattr(c.args[1], "chat_id", None) == 502 and "Новое предложение по заявке" in c.args[1].text)
         self.assertTrue(all(method in offer.text for method in payments.METHODS))
 
     async def test_waste_publication_dispatch_respects_paused_equipment(self):
@@ -549,13 +555,79 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await self.send("каток")
         await self.send("Москва")
         draft = await self.state().get_data()
-        for action in (nav.MY_REQUESTS, nav.REGISTER, nav.ADD_MACHINE, "/start", "/start lead_999"):
+        for action in (nav.MY_REQUESTS, nav.REGISTER, nav.ADD_MACHINE, "/start"):
             self.assertIn("Анкета ещё открыта", (await self.send(action)).text)
             self.assertEqual(await self.state().get_state(), bot.LeadForm.area.state)
             self.assertEqual(await self.state().get_data(), draft)
+        self.assertIn("недоступна", (await self.send("/start lead_999")).text)
+        self.assertEqual(await self.state().get_data(), draft)
         await self.send("Куркино")
         self.assertEqual((await self.state().get_data())["area"], "Куркино")
         self.assertIn("отменено", (await self.send("/cancel")).text)
+
+    async def test_switch_offer_requires_consent_and_keeps_saved_data(self):
+        await self.add_lead(37)
+        await self.add_lead(38)
+        await self.send("/start lead_37")
+        await self.send("28000")
+        choice = (await self.send("/start lead_38")).reply_markup.inline_keyboard
+        await self.click(choice[0][0].callback_data)
+        self.assertEqual(await self.state().get_state(), bot.OfferForm.comment.state)
+        self.assertEqual((await self.state().get_data())["price"], "28000")
+        await self.click(choice[1][0].callback_data)
+        self.assertEqual((await self.state().get_data())["lead_id"], 37)
+        choice = (await self.send("/start lead_38")).reply_markup.inline_keyboard
+        await self.click(choice[1][0].callback_data)
+        self.assertEqual(await self.state().get_state(), bot.OfferForm.price.state)
+        self.assertEqual((await self.state().get_data())["lead_id"], 38)
+        self.assertNotIn("price", await self.state().get_data())
+        self.assertEqual(await self.sql("SELECT id FROM leads ORDER BY id"), [(37,), (38,)])
+
+    async def test_unavailable_target_does_not_discard_previous_draft(self):
+        await self.add_lead(37)
+        await self.send(nav.PLACE_REQUEST)
+        await self.send("каток")
+        choice = (await self.send("/start lead_37")).reply_markup.inline_keyboard
+        await self.sql("UPDATE leads SET status='closed' WHERE id=37")
+        await self.click(choice[1][0].callback_data)
+        self.assertEqual(await self.state().get_state(), bot.LeadForm.region.state)
+        self.assertEqual((await self.state().get_data())["equipment"], "каток")
+
+    async def test_new_equipment_notice_resumes_after_reactivation(self):
+        user_id = self.user_id
+        await bot.provider_registry.register_new_provider(
+            user_id, "Исполнитель", "+79991234567", {payments.CASH}, storage.DB_PATH,
+        )
+        machine_id = await bot.provider_registry.add_equipment(
+            user_id, "каток", "Машина", "Москва", "СЗАО", storage.DB_PATH,
+        )
+        for lead_id in (37, 38):
+            await self.add_lead(lead_id)
+            await self.sql("INSERT INTO lead_routing VALUES (?, 'каток', 'Москва', 'СЗАО')", (lead_id,))
+        with patch.object(bot, "settings", replace(bot.settings, test_notification_provider_ids=frozenset({user_id}))):
+            await bot.provider_registry.change_equipment_status(user_id, machine_id, False, storage.DB_PATH)
+            await bot.notify_test_providers(self.telegram, await bot.get_lead(37))
+            self.session.assert_not_awaited()
+            await bot.provider_registry.change_equipment_status(user_id, machine_id, True, storage.DB_PATH)
+            await bot.notify_test_providers(self.telegram, await bot.get_lead(38))
+            await bot.notify_test_providers(self.telegram, await bot.get_lead(38))
+        self.session.assert_awaited_once()
+        sent = self.session.await_args.args[1]
+        self.assertEqual(sent.reply_markup.inline_keyboard[0][0].url,
+                         "https://t.me/OfflineTestBot?start=lead_38")
+
+    async def test_moderator_menu_preserves_active_form(self):
+        self.user_id = 1
+        await self.send(nav.PLACE_REQUEST)
+        before = await self.state().get_data()
+        await self.click("moderation_home")
+        self.assertEqual(await self.state().get_state(), bot.LeadForm.equipment.state)
+        self.assertEqual(await self.state().get_data(), before)
+        await self.state().clear()
+        await self.click("moderation_home")
+        self.assertEqual(self.labels(self.session.await_args.args[1]), self.labels(
+            SimpleNamespace(reply_markup=nav.main_menu())
+        ))
 
     async def test_add_machine_for_blocked_provider_stays_in_menu(self):
         await self.sql(
@@ -638,30 +710,41 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
             confirmation = telegram.send_message.await_args_list[1]
             self.assertEqual(confirmation.args[1], "Ваша заявка №1 опубликована")
             self.assertEqual(confirmation.kwargs["reply_markup"].inline_keyboard[0][0].url, "https://t.me/c/123/72")
-            self.assertIn("Подходящая заявка", telegram.send_message.await_args_list[2].args[1])
+            notification = telegram.send_message.await_args_list[2]
+            self.assertIn("Подходящая заявка", notification.args[1])
+            self.assertNotIn("https://t.me/", notification.args[1])
+            button = notification.kwargs["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(button.text, "🚜 Откликнуться на заявку")
+            self.assertEqual(button.url, "https://t.me/OfflineTestBot?start=lead_1")
             self.user_id = provider
             for value in ("/start lead_1", "25000", "С подачей", nav.PROFILE_PHONE):
                 await self.send(value)
             offer = next(c.args[1] for c in self.session.await_args_list
-                         if c.args[1].text.startswith("По вашей заявке появился отклик"))
+                         if c.args[1].text.startswith("🚜 Новое предложение по заявке"))
             self.assertEqual(offer.chat_id, customer)
             self.assertIn(payments.VAT, offer.text)
             self.assertIn(payments.NO_VAT, offer.text)
-            self.assertIn("+79991234567", offer.text)
-            buttons = offer.reply_markup.inline_keyboard[0]
-            self.assertEqual(buttons[0].url, "tg://user?id=1")
+            self.assertNotIn("+79991234567", offer.text)
+            self.assertEqual(offer.reply_markup.inline_keyboard[0][0].url, "tg://user?id=1")
+            buttons = offer.reply_markup.inline_keyboard[1]
+            self.assertEqual([button.text for button in buttons], ["📱 Показать номер", "📞 Позвонить"])
             self.assertEqual((await self.send("/start lead_1")).text, "Вы уже откликнулись на эту заявку")
             self.assertEqual(await self.sql("SELECT count(*) FROM offers"), [(1,)])
-            call = SimpleNamespace(from_user=SimpleNamespace(id=customer), data=buttons[1].callback_data,
+            call = SimpleNamespace(from_user=SimpleNamespace(id=customer), data=buttons[0].callback_data,
                                    answer=AsyncMock())
-            self.assertEqual(buttons[1].text, "📞 Показать номер")
-            phone_bot = SimpleNamespace(send_message=AsyncMock())
+            phone_bot = SimpleNamespace(send_message=AsyncMock(), send_contact=AsyncMock())
             await bot.call_provider(call, phone_bot)
             self.assertEqual(phone_bot.send_message.await_args.args, (customer, "Телефон исполнителя: +79991234567"))
             copy = phone_bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
             self.assertEqual(copy.copy_text.text, "+79991234567")
+            call.data = buttons[1].callback_data
+            await bot.call_provider(call, phone_bot)
+            phone_bot.send_contact.assert_awaited_once_with(customer, "+79991234567", "MST Тест")
             call.from_user.id = 12345
             await bot.call_provider(call, phone_bot)
+            call.data = buttons[0].callback_data
+            await bot.call_provider(call, phone_bot)
+            phone_bot.send_contact.assert_awaited_once()
             phone_bot.send_message.assert_awaited_once()
 
     async def test_rejection_reason_is_stored_and_sent_once(self):
