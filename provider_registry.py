@@ -11,6 +11,12 @@ import aiosqlite
 import payment_preferences
 
 DEFAULT_DB_PATH = "bot.db"
+SERVICE_DIRECTIONS = (
+    "Вывоз грунта", "Вывоз снега", "Вывоз строительных отходов",
+    "Перевозка сыпучих материалов", "Доставка песка, щебня и других материалов",
+    "Приём грунта и отходов на площадках",
+)
+MACHINE_FIELDS = ("brand", "model", "specifications", "attachments", "notes")
 PHONE_RE = re.compile(r"(?:\+7|8)[0-9]{10}\Z")
 CATEGORIES = frozenset({
     "мини-экскаватор", "мини-погрузчик", "экскаватор-погрузчик",
@@ -33,9 +39,15 @@ def _validate_name(name):
 
 
 def _validate_phone(phone):
-    if not isinstance(phone, str) or not PHONE_RE.fullmatch(phone.strip()):
-        raise ValueError("Номер телефона должен быть в формате +7XXXXXXXXXX или 8XXXXXXXXXX")
-    return phone.strip()
+    if not isinstance(phone, str) or len(phone) > 32:
+        raise ValueError("Номер телефона должен начинаться с +7 или 8 и содержать 11 цифр")
+    compact = phone.translate(str.maketrans("", "", " ()-\u00a0\u202f"))
+    if compact.startswith("7"):
+        compact = "+" + compact  # Telegram contact cards can omit the plus.
+    if not PHONE_RE.fullmatch(compact):
+        raise ValueError("Номер телефона должен начинаться с +7 или 8 и содержать 11 цифр")
+    return "+7" + compact[-10:]
+
 
 
 async def init_schema(db_path=DEFAULT_DB_PATH):
@@ -61,6 +73,16 @@ async def init_schema(db_path=DEFAULT_DB_PATH):
         )""")
         await db.execute("""CREATE INDEX IF NOT EXISTS idx_provider_equipment_matching
             ON provider_equipment(category, region, active)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS provider_equipment_details (
+            equipment_id INTEGER PRIMARY KEY REFERENCES provider_equipment(id),
+            brand TEXT NOT NULL, model TEXT NOT NULL, specifications TEXT NOT NULL,
+            attachments TEXT NOT NULL, notes TEXT NOT NULL
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS provider_services (
+            provider_id INTEGER NOT NULL REFERENCES provider_profiles(telegram_id),
+            direction TEXT NOT NULL, selected INTEGER NOT NULL CHECK(selected IN (0,1)),
+            PRIMARY KEY(provider_id, direction)
+        )""")
         await db.commit()
 
 
@@ -107,7 +129,7 @@ async def register_new_provider(telegram_id, name, phone, methods, db_path=DEFAU
 
 
 async def add_equipment(telegram_id, category, description, region, area,
-                        db_path=DEFAULT_DB_PATH):
+                        db_path=DEFAULT_DB_PATH, *, fields=None):
     if category not in CATEGORIES or region not in SERVICE_REGIONS:
         raise ValueError("Выберите категорию техники и регион из списка")
     if not isinstance(description, str) or not 1 <= len(description.strip()) <= 200:
@@ -120,15 +142,17 @@ async def add_equipment(telegram_id, category, description, region, area,
             SELECT telegram_id, ?, ?, ?, ?, ? FROM provider_profiles
             WHERE telegram_id=? AND blocked=0""",
             (category, description.strip(), region, area.strip(), _now(), telegram_id))
-        await db.commit()
         if cursor.rowcount != 1:
             raise ValueError("Сначала зарегистрируйтесь; заблокированный профиль недоступен")
+        if fields is not None:
+            await write_machine_details(db, cursor.lastrowid, fields)
+        await db.commit()
         return cursor.lastrowid
 
 
 async def update_equipment(telegram_id, equipment_id, *, category, description,
-                           region, area, active=True, db_path=DEFAULT_DB_PATH):
-    if category not in CATEGORIES or region not in REGIONS:
+                           region, area, active=True, db_path=DEFAULT_DB_PATH, fields=None):
+    if category not in CATEGORIES or region not in SERVICE_REGIONS:
         raise ValueError("Некорректная категория или регион")
     if not isinstance(description, str) or not 1 <= len(description.strip()) <= 200:
         raise ValueError("Некорректное описание")
@@ -136,13 +160,103 @@ async def update_equipment(telegram_id, equipment_id, *, category, description,
         raise ValueError("Некорректный район")
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute("""UPDATE provider_equipment SET
-            category=?, description=?, region=?, area=?, active=?
+            category=?, description=?, region=?, area=?, active=COALESCE(?, active)
             WHERE id=? AND provider_id=? AND EXISTS (
                 SELECT 1 FROM provider_profiles WHERE telegram_id=? AND blocked=0
-            )""", (category, description.strip(), region, area.strip(), int(bool(active)),
+            )""", (category, description.strip(), region, area.strip(), None if active is None else int(bool(active)),
                    equipment_id, telegram_id, telegram_id))
+        if cursor.rowcount and fields is not None:
+            await write_machine_details(db, equipment_id, fields)
         await db.commit()
         return cursor.rowcount == 1
+
+
+async def write_machine_details(db, equipment_id, fields):
+    await db.execute("""INSERT INTO provider_equipment_details VALUES (?,?,?,?,?,?)
+        ON CONFLICT(equipment_id) DO UPDATE SET brand=excluded.brand, model=excluded.model,
+        specifications=excluded.specifications, attachments=excluded.attachments, notes=excluded.notes""",
+        (equipment_id, *(fields[key] for key in MACHINE_FIELDS)))
+
+
+async def get_profile(telegram_id, db_path=DEFAULT_DB_PATH):
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        return await (await db.execute(
+            "SELECT * FROM provider_profiles WHERE telegram_id=?", (telegram_id,)
+        )).fetchone()
+
+
+async def edit_profile(telegram_id, field, value, db_path=DEFAULT_DB_PATH):
+    columns = {"name": "display_name", "phone": "phone"}
+    if field not in {*columns, "payment"}:
+        raise ValueError("Неизвестное поле профиля")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        if field == "payment":
+            cursor = await db.execute(
+                "UPDATE provider_profiles SET updated_at=? WHERE telegram_id=? AND blocked=0",
+                (_now(), telegram_id),
+            )
+            if cursor.rowcount:
+                await payment_preferences.write_provider_revision(db, telegram_id, value)
+        else:
+            column = columns[field]
+            value = _validate_name(value) if field == "name" else _validate_phone(value)
+            cursor = await db.execute(
+                f"UPDATE provider_profiles SET {column}=?, updated_at=? WHERE telegram_id=? AND blocked=0",
+                (value, _now(), telegram_id),
+            )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def toggle_notifications(telegram_id, expected, db_path=DEFAULT_DB_PATH):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """UPDATE provider_profiles SET notifications_enabled=?, updated_at=?
+               WHERE telegram_id=? AND blocked=0 AND notifications_enabled=?""",
+            (int(not expected), _now(), telegram_id, int(expected)),
+        )
+        await db.commit()
+
+
+async def change_equipment_status(telegram_id, equipment_id, active, db_path=DEFAULT_DB_PATH):
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            """UPDATE provider_equipment SET active=? WHERE id=? AND provider_id=?
+               AND EXISTS (SELECT 1 FROM provider_profiles WHERE telegram_id=? AND blocked=0)""",
+            (int(active), equipment_id, telegram_id, telegram_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def provider_services(telegram_id, db_path=DEFAULT_DB_PATH):
+    async with aiosqlite.connect(db_path) as db:
+        rows = await (await db.execute(
+            "SELECT direction FROM provider_services WHERE provider_id=? AND selected=1",
+            (telegram_id,),
+        )).fetchall()
+        return [row[0] for row in rows]
+
+
+async def save_services(telegram_id, selected, db_path=DEFAULT_DB_PATH):
+    if not set(selected) <= set(SERVICE_DIRECTIONS):
+        raise ValueError("Неизвестное направление")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        exists = await (await db.execute(
+            "SELECT 1 FROM provider_profiles WHERE telegram_id=? AND blocked=0", (telegram_id,)
+        )).fetchone()
+        if not exists:
+            return False
+        await db.executemany(
+            """INSERT INTO provider_services VALUES (?,?,?) ON CONFLICT(provider_id,direction)
+               DO UPDATE SET selected=excluded.selected""",
+            [(telegram_id, direction, int(direction in selected)) for direction in SERVICE_DIRECTIONS],
+        )
+        await db.commit()
+        return True
 
 
 async def set_notifications(telegram_id, enabled, db_path=DEFAULT_DB_PATH):
@@ -170,8 +284,10 @@ async def set_blocked(telegram_id, blocked, *, admin_id, admin_ids,
 async def list_equipment(telegram_id, db_path=DEFAULT_DB_PATH):
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("""SELECT id, category, description, region, area, active
-            FROM provider_equipment WHERE provider_id=? ORDER BY id""",
+        async with db.execute("""SELECT e.id, e.category, e.description, e.region, e.area, e.active,
+                   d.brand, d.model, d.specifications, d.attachments, d.notes
+            FROM provider_equipment e LEFT JOIN provider_equipment_details d ON d.equipment_id=e.id
+            WHERE e.provider_id=? ORDER BY e.id""",
             (telegram_id,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 

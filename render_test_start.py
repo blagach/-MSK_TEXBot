@@ -10,7 +10,7 @@ from typing import Mapping
 from aiogram import Bot
 from aiogram.exceptions import TelegramConflictError
 
-from render_test_backup import snapshot
+from render_test_backup import snapshot, verify_small_snapshot
 from render_test_guard import IsolationError, TelegramIsolation, verify_identity
 
 TEST_BOT = "Msktex_test_dmitry_bot"
@@ -78,10 +78,16 @@ async def start() -> None:
         if database.exists():
             backup_path, digest = snapshot(database)
             logging.info("Test SQLite backup %s SHA-256 %s", backup_path.name, digest)
+            counts = verify_small_snapshot(backup_path)
+            if counts is not None:
+                logging.info("Test SQLite restore verified: leads=%s offers=%s", *counts)
+            else:
+                logging.info("Test SQLite restore requires a separate file (snapshot exceeds 16 MiB)")
 
         os.environ.update(
             BOT_TOKEN=config.token, BOT_USERNAME=TEST_BOT, ADMIN_IDS=str(config.admin_id),
-            LEADS_CHANNEL_ID=str(config.channel_id), PAYMENT_URL="", TEST_NOTIFICATION_PROVIDER_IDS="",
+            LEADS_CHANNEL_ID=str(config.channel_id), PAYMENT_URL="",
+            TEST_NOTIFICATION_PROVIDER_IDS=",".join(map(str, sorted(config.testers))),
         )
         app = importlib.import_module("bot")
         app.storage.DB_PATH = str(database)

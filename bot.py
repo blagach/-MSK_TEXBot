@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    KeyboardButton,
 )
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
@@ -113,8 +115,8 @@ LEAD_STEPS = nav.Form({
         (payment_preferences.NO_VAT,), (payment_preferences.ANY,),
     ),
     LeadForm.phone: (
-        "Введите номер телефона для связи без пробелов, скобок и дефисов. "
-        "Например, +79123456789 или 89123456789.",
+        "Введите телефон для связи или отправьте свой контакт.",
+        (KeyboardButton(text=nav.SHARE_PHONE, request_contact=True),),
     ),
 })
 
@@ -153,8 +155,9 @@ OFFER_STEPS = nav.Form({
         ("Без комментария",),
     ),
     OfferForm.phone: (
-        "Введите свой телефон, чтобы заказчик мог с вами связаться. "
-        "Например, +7 912 345-67-89, 79123456789 или 89123456789.",
+        "Введите свой телефон, чтобы заказчик мог с вами связаться.",
+        (KeyboardButton(text=nav.SHARE_PHONE, request_contact=True),),
+        (nav.PROFILE_PHONE,),
     ),
 })
 
@@ -274,10 +277,9 @@ async def get_lead(lead_id: int) -> aiosqlite.Row | None:
         return await read_lead(db, lead_id)
 
 
-async def valid_input(message: Message, limit: int, phone: bool = False) -> bool:
-    if not storage.valid_text(message.text, limit, phone):
-        await message.answer("Введите телефон в формате +7XXXXXXXXXX или 8XXXXXXXXXX." if phone
-                             else f"Отправьте текст от 1 до {limit} символов.")
+async def valid_input(message: Message, limit: int) -> bool:
+    if not storage.valid_text(message.text, limit):
+        await message.answer(f"Отправьте текст от 1 до {limit} символов.")
         return False
     return True
 
@@ -294,9 +296,10 @@ async def notify(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
 
 async def finish_navigation(message: Message, state: FSMContext, text: str) -> None:
     current = await state.get_state()
-    if any(form.contains(current) for form in (provider_ui.REGISTRATION_STEPS, provider_ui.MACHINE_STEPS)):
+    if (any(form.contains(current) for form in (provider_ui.REGISTRATION_STEPS, provider_ui.MACHINE_STEPS))
+            or current in provider_ui.PROFILE_STATES):
         await nav.return_to_provider_menu(state)
-        await message.answer(text, reply_markup=nav.PROVIDER_MENU)
+        await message.answer(text, reply_markup=await provider_ui.provider_keyboard(message.from_user.id))
         return
     history = (await state.get_data()).get("screens", [])
     if history:
@@ -323,6 +326,9 @@ async def home(message: Message, state: FSMContext) -> None:
 @router.message(F.text.in_({nav.BACK, "Назад"}))
 async def back(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
+    if current in provider_ui.PROFILE_STATES:
+        await finish_navigation(message, state, "Заполнение отменено.")
+        return
     data = await state.get_data()
     forms = (WASTE_STEPS, *FORMS[1:]) if data.get("waste_flow") else FORMS
     for form in forms:
@@ -334,6 +340,8 @@ async def back(message: Message, state: FSMContext) -> None:
                 previous = LeadForm.waste_mass
             if previous is None:
                 await finish_navigation(message, state, "Заполнение отменено.")
+            elif previous == provider_ui.Register.payment:
+                await provider_ui.show_selection(message, state, previous, payment_preferences.PAYMENT_OPTIONS)
             elif form is WASTE_STEPS:
                 await show_lead_step(message, state, previous)
             else:
@@ -348,12 +356,13 @@ async def back(message: Message, state: FSMContext) -> None:
 
 
 @router.message(
-    StateFilter(*WASTE_STEPS.steps, *(step for form in FORMS[1:] for step in form.steps)),
+    StateFilter(*WASTE_STEPS.steps, *(step for form in FORMS[1:] for step in form.steps), *provider_ui.PROFILE_STATES),
     F.text.in_({
         nav.PLACE_REQUEST, "📝 Оставить заявку", nav.FIND_EQUIPMENT,
         nav.PROVIDERS, "🚜 Я исполнитель", nav.MY_REQUESTS, nav.ACCOUNT, nav.HELP,
         nav.REGISTER, nav.PROFILE, nav.PAYMENT, nav.ADD_MACHINE, nav.MY_MACHINES,
-        nav.ENABLE_NOTIFICATIONS, nav.DISABLE_NOTIFICATIONS,
+        nav.ENABLE_NOTIFICATIONS, nav.DISABLE_NOTIFICATIONS, nav.NOTIFICATIONS_ON, nav.NOTIFICATIONS_OFF,
+        nav.EDIT_PROFILE, nav.SERVICES,
     }),
 )
 async def keep_active_form(message: Message) -> None:
@@ -366,7 +375,7 @@ async def providers_menu(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Раздел исполнителя. Здесь можно зарегистрироваться, добавить технику "
         "или открыть существующий профиль.",
-        reply_markup=nav.PROVIDER_MENU,
+        reply_markup=await provider_ui.provider_keyboard(message.from_user.id),
     )
 
 
@@ -436,17 +445,28 @@ async def show_section(message: Message, state: FSMContext, section: str) -> Non
 
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await state.get_state():
-        await keep_active_form(message)
-        return
-    await state.clear()
     if not command.args or not command.args.startswith("lead_"):
+        if await state.get_state():
+            await keep_active_form(message)
+            return
         await message.answer("Ссылка на заявку устарела. Откройте актуальную заявку в канале.", reply_markup=main_menu())
         return
     lead_id = storage.parse_id(command.args, "lead_")
     if lead_id is None:
         await message.answer("Некорректная ссылка на заявку.", reply_markup=main_menu())
         return
+    if await storage.has_offer(lead_id, message.from_user.id):
+        current = await state.get_state()
+        if OFFER_STEPS.contains(current) and (await state.get_data()).get("lead_id") == lead_id:
+            await state.clear()
+            await message.answer("Вы уже откликнулись на эту заявку", reply_markup=main_menu())
+        else:
+            await message.answer("Вы уже откликнулись на эту заявку")
+        return
+    if await state.get_state():
+        await keep_active_form(message)
+        return
+    await state.clear()
     lead = await get_lead(lead_id)
     if not lead or lead["status"] != "published":
         await message.answer("Эта заявка уже недоступна.", reply_markup=main_menu())
@@ -589,7 +609,7 @@ async def lead_area(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.place)
 async def lead_place(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 300, phone=False):
+    if not await valid_input(message, 300):
         return
     await state.update_data(place=message.text)
     data = await state.get_data()
@@ -608,7 +628,7 @@ async def lead_waste_destination(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.date)
 async def lead_date(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 100, phone=False):
+    if not await valid_input(message, 100):
         return
     await state.update_data(work_date=message.text)
     await show_lead_step(message, state, LeadForm.details)
@@ -616,7 +636,7 @@ async def lead_date(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.details)
 async def lead_details(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 1500, phone=False):
+    if not await valid_input(message, 1500):
         return
     await state.update_data(details=message.text)
     await show_lead_step(message, state, LeadForm.payment)
@@ -633,7 +653,10 @@ async def lead_payment(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.phone)
 async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not await valid_input(message, 32, phone=True):
+    try:
+        phone = provider_registry._validate_phone(nav.phone_input(message))
+    except ValueError as exc:
+        await message.answer(str(exc))
         return
     data = await state.get_data()
     created_at = datetime.now(timezone.utc).isoformat()
@@ -643,7 +666,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
                 """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (message.from_user.id, message.from_user.full_name, data["equipment"], data["place"],
-                 data["work_date"], data["details"], message.text.strip(), created_at),
+                 data["work_date"], data["details"], phone, created_at),
             )
             lead_id = cursor.lastrowid
             if (payment_method := data.get("payment_method")) is not None:
@@ -672,7 +695,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         logging.exception("Shadow review unavailable for lead %s", lead_id)
     markup = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_menu:{lead_id}"),
     ]])
     for admin_id in settings.admin_ids:
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
@@ -681,7 +704,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.message(OfferForm.price)
 async def offer_price(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 100, phone=False):
+    if not await valid_input(message, 100):
         return
     await state.update_data(price=message.text)
     await OFFER_STEPS.show(message, state, OfferForm.comment)
@@ -689,7 +712,7 @@ async def offer_price(message: Message, state: FSMContext) -> None:
 
 @router.message(OfferForm.comment)
 async def offer_comment(message: Message, state: FSMContext) -> None:
-    if not await valid_input(message, 1500, phone=False):
+    if not await valid_input(message, 1500):
         return
     await state.update_data(comment=message.text)
     await OFFER_STEPS.show(message, state, OfferForm.phone)
@@ -697,27 +720,33 @@ async def offer_comment(message: Message, state: FSMContext) -> None:
 
 @router.message(OfferForm.phone)
 async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
-    raw_phone = (message.text or "").strip()
-    phone = raw_phone.translate(str.maketrans("", "", " ()-\u00a0\u202f"))
-    if phone.startswith("7"):
-        phone = "+" + phone
-    if len(raw_phone) > 32 or not storage.valid_text(phone, 32, phone=True):
-        await message.answer("Введите свой номер. Например, +7 912 345-67-89, 79123456789 или 89123456789.")
+    provider_id = message.from_user.id
+    profile = await provider_registry.get_profile(provider_id, storage.DB_PATH)
+    raw_phone = nav.phone_input(message)
+    if raw_phone == nav.PROFILE_PHONE:
+        raw_phone = profile["phone"] if profile else None
+    try:
+        phone = provider_registry._validate_phone(raw_phone)
+    except ValueError as exc:
+        await message.answer(str(exc))
         return
-    phone = "+7" + phone[-10:]
     data = await state.get_data()
     lead = await get_lead(int(data["lead_id"]))
     if not lead or lead["status"] != "published":
         await state.clear()
         await message.answer("Заявка уже недоступна.", reply_markup=main_menu())
         return
-    provider_name = message.from_user.full_name
-    username = f"@{message.from_user.username}" if message.from_user.username else "без username"
+    provider_name = profile["display_name"] if profile else message.from_user.full_name
+    handle = message.from_user.username
+    username = f"@{handle}" if handle else "без username"
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        methods = await payment_preferences.read_provider(db, provider_id)
     offer = (
         f"🚜 Отклик на заявку №{lead['id']}\n\n"
         f"Исполнитель: {provider_name} ({username})\n"
         f"Цена: {data['price']}\n"
         f"Условия: {data['comment']}\n"
+        f"Способы оплаты: {', '.join(methods) if methods else 'Не указаны'}\n"
         f"Телефон: {phone}"
     )
     offer_id = await storage.save_offer(
@@ -726,17 +755,65 @@ async def offer_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     )
     await state.clear()
     if offer_id is None:
-        await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu())
+        duplicate = await storage.has_offer(lead["id"], provider_id)
+        await message.answer(
+            "Вы уже откликнулись на эту заявку" if duplicate else "Заявка закрыта.",
+            reply_markup=main_menu(),
+        )
         return
-    delivered = await notify(bot, lead["customer_id"], "По вашей заявке появился отклик:\n\n" + offer)
+    chat_url = f"https://t.me/{handle}" if handle and re.fullmatch(r"[A-Za-z0-9_]+", handle) else f"tg://user?id={provider_id}"
+    contact_buttons = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 Написать исполнителю", url=chat_url),
+        InlineKeyboardButton(text="📞 Позвонить исполнителю", callback_data=f"offer_call:{offer_id}"),
+    ]])
+    delivered = await notify(
+        bot, lead["customer_id"], "По вашей заявке появился отклик:\n\n" + offer,
+        reply_markup=contact_buttons,
+    )
     await storage.mark_offer(offer_id, "sent" if delivered else "unconfirmed")
-    for admin_id in settings.admin_ids:
+    for admin_id in settings.admin_ids - {lead["customer_id"]}:
         await notify(bot, admin_id, offer + ("" if delivered else "\n⚠️ Доставка заказчику не подтверждена. Отклик сохранён."))
     await message.answer(
         "✅ Отклик сохранён и отправлен заказчику." if delivered else
         "Отклик сохранён. Доставка заказчику не подтверждена, требуется проверка диспетчера.",
         reply_markup=main_menu(),
     )
+
+
+@router.callback_query(F.data.startswith("offer_call:"))
+async def call_provider(callback: CallbackQuery, bot: Bot) -> None:
+    offer_id = storage.parse_id(callback.data, "offer_call:")
+    contact = await storage.offer_contact(offer_id, callback.from_user.id) if offer_id else None
+    if not contact:
+        await callback.answer("Контакт недоступен", show_alert=True)
+        return
+    await callback.answer("Откройте номер в карточке контакта")
+    try:
+        await bot.send_contact(
+            callback.from_user.id, provider_registry._validate_phone(contact[1]),
+            contact[0][:64] or "Исполнитель",
+        )
+    except (ValueError, TelegramAPIError):
+        await notify(bot, callback.from_user.id, f"Телефон исполнителя: {contact[1]}")
+
+
+async def published_customer_markup(bot, lead, sent):
+    username = getattr(sent.chat, "username", None)
+    if username:
+        url = f"https://t.me/{username}/{sent.message_id}"
+    elif str(sent.chat.id).startswith("-100"):
+        try:
+            member = await bot.get_chat_member(sent.chat.id, lead["customer_id"])
+        except TelegramAPIError:
+            return None
+        if member.status not in {"creator", "administrator", "member"} and not getattr(member, "is_member", False):
+            return None
+        url = f"https://t.me/c/{str(sent.chat.id)[4:]}/{sent.message_id}"
+    else:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Посмотреть заявку", url=url),
+    ]])
 
 
 async def admin_lead_id(callback: CallbackQuery, prefix: str):
@@ -804,8 +881,13 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
                      "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
         return
     await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
-    await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
-    await notify_test_providers(bot, lead)
+    customer_markup = await published_customer_markup(bot, lead, sent)
+    await notify(bot, lead["customer_id"], f"Ваша заявка №{lead_id} опубликована", reply_markup=customer_markup)
+    try:
+        await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
+        await notify_test_providers(bot, lead)
+    except aiosqlite.Error:
+        logging.exception("Post-publication follow-up failed for lead %s", lead_id)
     if callback.message:
         try:
             await callback.message.edit_text("✅ Заявка опубликована.\n\n" + lead_text(lead, True))
@@ -813,12 +895,45 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
             logging.warning("Cannot update moderation message for lead %s", lead_id)
 
 
-@router.callback_query(F.data.startswith("reject:"))
-async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
-    lead_id = await admin_lead_id(callback, "reject:")
+REJECTION_REASONS = {
+    "details": "Недостаточно данных",
+    "duplicate": "Повторная заявка",
+    "scope": "Услуга не поддерживается",
+    "none": "Без указания причины",
+}
+
+
+@router.callback_query(F.data.startswith("reject_menu:"))
+async def rejection_menu(callback: CallbackQuery) -> None:
+    lead_id = await admin_lead_id(callback, "reject_menu:")
     if lead_id is None:
         return
-    if not await storage.transition(lead_id, "new", "rejected"):
+    lead = await get_lead(lead_id)
+    if not lead or lead["status"] != "new":
+        await callback.answer("Заявка уже обработана", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(text=reason, callback_data=f"reject:{lead_id}:{code}")]
+               for code, reason in REJECTION_REASONS.items()]
+    buttons.append([InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}")])
+    await callback.answer()
+    await callback.message.answer(
+        f"Причина отклонения заявки №{lead_id}:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("reject:"))
+async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    _, _, remainder = callback.data.partition(":")
+    raw_id, _, code = remainder.partition(":")
+    lead_id = storage.parse_id(raw_id, "")
+    reason = REJECTION_REASONS.get(code or "none")
+    if lead_id is None or reason is None:
+        await callback.answer("Некорректная заявка или причина", show_alert=True)
+        return
+    if not await storage.reject_with_reason(lead_id, reason):
         await callback.answer("Заявка уже обработана", show_alert=True)
         return
     try:
@@ -826,7 +941,10 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
     except TelegramAPIError:
         logging.warning("Cannot acknowledge rejection callback for lead %s", lead_id)
     lead = await get_lead(lead_id)
-    await notify(bot, lead["customer_id"], "К сожалению, сейчас не сможем подобрать исполнителя по этой заявке.")
+    text = f"Ваша заявка №{lead_id} отклонена."
+    if code and code != "none":
+        text += f" Причина: {reason}."
+    await notify(bot, lead["customer_id"], text)
     if callback.message:
         try:
             await callback.message.edit_text("❌ Заявка отклонена.")

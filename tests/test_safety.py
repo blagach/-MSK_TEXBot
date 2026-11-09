@@ -25,7 +25,7 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
                 VALUES (10,'кран','Москва','завтра','работа','+79991234567','now')""")
             await db.commit()
         self.telegram = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(
-            chat=SimpleNamespace(id=-100123), message_id=99)))
+            chat=SimpleNamespace(id=-100123, username="OfflinePublicChannel"), message_id=99)))
         self.callback = SimpleNamespace(from_user=SimpleNamespace(id=1), data='publish:1',
                                         answer=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock()))
 
@@ -58,7 +58,7 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_publication_only_one_send(self):
         await asyncio.gather(*(bot.publish_lead(self.callback, self.telegram) for _ in range(8)))
-        self.telegram.send_message.assert_awaited_once()
+        self.assertEqual(self.telegram.send_message.await_count, 2)
         self.assertEqual(await self.status(), 'published')
         async with aiosqlite.connect(storage.DB_PATH) as db:
             row = await (await db.execute('SELECT chat_id,message_id FROM lead_publications')).fetchone()

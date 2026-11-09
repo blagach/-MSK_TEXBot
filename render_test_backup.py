@@ -29,6 +29,24 @@ def backup_database(source: Path, destination: Path) -> str:
         return hashlib.file_digest(copy_file, "sha256").hexdigest()
 
 
+def verify_small_snapshot(path: Path) -> tuple[int, int] | None:
+    """Restore a small test snapshot into an independent in-memory database."""
+    if path.stat().st_size > 16 * 1024 * 1024:
+        return None
+    with closing(open_read_only(path)) as original, closing(sqlite3.connect(":memory:")) as restored:
+        original.backup(restored)
+        validate_database(restored)
+        counts = tuple(restored.execute(
+            "SELECT (SELECT count(*) FROM leads), (SELECT count(*) FROM offers)"
+        ).fetchone())
+        expected = original.execute(
+            "SELECT (SELECT count(*) FROM leads), (SELECT count(*) FROM offers)"
+        ).fetchone()
+        if counts != expected:
+            raise RuntimeError("Restored test counts do not match the snapshot")
+        return counts
+
+
 def snapshot(database: Path) -> tuple[Path, str]:
     backups = database.parent / "backups"
     if backups.is_symlink():
