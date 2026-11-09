@@ -27,12 +27,13 @@ class TestConfiguration:
     admin_id: int
     channel_id: int
     testers: frozenset[int]
+    support_group_id: int | None = None
 
 
 def read_test_configuration(env: Mapping[str, str]) -> TestConfiguration:
     if any(env.get(name) for name in (
         "BOT_TOKEN", "BOT_USERNAME", "ADMIN_IDS", "LEADS_CHANNEL_ID", "PAYMENT_URL",
-        "TEST_NOTIFICATION_PROVIDER_IDS", "DATABASE_URL",
+        "TEST_NOTIFICATION_PROVIDER_IDS", "DATABASE_URL", "SUPPORT_GROUP_ID",
     )):
         raise IsolationError("Shared bot settings must be absent from the test worker")
     token = env.get("TEST_BOT_TOKEN", "").strip()
@@ -41,10 +42,14 @@ def read_test_configuration(env: Mapping[str, str]) -> TestConfiguration:
     try:
         admin_id = int(env.get("TEST_ADMIN_ID", ""))
         channel_id = int(env.get("TEST_CHANNEL_ID", ""))
+        group = env.get("TEST_SUPPORT_GROUP_ID", "").strip()
+        support_group_id = int(group) if group else None
         testers = frozenset(int(value.strip()) for value in env.get("TESTER_IDS", "").split(","))
     except ValueError:
         raise IsolationError("Invalid test account or channel IDs") from None
-    return TestConfiguration(token, admin_id, channel_id, testers)
+    if support_group_id is not None and (support_group_id >= 0 or support_group_id == channel_id):
+        raise IsolationError("The support group must be separate from the test channel")
+    return TestConfiguration(token, admin_id, channel_id, testers, support_group_id)
 
 
 def test_database_path(disk: Path = DISK) -> Path:
@@ -60,7 +65,7 @@ async def start() -> None:
     if os.environ.get("RENDER_SERVICE_ID") != TEST_WORKER_ID:
         raise IsolationError("This launcher is restricted to the MSK TEXBot test Worker")
     config = read_test_configuration(os.environ)
-    guard = TelegramIsolation(config.testers, config.admin_id, config.channel_id)
+    guard = TelegramIsolation(config.testers, config.admin_id, config.channel_id, config.support_group_id)
     database = test_database_path()
     polling_conflict = asyncio.Event()
 
@@ -94,6 +99,8 @@ async def start() -> None:
             LEADS_CHANNEL_ID=str(config.channel_id), PAYMENT_URL="",
             TEST_NOTIFICATION_PROVIDER_IDS=",".join(map(str, sorted(config.testers))),
         )
+        if config.support_group_id is not None:
+            os.environ["SUPPORT_GROUP_ID"] = str(config.support_group_id)
         app = importlib.import_module("bot")
         app.storage.DB_PATH = str(database)
         await app.init_db()
@@ -105,6 +112,7 @@ async def start() -> None:
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="menu", description="Восстановить кнопки и продолжить анкету"),
             BotCommand(command="cancel", description="Отменить текущую анкету"),
+            BotCommand(command="support", description="Помощь и поддержка"),
         ], scope=BotCommandScopeAllPrivateChats())
         await telegram.set_chat_menu_button(menu_button=MenuButtonCommands())
         logging.info("Starting isolated @%s at %s", TEST_BOT, os.getenv("RENDER_GIT_COMMIT", "local"))

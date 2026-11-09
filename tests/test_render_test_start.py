@@ -62,7 +62,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.session.middleware.assert_called()
         self.dispatcher.update.outer_middleware.assert_called_once()
         commands = self.telegram.set_my_commands.await_args
-        self.assertEqual([item.command for item in commands.args[0]], ["start", "menu", "cancel"])
+        self.assertEqual([item.command for item in commands.args[0]], ["start", "menu", "cancel", "support"])
         self.assertEqual(commands.kwargs["scope"].type, "all_private_chats")
         self.assertEqual(self.telegram.set_chat_menu_button.await_args.kwargs["menu_button"].type, "commands")
         self.dispatcher.start_polling.assert_awaited_once_with(

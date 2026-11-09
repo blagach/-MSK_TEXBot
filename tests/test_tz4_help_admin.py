@@ -1,0 +1,223 @@
+"""Help and administrator workflows with isolated SQLite and fake Telegram."""
+import asyncio
+import os
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace as Record
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiosqlite
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message
+from openpyxl import load_workbook
+
+os.environ.update(BOT_TOKEN="123456:TEST", ADMIN_IDS="1,2", LEADS_CHANNEL_ID="-100123")
+
+import admin_reports
+import admin_ui
+import bot
+import storage
+import support_storage
+import support_ui
+
+
+class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.database = Path(temp.name) / "isolated.sqlite"
+        config = patch.object(storage, "DB_PATH", str(self.database))
+        config.start()
+        self.addCleanup(config.stop)
+        await bot.init_db()
+        self.telegram = Record(send_message=AsyncMock(), edit_message_reply_markup=AsyncMock(), id=99)
+        self.admins = {1, 2}
+        self.memory = MemoryStorage()
+
+    def actor(self, user_id, *, chat_type="private"):
+        state = FSMContext(self.memory, StorageKey(bot_id=99, chat_id=user_id, user_id=user_id))
+        message = MagicMock(spec=Message)
+        message.from_user = Record(id=user_id)
+        message.chat = Record(id=user_id, type=chat_type)
+        message.bot = self.telegram
+        message.text = None
+        message.caption = None
+        message.photo = None
+        message.answer = AsyncMock()
+        message.answer_photo = AsyncMock()
+        message.answer_document = AsyncMock()
+        return message, state
+
+    def callback(self, message, data):
+        return Record(message=message, from_user=message.from_user, data=data, answer=AsyncMock())
+
+    async def help_action(self, message, state, action, group=None):
+        callback = self.callback(message, f"help:{action}")
+        await support_ui.support_action(callback, state, self.telegram, self.admins, group)
+        return callback
+
+    async def test_menu_access_and_preserved_role_drafts(self):
+        ordinary, state = self.actor(20)
+        draft_storage = bot.SQLiteDraftStorage(str(self.database))
+        await draft_storage.init_schema()
+        state = FSMContext(draft_storage, state.key)
+        offer = bot.draft_slot(state, "offer")
+        await draft_storage.checkpoint(offer.key, bot.OfferForm.price.state, {"lead_id": 2})
+        await draft_storage.checkpoint(state.key, bot.LeadForm.region.state, {"equipment": "автокран"})
+        await bot.open_support(ordinary, state)
+        self.assertIsNone(await state.get_state())
+        reopened = bot.SQLiteDraftStorage(str(self.database))
+        lead = bot.draft_slot(FSMContext(reopened, state.key), "lead")
+        self.assertEqual(await lead.get_state(), bot.LeadForm.region.state)
+        self.assertEqual(await lead.get_data(), {"equipment": "автокран"})
+        self.assertEqual(await offer.get_data(), {"lead_id": 2})
+        regular_markup = ordinary.answer.await_args_list[0].kwargs["reply_markup"].keyboard
+        self.assertEqual([button.text for button in regular_markup[0]], [bot.CUSTOMER_ROLE, bot.PROVIDER_ROLE])
+        self.assertEqual([button.text for button in regular_markup[1]], [support_ui.HELP_LABEL])
+
+        admin, admin_state = self.actor(1)
+        await bot.open_admin_panel(admin, admin_state)
+        admin_markup = admin.answer.await_args_list[0].kwargs["reply_markup"].keyboard
+        self.assertIn(admin_ui.ADMIN_LABEL, [button.text for button in admin_markup[1]])
+        await bot.open_admin_panel(ordinary, state)
+        ordinary.answer.assert_awaited_with("Нет доступа.")
+
+    async def test_guides_search_and_training_do_not_create_records(self):
+        message, state = self.actor(20)
+        for role in ("customer", "provider"):
+            await self.help_action(message, state, f"guide:{role}:0")
+            image = message.answer_photo.await_args.args[0]
+            self.assertTrue(Path(image.path).read_bytes().startswith(b"\x89PNG"))
+            for step in range(4):
+                await self.help_action(message, state, f"try:{role}:{step}:1")
+            self.assertIn("Тренировка завершена", message.answer.await_args.args[0])
+        await self.help_action(message, state, "search")
+        message.text = "ОПЛАТА НДС"
+        await support_ui.search_faq(message)
+        keyboard = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertIn("Какие формы оплаты доступны?", [row[0].text for row in keyboard])
+        async with aiosqlite.connect(self.database) as db:
+            async with db.execute("SELECT (SELECT COUNT(*) FROM leads), (SELECT COUNT(*) FROM offers), (SELECT COUNT(*) FROM support_tickets)") as cursor:
+                self.assertEqual(await cursor.fetchone(), (0, 0, 0))
+
+    async def test_support_ticket_ownership_admin_reply_and_status(self):
+        customer, customer_state = self.actor(20)
+        await self.help_action(customer, customer_state, "new:bug")
+        customer.text = "Не вижу кнопки региона"
+        await support_ui.compose_ticket(customer, customer_state)
+        previous = (await customer_state.get_data())["support_nonce"]
+        customer.text = None
+        customer.photo = [Record(file_id="screenshot")]
+        await support_ui.compose_ticket(customer, customer_state)
+        await self.help_action(customer, customer_state, f"send:{previous}")
+        self.assertEqual(await support_storage.list_tickets(requester_id=20), [])
+        nonce = (await customer_state.get_data())["support_nonce"]
+        await self.help_action(customer, customer_state, f"send:{nonce}")
+        await self.help_action(customer, customer_state, f"send:{nonce}")
+        self.assertEqual(self.telegram.send_message.await_count, 2)
+        row, = await support_storage.list_tickets(requester_id=20)
+        ticket = row["id"]
+        self.assertEqual((row["kind"], row["status"]), ("bug", "new"))
+        self.assertEqual((await support_storage.history(ticket))[0]["photo_id"], "screenshot")
+
+        stranger, stranger_state = self.actor(21)
+        await self.help_action(stranger, stranger_state, f"ticket:{ticket}:0")
+        self.assertEqual(stranger.answer.await_args.args[0], "Обращение недоступно.")
+        denied = await self.help_action(stranger, stranger_state, f"reply:{ticket}")
+        denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
+        self.assertIsNone(await stranger_state.get_state())
+
+        admin, admin_state = self.actor(1)
+        await self.help_action(admin, admin_state, f"reply:{ticket}")
+        admin.text = "Откройте /menu."
+        await support_ui.reply_to_ticket(admin, admin_state, self.telegram, self.admins)
+        self.assertEqual(self.telegram.send_message.await_args.args[0], 20)
+        self.assertEqual((await support_storage.ticket(ticket))["status"], "in_progress")
+        await self.help_action(admin, admin_state, f"status:{ticket}:closed")
+        self.assertEqual((await support_storage.ticket(ticket))["status"], "closed")
+        self.assertFalse(await support_storage.add_reply(ticket, 1, "late", "Поздний ответ"))
+        await self.help_action(customer, customer_state, f"ticket:{ticket}:0")
+        self.assertTrue(any("Откройте /menu." in call.args[0] for call in customer.answer.await_args_list))
+        customer.answer_photo.assert_awaited_once_with("screenshot")
+
+    async def test_simultaneous_confirmations_are_idempotent(self):
+        results = await asyncio.gather(*[
+            support_storage.create_ticket(20, "help", "same", "Текст", None) for _ in range(2)
+        ])
+        self.assertEqual(results[0][0], results[1][0])
+        self.assertEqual(sum(created for _, created in results), 1)
+
+    async def test_admin_access_checked_on_every_export(self):
+        for user, chat_type in ((20, "private"), (1, "supergroup")):
+            message, _ = self.actor(user, chat_type=chat_type)
+            callback = self.callback(message, "admin:export")
+            await admin_ui.admin_action(callback, self.admins)
+            callback.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
+            message.answer_document.assert_not_awaited()
+        admin, _ = self.actor(1)
+        await admin_ui.admin_action(self.callback(admin, "admin:export"), self.admins)
+        self.assertTrue(admin.answer_document.await_args.args[0].filename.endswith(".xlsx"))
+
+    async def test_report_counts_and_excel_use_existing_records(self):
+        stamp = "2026-11-09T10:00:00+00:00"
+        async with aiosqlite.connect(self.database) as db:
+            await db.executemany(
+                "INSERT INTO leads(customer_id,equipment,place,work_date,details,phone,status,created_at) VALUES (?,'кран','Москва','завтра','','+79991234567',?,?)",
+                [(20, "published", stamp), (30, "rejected", stamp), (20, "published", stamp)],
+            )
+            await db.execute(
+                "INSERT INTO provider_profiles(telegram_id,display_name,phone,consent_at,updated_at) VALUES (20,?,'+79991234567',?,?)",
+                ("=HYPERLINK(1)", stamp, stamp),
+            )
+            await db.executemany(
+                "INSERT INTO providers VALUES (?,?,'трал','Московская область','+79991234567',?)",
+                [(20, "Дубликат профиля", stamp), (40, "Перевозчик", "2026-11-01T10:00:00+00:00")],
+            )
+            await db.execute(
+                "INSERT INTO provider_equipment(provider_id,category,description,region,area,created_at) VALUES (20,'автокран','30 т','Москва','ЗАО',?)",
+                (stamp,),
+            )
+            await db.commit()
+        offer = await storage.save_offer(1, 50, "Исполнитель", "", "15000", "", "+79991234567")
+        await storage.mark_offer(offer, "sent")
+        await storage.save_offer(3, 20, "Кран", "", "20000", "", "+79991234567")
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute("UPDATE leads SET status='archived' WHERE id=3")
+            await db.commit()
+        self.assertEqual(dict(await admin_reports.user_totals()), {"total": 4, "customers": 2, "providers": 3, "both": 1})
+        registrations = await admin_reports.registration_stats(datetime(2026, 11, 9, 15, tzinfo=timezone.utc))
+        self.assertEqual([row["providers"] for row in registrations], [1, 1, 2])
+        self.assertEqual([row["customers"] for row in registrations], [2, 2, 2])
+        leads, offers, delivery = await admin_reports.lead_and_offer_counts()
+        self.assertEqual(admin_reports.classify(leads), {"Активные": 1, "Закрытые": 1, "Архивные": 1, "Прочие": 0})
+        self.assertEqual(admin_reports.classify(offers)["Архивные"], 1)
+        self.assertEqual({row["status"]: row["n"] for row in delivery}, {"pending": 1, "sent": 1})
+        equipment = await admin_reports.equipment_page(0)
+        self.assertEqual(len(equipment), 3)
+        self.assertIn("Москва, ЗАО", [item["location"] for item in equipment])
+        workbook = load_workbook(BytesIO(await admin_reports.export_xlsx()))
+        self.assertEqual(workbook.sheetnames, ["Пользователи", "Техника"])
+        people = workbook["Пользователи"]
+        self.assertEqual((people["A2"].value, people["A2"].data_type), ("20", "s"))
+        self.assertEqual((people["B2"].value, people["B2"].data_type), ("=HYPERLINK(1)", "s"))
+        self.assertEqual(workbook["Техника"].max_row, 4)
+        self.assertNotIn("+79991234567", [cell.value for sheet in workbook for row in sheet for cell in row])
+
+    async def test_support_group_gets_only_metadata_and_unknown_members_trigger_fallback(self):
+        telegram = self.telegram
+        telegram.get_chat = AsyncMock(return_value=Record(type="supergroup", username=None, title="Поддержка"))
+        telegram.get_chat_member = AsyncMock(return_value=Record(status="administrator"))
+        telegram.get_chat_member_count = AsyncMock(return_value=3)
+        await support_ui.notify_admins(telegram, self.admins, -10099, 42, "help")
+        telegram.send_message.assert_awaited_once()
+        self.assertEqual(telegram.send_message.await_args.args[0], -10099)
+        self.assertIn("/support 42", telegram.send_message.await_args.args[1])
+        telegram.send_message.reset_mock()
+        telegram.get_chat_member_count.return_value = 4
+        await support_ui.notify_admins(telegram, self.admins, -10099, 42, "help")
+        self.assertEqual([call.args[0] for call in telegram.send_message.await_args_list], [1, 2])

@@ -1,0 +1,87 @@
+"""Private, administrator-only report and export entry points."""
+import re
+
+from aiogram import F, Router
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+import admin_reports as reports
+
+router = Router()
+router.callback_query.filter(F.message.chat.type == "private")
+ADMIN_LABEL = "🛡 Админ-панель"
+
+
+def keyboard(*rows):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text, callback_data=action) for text, action in row]
+        for row in rows
+    ])
+
+
+HOME = (("⬅️ В админ-панель", "admin:home"),)
+
+
+async def menu(message):
+    await message.answer("Админ-панель", reply_markup=keyboard(
+        (("👥 Пользователи", "admin:users"), ("🚜 Исполнители и техника", "admin:equipment:0")),
+        (("📋 Заявки и отклики", "admin:records"), ("📊 Статистика", "admin:stats")),
+        (("📥 Обращения", "help:queue"), ("📎 Выгрузка XLSX", "admin:export")),
+    ))
+
+
+@router.callback_query(F.data.startswith("admin:"))
+async def admin_action(callback: CallbackQuery, support_admin_ids):
+    message = callback.message
+    if (
+        callback.from_user.id not in support_admin_ids or not isinstance(message, Message)
+        or message.chat.type != "private" or message.chat.id != callback.from_user.id
+    ):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    action = callback.data.removeprefix("admin:")
+    if action == "home":
+        await menu(message)
+    elif action == "users":
+        data = await reports.user_totals()
+        await message.answer(
+            f"Всего известных пользователей · {data['total']}\n"
+            f"Заказчики · {data['customers']}\nИсполнители · {data['providers']}\n"
+            f"Две роли · {data['both']}\n\n"
+            "Заказчики учитываются по заявкам, исполнители по регистрации или отклику.",
+            reply_markup=keyboard(HOME),
+        )
+    elif action == "records":
+        leads, offers, delivery = await reports.lead_and_offer_counts()
+        lead_counts = " · ".join(f"{label} {n}" for label, n in reports.classify(leads).items())
+        offer_counts = " · ".join(f"{label} {n}" for label, n in reports.classify(offers).items())
+        labels = {"sent": "отправлен", "pending": "ожидается", "unconfirmed": "не подтверждена"}
+        deliveries = " · ".join(f"{labels.get(r['status'], r['status'])} {r['n']}" for r in delivery)
+        await message.answer(
+            f"Заявки\n{lead_counts}\n\nОтклики по статусу связанной заявки\n{offer_counts}\n\n"
+            f"Доставка откликов\n{deliveries or 'Нет записей'}", reply_markup=keyboard(HOME),
+        )
+    elif action == "stats":
+        result = await reports.registration_stats()
+        lines = [
+            f"{period} · регистраций исполнителей {row['providers']}, первых заявок {row['customers']}"
+            for period, row in zip(("День", "Неделя", "Месяц"), result)
+        ]
+        await message.answer("Календарные периоды по Москве\n\n" + "\n".join(lines), reply_markup=keyboard(HOME))
+    elif action == "export":
+        document = BufferedInputFile(await reports.export_xlsx(), filename="msk-texbot-users-equipment.xlsx")
+        await message.answer_document(document, caption="Пользователи и зарегистрированная техника.", reply_markup=keyboard(HOME))
+    elif re.fullmatch(r"equipment:[0-9]{1,7}", action):
+        offset = int(action.split(":")[1])
+        if offset % 8:
+            return
+        items = await reports.equipment_page(offset)
+        lines = [f"{r['equipment_id']} · {r['category'][:80]} · {r['location'][:120]}\n"
+                 f"{(r['owner'] or 'Имя не указано')[:80]} · {r['status']}" for r in items[:8]]
+        navigation = []
+        if offset:
+            navigation.append(("⬅️ Предыдущие", f"admin:equipment:{offset-8}"))
+        if len(items) > 8:
+            navigation.append(("Следующие ➡️", f"admin:equipment:{offset+8}"))
+        markup = keyboard(tuple(navigation), HOME) if navigation else keyboard(HOME)
+        await message.answer("Исполнители и техника\n\n" + "\n\n".join(lines) if lines else "Нет записей.", reply_markup=markup)

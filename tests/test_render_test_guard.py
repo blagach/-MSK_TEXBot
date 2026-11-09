@@ -69,6 +69,26 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
                 await self.send(api("sendContact", chat_id=chat_id))
         self.request.assert_awaited_once()
 
+    async def test_help_photos_and_admin_documents_stay_private(self):
+        self.assertEqual(await self.send(api("sendPhoto", chat_id=102)), "sent")
+        self.assertEqual(await self.send(api("sendDocument", chat_id=101)), "sent")
+        for method, destination in (("sendPhoto", -100123), ("sendPhoto", 999),
+                                    ("sendDocument", -100123), ("sendDocument", 102)):
+            with self.assertRaises(IsolationError):
+                await self.send(api(method, chat_id=destination))
+        self.assertEqual(self.request.await_count, 2)
+
+    async def test_support_group_verified_separately_from_test_channel(self):
+        self.guard.support_group_id = -100555
+        self.channel.type = "supergroup"
+        self.members[101].status = "administrator"
+        self.bot.get_chat_member_count.return_value = 2
+        self.assertEqual(await self.send(api("sendMessage", chat_id=-100555)), "sent")
+        self.bot.get_chat_member_count.return_value = 3
+        with self.assertRaises(IsolationError):
+            await self.send(api("sendMessage", chat_id=-100555))
+        self.request.assert_awaited_once()
+
     async def test_public_or_linked_channel_rejected(self):
         for field, value in (("username", "public"), ("active_usernames", ["public"]),
                              ("linked_chat_id", -100987), ("title", "Production"),
@@ -104,7 +124,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         await self.guard.check_channel(self.bot)
 
     async def test_unknown_and_payment_methods_rejected(self):
-        for name in ("sendPhoto", "forwardMessage", "sendInvoice", "deleteMessage", "deleteWebhook"):
+        for name in ("forwardMessage", "sendInvoice", "deleteMessage", "deleteWebhook"):
             with self.subTest(method=name), self.assertRaises(IsolationError):
                 await self.send(api(name, chat_id=101))
         self.request.assert_not_awaited()

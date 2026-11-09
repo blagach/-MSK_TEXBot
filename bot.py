@@ -29,6 +29,9 @@ from dotenv import load_dotenv
 
 from draft_storage import SQLiteDraftStorage, draft_slot
 
+import admin_ui
+import support_storage
+import support_ui
 import storage
 import provider_registry
 import provider_ui
@@ -52,6 +55,7 @@ class Settings:
     payment_url: str
     bot_username: str
     test_notification_provider_ids: frozenset[int] = frozenset()
+    support_group_id: int | None = None
 
 
 def read_settings() -> Settings:
@@ -60,6 +64,9 @@ def read_settings() -> Settings:
     channel = os.getenv("LEADS_CHANNEL_ID", "")
     if not token or not admins or not channel:
         raise RuntimeError("Заполните BOT_TOKEN, ADMIN_IDS и LEADS_CHANNEL_ID в .env")
+    support_group_id = int(os.environ["SUPPORT_GROUP_ID"]) if os.getenv("SUPPORT_GROUP_ID") else None
+    if support_group_id is not None and (support_group_id >= 0 or support_group_id == int(channel)):
+        raise RuntimeError("SUPPORT_GROUP_ID must identify a separate group")
     return Settings(
         token,
         admins,
@@ -67,6 +74,7 @@ def read_settings() -> Settings:
         os.getenv("PAYMENT_URL", ""),
         os.getenv("BOT_USERNAME", "MSK_TEXBot").lstrip("@"),
         frozenset(int(value.strip()) for value in os.getenv("TEST_NOTIFICATION_PROVIDER_IDS", "").split(",") if value.strip()),
+        support_group_id,
     )
 
 
@@ -148,8 +156,9 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
-def main_menu() -> ReplyKeyboardMarkup:
-    return section_keyboard((CUSTOMER_ROLE, PROVIDER_ROLE))
+def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
+    actions = (support_ui.HELP_LABEL, admin_ui.ADMIN_LABEL) if admin else (support_ui.HELP_LABEL,)
+    return section_keyboard((CUSTOMER_ROLE, PROVIDER_ROLE), actions)
 
 
 def respond_button(lead_id: int) -> InlineKeyboardButton:
@@ -191,6 +200,7 @@ async def init_db() -> None:
     await moderation_history.init_schema(storage.DB_PATH)
     await payment_preferences.init_schema(storage.DB_PATH)
     await notification_reservations.init_schema(storage.DB_PATH)
+    await support_storage.init_schema()
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
@@ -459,7 +469,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
         return
     await clear_form_keyboard(message, state)
     await state.clear()
-    await message.answer("Заполнение отменено.", reply_markup=main_menu())
+    await message.answer("Заполнение отменено.", reply_markup=main_menu(is_admin(state.key.user_id)))
 
 
 @router.message(CommandStart(deep_link=True))
@@ -497,7 +507,7 @@ async def start(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await message.answer(
         "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(is_admin(state.key.user_id)),
     )
 
 
@@ -505,7 +515,30 @@ async def start(message: Message, state: FSMContext) -> None:
 async def show_main_menu(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await message.answer("Главное меню MSK_TEX. Выберите нужный раздел:",
-                         reply_markup=main_menu())
+                         reply_markup=main_menu(is_admin(state.key.user_id)))
+
+
+@router.message(Command("support"), F.chat.type == "private")
+@router.message(F.text == support_ui.HELP_LABEL, F.chat.type == "private")
+async def open_support(message: Message, state: FSMContext, command: CommandObject | None = None) -> None:
+    user_id = message.from_user.id
+    await pause_form(message, state)
+    await message.answer("Выберите раздел ниже.", reply_markup=main_menu(is_admin(user_id)))
+    if command and command.args and is_admin(user_id) and support_ui.positive_id(command.args):
+        await support_ui.show_ticket(message, int(command.args), user_id, True)
+    else:
+        await support_ui.menu(message, user_id, settings.admin_ids)
+
+
+@router.message(Command("admin"), F.chat.type == "private")
+@router.message(F.text == admin_ui.ADMIN_LABEL, F.chat.type == "private")
+async def open_admin_panel(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await pause_form(message, state)
+    await message.answer("Выберите отчёт ниже.", reply_markup=main_menu(True))
+    await admin_ui.menu(message)
 
 
 @router.message(F.text.in_({CUSTOMER_ROLE, "🧾 Заказчик"}))
@@ -703,7 +736,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
     if not created:
         await clear_form_keyboard(message, state)
         await state.clear()
-        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu())
+        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu(is_admin(message.from_user.id)))
         return
     lead = await get_lead(lead_id)
     # Shadow evaluation only: never changes the manual approval workflow.
@@ -722,7 +755,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
     await clear_form_keyboard(message, state)
     await state.clear()
-    await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu())
+    await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu(is_admin(message.from_user.id)))
 
 
 @router.message(F.text == LEGACY_PROVIDER)
@@ -776,7 +809,7 @@ async def provider_phone(message: Message, state: FSMContext) -> None:
         )
         await db.commit()
     await state.clear()
-    await message.answer("Готово. Вы зарегистрированы как исполнитель. Когда появится подходящая заявка, она будет опубликована в канале.", reply_markup=main_menu())
+    await message.answer("Готово. Вы зарегистрированы как исполнитель. Когда появится подходящая заявка, она будет опубликована в канале.", reply_markup=main_menu(is_admin(state.key.user_id)))
 
 
 @router.message(OfferForm.price)
@@ -821,7 +854,7 @@ async def cancel_unsent_offer(message: Message, user_id: int, state: FSMContext)
         await archive.set_data(await state.get_data())
         await archive.set_state(OfferForm.cancel_confirmation)
         await state.clear()
-    await message.answer("Незавершённый отклик отменён.", reply_markup=main_menu())
+    await message.answer("Незавершённый отклик отменён.", reply_markup=main_menu(is_admin(state.key.user_id)))
 
 
 @router.callback_query(F.data.startswith("offer_step:"))
@@ -899,7 +932,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
     if not lead or lead["status"] != "published":
         await clear_form_keyboard(message, state)
         await state.clear()
-        await message.answer("Заявка уже недоступна.", reply_markup=main_menu())
+        await message.answer("Заявка уже недоступна.", reply_markup=main_menu(is_admin(provider.id)))
         return
     provider_name = provider.full_name
     username = f"@{provider.username}" if provider.username else "без username"
@@ -916,7 +949,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
     await clear_form_keyboard(message, state)
     await state.clear()
     if offer_id is None:
-        await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu())
+        await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu(is_admin(provider.id)))
         return
     handle = provider.username or ""
     chat_url = (
@@ -939,7 +972,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
     await message.answer(
         "✅ Отклик сохранён и отправлен заказчику." if delivered else
         "Отклик сохранён. Доставка заказчику не подтверждена, требуется проверка диспетчера.",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(is_admin(provider.id)),
     )
 
 
@@ -1051,9 +1084,14 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
 
 
 def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatcher:
-    dispatcher = Dispatcher(storage=fsm_storage or MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dispatcher = Dispatcher(
+        storage=fsm_storage or MemoryStorage(), events_isolation=SimpleEventIsolation(),
+        support_admin_ids=settings.admin_ids, support_group_id=settings.support_group_id,
+    )
     dispatcher.include_router(router)
     dispatcher.include_router(provider_ui.router)
+    dispatcher.include_router(support_ui.router)
+    dispatcher.include_router(admin_ui.router)
     return dispatcher
 
 
@@ -1065,6 +1103,7 @@ async def main() -> None:
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="menu", description="Открыть меню"),
         BotCommand(command="cancel", description="Отменить действие"),
+        BotCommand(command="support", description="Помощь и поддержка"),
     ])
     await create_dispatcher().start_polling(bot)
 

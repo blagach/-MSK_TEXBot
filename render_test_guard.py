@@ -3,6 +3,8 @@ from contextvars import ContextVar
 
 from aiogram.types import BotCommandScopeAllPrivateChats, MenuButtonCommands
 
+from support_group import is_private_admin_group
+
 
 class IsolationError(RuntimeError):
     pass
@@ -26,10 +28,11 @@ class TelegramIsolation:
         "getChat", "getChatMember", "getChatMemberCount",
     })
 
-    def __init__(self, testers, admin_id, channel_id):
+    def __init__(self, testers, admin_id, channel_id, support_group_id=None):
         self.testers = frozenset(testers)
         self.admin_id = admin_id
         self.channel_id = channel_id
+        self.support_group_id = support_group_id
         if admin_id not in self.testers or any(
             type(user_id) is not int or user_id <= 0 for user_id in self.testers
         ):
@@ -66,10 +69,15 @@ class TelegramIsolation:
             return await make_request(bot, method)
         if api == "setChatMenuButton" and method.chat_id is None and isinstance(method.menu_button, MenuButtonCommands):
             return await make_request(bot, method)
-        if api in {"sendMessage", "editMessageText", "editMessageReplyMarkup", "sendContact"}:
+        if api in {"sendMessage", "editMessageText", "editMessageReplyMarkup", "sendContact", "sendPhoto", "sendDocument"}:
             destination = method.chat_id
-            if type(destination) is int and destination in self.testers:
+            if (type(destination) is int and destination in self.testers
+                    and (api != "sendDocument" or destination == self.admin_id)):
                 return await make_request(bot, method)
+            if api == "sendMessage" and destination == self.support_group_id and self.support_group_id is not None:
+                if await is_private_admin_group(bot, destination, {self.admin_id}, test=True):
+                    return await make_request(bot, method)
+                raise IsolationError("The configured test support group is not private and admin-only")
             if api == "sendMessage" and type(destination) is int and destination == self.channel_id:
                 await self.check_channel(bot)
                 return await make_request(bot, method)

@@ -408,7 +408,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_role_menus_keep_existing_provider_features_and_scope_personal_lists(self):
         self.assertEqual([[button.text for button in row] for row in bot.main_menu().keyboard],
-                         [[bot.CUSTOMER_ROLE, bot.PROVIDER_ROLE]])
+                         [[bot.CUSTOMER_ROLE, bot.PROVIDER_ROLE], [bot.support_ui.HELP_LABEL]])
         await bot.executor_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows(), [[bot.provider_ui.REGISTER_PROVIDER], [bot.OFFER_HOME]])
         await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
