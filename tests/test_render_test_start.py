@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiogram.exceptions import TelegramConflictError
 
 import render_test_start as worker
-from render_test_backup import backup_database
+from render_test_backup import backup_database, verify_small_snapshot
 from render_test_guard import IsolationError
 
 
@@ -110,10 +110,13 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(self.database)) as live:
             self.assertEqual(live.execute("PRAGMA journal_mode=WAL").fetchone(), ("wal",))
             live.execute("CREATE TABLE leads (id INTEGER PRIMARY KEY)")
+            live.execute("CREATE TABLE offers (id INTEGER PRIMARY KEY)")
+            live.execute("INSERT INTO offers VALUES (1)")
             live.execute("INSERT INTO leads VALUES (1)")
             live.commit()
             digest = backup_database(self.database, backup)
             self.assertEqual(len(digest), 64)
+            self.assertEqual(verify_small_snapshot(backup), (1, 1))
             live.execute("INSERT INTO leads VALUES (2)")
             live.commit()
             backup_database(backup, candidate)

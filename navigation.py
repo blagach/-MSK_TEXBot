@@ -12,15 +12,35 @@ HOME = "🏠 Главное меню"
 REGISTER = "🚜 Зарегистрироваться как исполнитель"
 PROFILE = "👤 Мой профиль"
 PAYMENT = "💳 Способы оплаты"
+EDIT_PROFILE = "✏️ Редактировать профиль"
+SERVICES = "🧰 Направления услуг"
+SHARE_PHONE = "📲 Отправить свой номер"
+PROFILE_PHONE = "Использовать номер из профиля"
 ADD_MACHINE = "➕ Добавить технику"
 MY_MACHINES = "📋 Моя техника"
 ENABLE_NOTIFICATIONS = "🔔 Уведомления вкл"
 DISABLE_NOTIFICATIONS = "🔕 Уведомления выкл"
+NOTIFICATIONS_ON = "🔔 Уведомления: ВКЛЮЧЕНЫ ✅"
+NOTIFICATIONS_OFF = "🔕 Уведомления: ВЫКЛЮЧЕНЫ ❌"
+
+
+def notification_label(enabled):
+    return NOTIFICATIONS_ON if enabled else NOTIFICATIONS_OFF
+
+
+def phone_input(message):
+    contact = getattr(message, "contact", None)
+    if contact is None:
+        return message.text
+    if contact.user_id != message.from_user.id:
+        return None
+    return contact.phone_number
+
 
 
 def keyboard(*rows):
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=label) for label in row] for row in rows],
+        keyboard=[[label if isinstance(label, KeyboardButton) else KeyboardButton(text=label) for label in row] for row in rows],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -38,10 +58,13 @@ def section_menu(*rows):
     return keyboard(*rows, (BACK, HOME))
 
 
-PROVIDER_MENU = section_menu(
-    (REGISTER,), (PROFILE, PAYMENT), (ADD_MACHINE, MY_MACHINES),
-    (ENABLE_NOTIFICATIONS, DISABLE_NOTIFICATIONS),
-)
+def provider_menu(enabled=False):
+    return section_menu(
+        (REGISTER,), (PROFILE, PAYMENT), (ADD_MACHINE, MY_MACHINES),
+        (SERVICES,), (notification_label(enabled),),
+    )
+
+
 ACCOUNT_MENU = section_menu((MY_REQUESTS, PROFILE), (PROVIDERS,))
 
 

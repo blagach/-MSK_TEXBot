@@ -52,6 +52,13 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
                 await self.send(api("sendMessage", chat_id=target))
         self.assertEqual(self.request.await_count, 2)
 
+    async def test_contact_only_for_allowed_private_chat(self):
+        self.assertEqual(await self.send(api("sendContact", chat_id=101)), "sent")
+        for chat_id in (999, -100123):
+            with self.assertRaises(IsolationError):
+                await self.send(api("sendContact", chat_id=chat_id))
+        self.request.assert_awaited_once()
+
     async def test_public_or_linked_channel_rejected(self):
         for field, value in (("username", "public"), ("active_usernames", ["public"]),
                              ("linked_chat_id", -100987), ("title", "Production"),
