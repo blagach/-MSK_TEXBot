@@ -57,8 +57,8 @@ async def recipients_for_service(*, direction, region, area, db_path=provider_re
         return [row[0] for row in rows]
 
 
-def notification_text(*, lead_id, category, region, area, work_date, details, bot_username, service=False):
-    """Only public lead details and bot deep link; never customer phone."""
+def notification_text(*, lead_id, category, region, area, work_date, details, service=False):
+    """Only public lead details; never customer phone."""
     if not isinstance(lead_id, int) or lead_id <= 0:
         raise ValueError("Invalid lead id")
     categories = provider_registry.SERVICE_DIRECTIONS if service else provider_registry.CATEGORIES
@@ -66,14 +66,10 @@ def notification_text(*, lead_id, category, region, area, work_date, details, bo
         raise ValueError("Unrecognized lead category or region")
     if not isinstance(area, str) or not area.strip():
         raise ValueError("Missing lead area")
-    username = bot_username.lstrip("@")
-    if not username or not username.replace("_", "").isalnum():
-        raise ValueError("Invalid bot username")
     return (
         f"🚜 Подходящая заявка №{lead_id}\n"
         f"{'Услуга' if service else 'Техника'}: {category}\n"
         f"Регион: {region}, {area.strip()}\n"
         f"Дата: {work_date}\n"
-        f"Описание: {details}\n"
-        f"Откликнуться: https://t.me/{username}?start=lead_{lead_id}"
+        f"Описание: {details}"
     )
