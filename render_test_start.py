@@ -1,0 +1,117 @@
+"""Launch the isolated Telegram worker with a fail-closed test configuration."""
+import asyncio
+import importlib
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramConflictError
+
+from render_test_backup import snapshot
+from render_test_guard import IsolationError, TelegramIsolation, verify_identity
+
+TEST_BOT = "Msktex_test_dmitry_bot"
+DISK = Path("/var/data")
+POLLING_UPDATES = ["message", "callback_query"]
+
+
+@dataclass(frozen=True)
+class TestConfiguration:
+    token: str
+    admin_id: int
+    channel_id: int
+    testers: frozenset[int]
+
+
+def read_test_configuration(env: Mapping[str, str]) -> TestConfiguration:
+    if any(env.get(name) for name in (
+        "BOT_TOKEN", "BOT_USERNAME", "ADMIN_IDS", "LEADS_CHANNEL_ID", "PAYMENT_URL",
+        "TEST_NOTIFICATION_PROVIDER_IDS", "DATABASE_URL",
+    )):
+        raise IsolationError("Shared bot settings must be absent from the test worker")
+    token = env.get("TEST_BOT_TOKEN", "").strip()
+    if not token:
+        raise IsolationError("Missing TEST_BOT_TOKEN")
+    try:
+        admin_id = int(env.get("TEST_ADMIN_ID", ""))
+        channel_id = int(env.get("TEST_CHANNEL_ID", ""))
+        testers = frozenset(int(value.strip()) for value in env.get("TESTER_IDS", "").split(","))
+    except ValueError:
+        raise IsolationError("Invalid test account or channel IDs") from None
+    return TestConfiguration(token, admin_id, channel_id, testers)
+
+
+def test_database_path(disk: Path = DISK) -> Path:
+    if disk.is_symlink() or not disk.is_mount() or not os.access(disk, os.W_OK):
+        raise IsolationError("The writable test disk must be mounted at /var/data")
+    database = disk / "bot.db"
+    if database.is_symlink() or (database.exists() and not database.is_file()):
+        raise IsolationError("Invalid test SQLite path")
+    return database
+
+
+async def start() -> None:
+    config = read_test_configuration(os.environ)
+    guard = TelegramIsolation(config.testers, config.admin_id, config.channel_id)
+    database = test_database_path()
+    polling_conflict = asyncio.Event()
+
+    async def prevent_duplicate_polling(make_request, bot, method):
+        try:
+            return await make_request(bot, method)
+        except TelegramConflictError:
+            if method.__api_method__ == "getUpdates":
+                polling_conflict.set()
+            raise
+
+    async with Bot(token=config.token) as telegram:
+        verify_identity(await telegram.get_me(), TEST_BOT)
+        if (await telegram.get_webhook_info()).url:
+            raise IsolationError("The test bot has an active webhook")
+        telegram.session.middleware(guard.outgoing)
+        telegram.session.middleware(prevent_duplicate_polling)
+        await guard.check_channel(telegram)
+
+        if database.exists():
+            backup_path, digest = snapshot(database)
+            logging.info("Test SQLite backup %s SHA-256 %s", backup_path.name, digest)
+
+        os.environ.update(
+            BOT_TOKEN=config.token, BOT_USERNAME=TEST_BOT, ADMIN_IDS=str(config.admin_id),
+            LEADS_CHANNEL_ID=str(config.channel_id), PAYMENT_URL="", TEST_NOTIFICATION_PROVIDER_IDS="",
+        )
+        app = importlib.import_module("bot")
+        app.storage.DB_PATH = str(database)
+        await app.init_db()
+        dispatcher = app.create_dispatcher()
+        dispatcher.update.outer_middleware(guard.incoming)
+        logging.info("Starting isolated @%s at %s", TEST_BOT, os.getenv("RENDER_GIT_COMMIT", "local"))
+        polling = asyncio.create_task(dispatcher.start_polling(
+            telegram, allowed_updates=POLLING_UPDATES, close_bot_session=False,
+        ))
+        conflict = asyncio.create_task(polling_conflict.wait())
+        try:
+            await asyncio.wait({polling, conflict}, return_when=asyncio.FIRST_COMPLETED)
+            if polling_conflict.is_set():
+                raise IsolationError("Another process is polling the test bot; stop it before restarting")
+            await polling
+        finally:
+            if not polling.done():
+                await dispatcher.stop_polling()
+            conflict.cancel()
+            await asyncio.gather(polling, conflict, return_exceptions=True)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    try:
+        asyncio.run(start())
+    except IsolationError as error:
+        raise SystemExit(str(error)) from None
+    except TelegramConflictError:
+        raise SystemExit("Another process is polling the test bot") from None
+    except Exception as error:
+        raise SystemExit(f"Test startup failed: {type(error).__name__}") from None
