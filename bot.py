@@ -31,6 +31,7 @@ import moderation_history
 import lead_moderation
 import lead_shadow_review
 import payment_preferences
+import waste_requests as waste
 
 load_dotenv()
 
@@ -75,6 +76,14 @@ class LeadForm(StatesGroup):
     details = State()
     payment = State()
     phone = State()
+    waste_kind = State()
+    waste_material = State()
+    waste_hazard = State()
+    waste_service = State()
+    waste_volume = State()
+    waste_mass = State()
+    waste_loading = State()
+    waste_destination = State()
 
 
 class OfferForm(StatesGroup):
@@ -89,14 +98,15 @@ def is_admin(user_id: int) -> bool:
 
 LEAD_STEPS = nav.Form({
     LeadForm.equipment: (
-        "Выберите категорию техники:",
+        "Выберите категорию техники или услугу:",
+        (waste.CATEGORY,),
         *((item,) for item in sorted(provider_registry.CATEGORIES)),
     ),
     LeadForm.region: ("Выберите регион:", ("Москва", "Московская область")),
     LeadForm.area: ("Укажите район или населённый пункт (например, СЗАО или Химки).",),
     LeadForm.place: ("Укажите точный адрес, ориентир или ближайшее метро.",),
     LeadForm.date: ("На какую дату и время нужна техника?",),
-    LeadForm.details: ("Опишите работу: объём, срок, груз/навесное оборудование, важные условия.",),
+    LeadForm.details: ("Опишите работу: объём, срок, груз, навесное оборудование, важные условия.",),
     LeadForm.payment: (
         "Выберите форму оплаты:",
         (payment_preferences.CASH,), (payment_preferences.VAT,),
@@ -106,6 +116,33 @@ LEAD_STEPS = nav.Form({
         "Введите номер телефона для связи без пробелов, скобок и дефисов. "
         "Например, +79123456789 или 89123456789.",
     ),
+})
+
+WASTE_STEPS = nav.Form({
+    LeadForm.equipment: LEAD_STEPS.steps[LeadForm.equipment],
+    LeadForm.waste_kind: ("Что нужно вывезти?", *((label,) for label in waste.DIRECTIONS.values())),
+    LeadForm.waste_material: ("Выберите материал.",),
+    LeadForm.waste_hazard: (
+        "Укажите класс опасности, если он установлен документами.",
+        waste.HAZARD_CLASSES,
+        (waste.UNKNOWN,),
+    ),
+    LeadForm.waste_service: (
+        "Какая услуга нужна? Комплексный вывоз включает погрузку и передачу материала "
+        "на площадку, имеющую право его принять.",
+        *((label,) for label in waste.SERVICES.values()),
+    ),
+    LeadForm.waste_volume: ("Укажите примерный объём в м³. Например, 12,5.",),
+    LeadForm.waste_mass: ("Укажите массу в тоннах, если она известна.", (waste.UNKNOWN,)),
+    LeadForm.waste_loading: ("Какие условия погрузки?", waste.LOADING),
+    LeadForm.region: LEAD_STEPS.steps[LeadForm.region],
+    LeadForm.area: LEAD_STEPS.steps[LeadForm.area],
+    LeadForm.place: ("Укажите точный адрес погрузки или ориентир.",),
+    LeadForm.waste_destination: ("Укажите адрес приёма, если он уже согласован.", (waste.NO_DESTINATION,)),
+    LeadForm.date: ("На какую дату и время нужен вывоз?",),
+    LeadForm.details: ("Укажите требования к перевозке и другие условия.", (waste.NO_DETAILS,)),
+    LeadForm.payment: LEAD_STEPS.steps[LeadForm.payment],
+    LeadForm.phone: LEAD_STEPS.steps[LeadForm.phone],
 })
 
 OFFER_STEPS = nav.Form({
@@ -168,6 +205,8 @@ async def init_db() -> None:
 
 
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
+    if "waste_kind" in lead.keys() and lead["waste_kind"]:
+        return waste_lead_text(lead, with_phone)
     text = (
         f"📌 Заявка №{lead['id']}\n"
         f"Техника: {lead['equipment']}\n"
@@ -182,12 +221,48 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
     return text
 
 
+def waste_lead_text(lead: aiosqlite.Row, with_phone: bool) -> str:
+    mass = waste.format_amount(lead["mass_kg"]) + " т" if lead["mass_kg"] else "Не указана"
+    hazard = lead["hazard_class"] or "Не указан"
+    lines = [
+        f"📌 Заявка №{lead['id']}",
+        f"Направление: {lead['equipment']}",
+        f"Услуга: {waste.SERVICES[lead['waste_service']]}",
+        f"Материал: {lead['material']}",
+        f"Объём: {waste.format_amount(lead['volume_liters'])} м³",
+        f"Масса: {mass}",
+        f"Погрузка: {lead['loading']}",
+        f"Район погрузки: {lead['region']}, {lead['area']}",
+        f"Когда: {lead['work_date']}",
+        f"Условия: {lead['details']}",
+        f"Форма оплаты: {lead['payment_method'] or 'Не указана'}",
+    ]
+    if lead["waste_kind"] == "construction":
+        lines.append(f"Заявленный класс опасности: {hazard}")
+    if with_phone:
+        if lead["waste_kind"] == "construction" and lead["hazard_class"] != "V":
+            lines.append("Перед публикацией уточните применимые документы и условия приёма.")
+        lines.extend((
+            f"Адрес погрузки: {lead['place']}",
+            f"Адрес приёма: {lead['destination'] or 'Уточняется'}",
+            f"Контакт заказчика: {lead['phone']}",
+        ))
+    return "\n".join(lines)
+
+
 async def read_lead(db: aiosqlite.Connection, lead_id: int) -> aiosqlite.Row | None:
     db.row_factory = aiosqlite.Row
     async with db.execute(
-        """SELECT leads.*, lead_payment_preferences.method AS payment_method
+        """SELECT leads.*, lead_payment_preferences.method AS payment_method,
+                  waste_lead_details.kind AS waste_kind, waste_lead_details.service AS waste_service,
+                  waste_lead_details.material, waste_lead_details.hazard_class,
+                  waste_lead_details.volume_liters, waste_lead_details.mass_kg,
+                  waste_lead_details.loading, waste_lead_details.destination,
+                  lead_routing.region, lead_routing.area
            FROM leads
            LEFT JOIN lead_payment_preferences ON lead_payment_preferences.lead_id = leads.id
+           LEFT JOIN waste_lead_details ON waste_lead_details.lead_id = leads.id
+           LEFT JOIN lead_routing ON lead_routing.lead_id = leads.id
            WHERE leads.id = ?""",
         (lead_id,),
     ) as cursor:
@@ -248,11 +323,19 @@ async def home(message: Message, state: FSMContext) -> None:
 @router.message(F.text.in_({nav.BACK, "Назад"}))
 async def back(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
-    for form in FORMS:
+    data = await state.get_data()
+    forms = (WASTE_STEPS, *FORMS[1:]) if data.get("waste_flow") else FORMS
+    for form in forms:
         if form.contains(current):
             previous = form.previous(current)
+            if previous == LeadForm.waste_hazard and data.get("waste_kind") != "construction":
+                previous = LeadForm.waste_material
+            if previous == LeadForm.waste_loading and data.get("waste_service") == "full":
+                previous = LeadForm.waste_mass
             if previous is None:
                 await finish_navigation(message, state, "Заполнение отменено.")
+            elif form is WASTE_STEPS:
+                await show_lead_step(message, state, previous)
             else:
                 await form.show(message, state, previous)
             return
@@ -265,7 +348,7 @@ async def back(message: Message, state: FSMContext) -> None:
 
 
 @router.message(
-    StateFilter(*(step for form in FORMS for step in form.steps)),
+    StateFilter(*WASTE_STEPS.steps, *(step for form in FORMS[1:] for step in form.steps)),
     F.text.in_({
         nav.PLACE_REQUEST, "📝 Оставить заявку", nav.FIND_EQUIPMENT,
         nav.PROVIDERS, "🚜 Я исполнитель", nav.MY_REQUESTS, nav.ACCOUNT, nav.HELP,
@@ -389,13 +472,102 @@ async def lead_start(message: Message, state: FSMContext) -> None:
     await LEAD_STEPS.show(message, state, LeadForm.equipment)
 
 
+async def show_lead_step(message: Message, state: FSMContext, step: State) -> None:
+    data = await state.get_data()
+    if step == LeadForm.waste_material:
+        await state.set_state(step)
+        choices = waste.MATERIALS[data["waste_kind"]]
+        prompt = WASTE_STEPS.steps[step][0]
+        await message.answer(prompt, reply_markup=nav.section_menu(*((label,) for label in choices)))
+        return
+    form = WASTE_STEPS if data.get("waste_flow") else LEAD_STEPS
+    await form.show(message, state, step)
+
+
 @router.message(LeadForm.equipment)
 async def lead_equipment(message: Message, state: FSMContext) -> None:
-    if message.text not in provider_registry.CATEGORIES:
-        await message.answer("Выберите категорию техники кнопкой из списка.")
+    if message.text == waste.CATEGORY:
+        await state.update_data(waste_flow=True)
+        await show_lead_step(message, state, LeadForm.waste_kind)
         return
-    await state.update_data(equipment=message.text)
-    await LEAD_STEPS.show(message, state, LeadForm.region)
+    if message.text not in provider_registry.CATEGORIES:
+        await message.answer("Выберите категорию техники или услугу кнопкой из списка.")
+        return
+    await state.update_data(equipment=message.text, waste_flow=False)
+    await show_lead_step(message, state, LeadForm.region)
+
+
+@router.message(LeadForm.waste_kind)
+async def lead_waste_kind(message: Message, state: FSMContext) -> None:
+    for kind, label in waste.DIRECTIONS.items():
+        if message.text == label:
+            await state.update_data(waste_kind=kind, equipment=label, waste_hazard=None)
+            await show_lead_step(message, state, LeadForm.waste_material)
+            return
+    await show_lead_step(message, state, LeadForm.waste_kind)
+
+
+@router.message(LeadForm.waste_material)
+async def lead_waste_material(message: Message, state: FSMContext) -> None:
+    kind = (await state.get_data())["waste_kind"]
+    if message.text not in waste.MATERIALS[kind]:
+        await show_lead_step(message, state, LeadForm.waste_material)
+        return
+    await state.update_data(waste_material=message.text)
+    step = LeadForm.waste_hazard if kind == "construction" else LeadForm.waste_service
+    await show_lead_step(message, state, step)
+
+
+@router.message(LeadForm.waste_hazard)
+async def lead_waste_hazard(message: Message, state: FSMContext) -> None:
+    if message.text not in (*waste.HAZARD_CLASSES, waste.UNKNOWN):
+        await show_lead_step(message, state, LeadForm.waste_hazard)
+        return
+    await state.update_data(waste_hazard=None if message.text == waste.UNKNOWN else message.text)
+    await show_lead_step(message, state, LeadForm.waste_service)
+
+
+@router.message(LeadForm.waste_service)
+async def lead_waste_service(message: Message, state: FSMContext) -> None:
+    for service, label in waste.SERVICES.items():
+        if message.text == label:
+            await state.update_data(waste_service=service)
+            await show_lead_step(message, state, LeadForm.waste_volume)
+            return
+    await show_lead_step(message, state, LeadForm.waste_service)
+
+
+@router.message(LeadForm.waste_volume)
+async def lead_waste_volume(message: Message, state: FSMContext) -> None:
+    volume = waste.to_thousandths(message.text)
+    if volume is None:
+        await show_lead_step(message, state, LeadForm.waste_volume)
+        return
+    await state.update_data(waste_volume=volume)
+    await show_lead_step(message, state, LeadForm.waste_mass)
+
+
+@router.message(LeadForm.waste_mass)
+async def lead_waste_mass(message: Message, state: FSMContext) -> None:
+    mass = waste.to_thousandths(message.text)
+    if mass is None and message.text != waste.UNKNOWN:
+        await show_lead_step(message, state, LeadForm.waste_mass)
+        return
+    await state.update_data(waste_mass=mass)
+    if (await state.get_data())["waste_service"] == "full":
+        await state.update_data(waste_loading="Погрузка включена")
+        await show_lead_step(message, state, LeadForm.region)
+        return
+    await show_lead_step(message, state, LeadForm.waste_loading)
+
+
+@router.message(LeadForm.waste_loading)
+async def lead_waste_loading(message: Message, state: FSMContext) -> None:
+    if message.text not in waste.LOADING:
+        await show_lead_step(message, state, LeadForm.waste_loading)
+        return
+    await state.update_data(waste_loading=message.text)
+    await show_lead_step(message, state, LeadForm.region)
 
 
 @router.message(LeadForm.region)
@@ -404,7 +576,7 @@ async def lead_region(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите Москву или Московскую область.")
         return
     await state.update_data(region=message.text)
-    await LEAD_STEPS.show(message, state, LeadForm.area)
+    await show_lead_step(message, state, LeadForm.area)
 
 
 @router.message(LeadForm.area)
@@ -412,7 +584,7 @@ async def lead_area(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 120):
         return
     await state.update_data(area=message.text.strip())
-    await LEAD_STEPS.show(message, state, LeadForm.place)
+    await show_lead_step(message, state, LeadForm.place)
 
 
 @router.message(LeadForm.place)
@@ -420,7 +592,18 @@ async def lead_place(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 300, phone=False):
         return
     await state.update_data(place=message.text)
-    await LEAD_STEPS.show(message, state, LeadForm.date)
+    data = await state.get_data()
+    step = LeadForm.waste_destination if data.get("waste_flow") else LeadForm.date
+    await show_lead_step(message, state, step)
+
+
+@router.message(LeadForm.waste_destination)
+async def lead_waste_destination(message: Message, state: FSMContext) -> None:
+    if not await valid_input(message, 300):
+        return
+    destination = None if message.text == waste.NO_DESTINATION else message.text.strip()
+    await state.update_data(waste_destination=destination)
+    await show_lead_step(message, state, LeadForm.date)
 
 
 @router.message(LeadForm.date)
@@ -428,7 +611,7 @@ async def lead_date(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
     await state.update_data(work_date=message.text)
-    await LEAD_STEPS.show(message, state, LeadForm.details)
+    await show_lead_step(message, state, LeadForm.details)
 
 
 @router.message(LeadForm.details)
@@ -436,7 +619,7 @@ async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
     await state.update_data(details=message.text)
-    await LEAD_STEPS.show(message, state, LeadForm.payment)
+    await show_lead_step(message, state, LeadForm.payment)
 
 
 @router.message(LeadForm.payment)
@@ -445,7 +628,7 @@ async def lead_payment(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите форму оплаты кнопкой из списка.")
         return
     await state.update_data(payment_method=message.text)
-    await LEAD_STEPS.show(message, state, LeadForm.phone)
+    await show_lead_step(message, state, LeadForm.phone)
 
 
 @router.message(LeadForm.phone)
@@ -466,6 +649,8 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
             if (payment_method := data.get("payment_method")) is not None:
                 await payment_preferences.write_lead(db, lead_id, payment_method)
             await lead_routing.write(db, lead_id, data["equipment"], data["region"], data["area"])
+            if data.get("waste_flow"):
+                await waste.write(db, lead_id, data)
             lead = await read_lead(db, lead_id)
             await db.commit()
     except aiosqlite.Error:

@@ -21,6 +21,7 @@ import navigation as nav
 import payment_preferences as payments
 import provider_ui
 import storage
+import waste_requests as waste
 
 
 class NavigationTests(unittest.IsolatedAsyncioTestCase):
@@ -183,6 +184,110 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
             [(1, bot.settings.leads_channel_id, 77)],
         )
         self.assertIn("уже обработана", callback.answer.await_args.args[0])
+
+    async def test_waste_intake_persists_all_three_directions_and_moderates(self):
+        for kind, material, hazard, service, mass, region, loading, destination in (
+            ("soil", "Глина", None, "transport", "7.25", "Москва", waste.LOADING[1], "Площадка №1"),
+            ("construction", "Асфальт", "IV", "full", waste.UNKNOWN, "Московская область",
+             "Погрузка включена", waste.NO_DESTINATION),
+            ("snow", "Снег с примесями", None, "container", waste.UNKNOWN, "Москва",
+             waste.LOADING[0], waste.NO_DESTINATION),
+        ):
+            menu = await self.send(nav.PLACE_REQUEST)
+            self.assertIn("самосвал", self.labels(menu))
+            await self.assert_step(await self.send(waste.CATEGORY), bot.LeadForm.waste_kind)
+            await self.assert_step(await self.send(waste.DIRECTIONS[kind]), bot.LeadForm.waste_material)
+            if kind == "construction":
+                await self.assert_step(await self.send(material), bot.LeadForm.waste_hazard)
+                await self.assert_step(await self.send(hazard), bot.LeadForm.waste_service)
+            else:
+                await self.assert_step(await self.send(material), bot.LeadForm.waste_service)
+            await self.assert_step(await self.send(nav.BACK),
+                                   bot.LeadForm.waste_hazard if kind == "construction" else bot.LeadForm.waste_material)
+            await self.send(hazard if kind == "construction" else material)
+            await self.send(waste.SERVICES[service])
+            await self.assert_step(await self.send("0"), bot.LeadForm.waste_volume)
+            await self.assert_step(await self.send("12,500"), bot.LeadForm.waste_mass)
+            if service == "full":
+                await self.assert_step(await self.send(mass), bot.LeadForm.region)
+                await self.assert_step(await self.send(nav.BACK), bot.LeadForm.waste_mass)
+                await self.send(mass)
+            else:
+                await self.assert_step(await self.send(mass), bot.LeadForm.waste_loading)
+                await self.send(loading)
+            for value in (
+                region, "Тестовый район", "Частный адрес погрузки", destination,
+                "завтра 09:00", waste.NO_DETAILS, payments.VAT,
+            ):
+                await self.send(value)
+            if kind == "snow":
+                before = await self.sql("SELECT id FROM leads ORDER BY id")
+                with patch.object(waste, "write", AsyncMock(side_effect=aiosqlite.OperationalError("simulated"))):
+                    self.assertIn("Анкета открыта", (await self.send("+70000000000")).text)
+                self.assertEqual(await self.sql("SELECT id FROM leads ORDER BY id"), before)
+                self.assertEqual(await self.state().get_state(), bot.LeadForm.phone.state)
+            await self.send("+70000000000")
+
+            lead_id = (await self.sql("SELECT max(id) FROM leads"))[0][0]
+            lead = await bot.get_lead(lead_id)
+            self.assertEqual(lead["status"], "new")
+            self.assertEqual(lead["region"], region)
+            self.assertEqual(lead["payment_method"], payments.VAT)
+            self.assertEqual(
+                await self.sql(
+                    """SELECT kind, material, hazard_class, service, volume_liters,
+                              mass_kg, loading, destination FROM waste_lead_details WHERE lead_id = ?""",
+                    (lead_id,),
+                ),
+                [(kind, material, hazard, service, 12500, 7250 if kind == "soil" else None,
+                  loading, destination if kind == "soil" else None)],
+            )
+            self.assertIn("Объём: 12,5 м³", bot.lead_text(lead))
+            self.assertIn(f"Форма оплаты: {payments.VAT}", bot.lead_text(lead))
+            self.assertNotIn("Частный адрес погрузки", bot.lead_text(lead))
+            self.assertNotIn("+70000000000", bot.lead_text(lead))
+            cards = [
+                call.args[1].text for call in self.session.await_args_list
+                if call.args[1].text.startswith(f"Новая заявка на проверку:\n\n📌 Заявка №{lead_id}\n")
+            ]
+            self.assertEqual(len(cards), len(bot.settings.admin_ids))
+            self.assertTrue(all("Частный адрес погрузки" in card for card in cards))
+            if kind == "construction":
+                self.assertTrue(all("Заявленный класс опасности: IV" in card for card in cards))
+            if kind == "soil":
+                callback = SimpleNamespace(
+                    from_user=SimpleNamespace(id=min(bot.settings.admin_ids)),
+                    data=f"publish:{lead_id}",
+                    answer=AsyncMock(),
+                    message=SimpleNamespace(edit_text=AsyncMock()),
+                )
+                sent = SimpleNamespace(chat=SimpleNamespace(id=bot.settings.leads_channel_id), message_id=88)
+                telegram = SimpleNamespace(send_message=AsyncMock(return_value=sent))
+                await bot.publish_lead(callback, telegram)
+                await bot.publish_lead(callback, telegram)
+                telegram.send_message.assert_awaited_once()
+                public = telegram.send_message.await_args.args[1]
+                self.assertIn(f"Форма оплаты: {payments.VAT}", public)
+                self.assertNotIn("Площадка №1", public)
+                self.assertNotIn("Частный адрес погрузки", public)
+                self.assertNotIn("+70000000000", public)
+                self.assertIn("Адрес приёма: Площадка №1", callback.message.edit_text.await_args.args[0])
+        self.assertTrue(all(call.args[1].chat_id != bot.settings.leads_channel_id
+                            for call in self.session.await_args_list))
+
+    async def test_back_from_waste_to_equipment_keeps_legacy_flow(self):
+        await self.send(nav.PLACE_REQUEST)
+        await self.send(waste.CATEGORY)
+        await self.send(waste.DIRECTIONS["snow"])
+        await self.send(nav.BACK)
+        await self.send(nav.BACK)
+        for value in ("самосвал", "Москва", "СЗАО", "Тестовый адрес", "завтра"):
+            prompt = await self.send(value)
+        self.assertIn("груз, навесное оборудование", prompt.text)
+        for value in ("Работы", payments.CASH, "+70000000000"):
+            await self.send(value)
+        self.assertEqual(await self.sql("SELECT equipment FROM leads"), [("самосвал",)])
+        self.assertEqual(await self.sql("SELECT lead_id FROM waste_lead_details"), [])
 
     async def test_legacy_payment_is_distinct_from_any_payment(self):
         await self.add_lead()

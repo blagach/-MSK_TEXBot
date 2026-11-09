@@ -45,6 +45,17 @@ async def init_schema():
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL
         )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS waste_lead_details (
+            lead_id INTEGER PRIMARY KEY REFERENCES leads(id),
+            kind TEXT NOT NULL,
+            material TEXT NOT NULL,
+            hazard_class TEXT,
+            service TEXT NOT NULL,
+            volume_liters INTEGER NOT NULL CHECK(volume_liters > 0),
+            mass_kg INTEGER CHECK(mass_kg > 0),
+            loading TEXT NOT NULL,
+            destination TEXT
+        )""")
         await db.commit()
 
 
