@@ -52,6 +52,13 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
                 await self.send(api("sendMessage", chat_id=target))
         self.assertEqual(self.request.await_count, 2)
 
+    async def test_keyboard_edits_only_for_allowed_private_chat(self):
+        self.assertEqual(await self.send(api("editMessageReplyMarkup", chat_id=101)), "sent")
+        for chat_id in (999, -100123):
+            with self.assertRaises(IsolationError):
+                await self.send(api("editMessageReplyMarkup", chat_id=chat_id))
+        self.request.assert_awaited_once()
+
     async def test_contact_only_for_allowed_private_chat(self):
         self.assertEqual(await self.send(api("sendContact", chat_id=101)), "sent")
         for chat_id in (999, -100123):

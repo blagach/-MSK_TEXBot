@@ -60,7 +60,7 @@ class TelegramIsolation:
         api = method.__api_method__
         if api in self.read_methods:
             return await make_request(bot, method)
-        if api in {"sendMessage", "editMessageText", "sendContact"}:
+        if api in {"sendMessage", "editMessageText", "editMessageReplyMarkup", "sendContact"}:
             destination = method.chat_id
             if type(destination) is int and destination in self.testers:
                 return await make_request(bot, method)
