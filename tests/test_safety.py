@@ -117,9 +117,9 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
         await storage.finish_publication(1, -1, 1)
         message = SimpleNamespace(text='+79991234567', answer=AsyncMock(), from_user=SimpleNamespace(
             id=20, full_name='Исполнитель', username=None))
-        state = SimpleNamespace(get_data=AsyncMock(return_value={'lead_id':1,'price':'1000','comment':'условия'}), clear=AsyncMock())
+        state = SimpleNamespace(get_data=AsyncMock(return_value={'lead_id':1,'price':'1000','comment':'условия','phone':'+79991234567'}), clear=AsyncMock())
         self.telegram.send_message.side_effect = TelegramNetworkError(method=SendMessage(chat_id=1,text='x'), message='timeout')
-        await bot.offer_phone(message, state, self.telegram)
+        await bot.send_offer(message, message.from_user, state, self.telegram)
         async with aiosqlite.connect(storage.DB_PATH) as db:
             row = await (await db.execute('SELECT delivery_status,price FROM offers')).fetchone()
         self.assertEqual(row, ('unconfirmed', '1000'))
