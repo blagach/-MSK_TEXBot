@@ -358,6 +358,9 @@ async def pause_form(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await clear_form_keyboard(message, state)
     if kind:
+        if current == provider_ui.Register.payment.state:
+            await provider_ui.retire_payment_panel(message, state)
+            data.pop("payment_panel", None)
         if data.get("machine_panel"):
             await remove_form_keyboard(message, data["machine_panel"])
         lead_id = storage.parse_id(f"lead_{data.get('lead_id')}", "lead_")

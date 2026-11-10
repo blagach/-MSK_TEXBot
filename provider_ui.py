@@ -1,6 +1,7 @@
 """Aiogram router for provider self-service. Attach after init_schema."""
 from aiogram import F, Router
 import aiosqlite
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, CallbackQuery, Message, ReplyKeyboardMarkup
@@ -139,7 +140,7 @@ async def start_payment_selection(message, state, user_id):
     await show_payment_selection(message, state, selected)
 
 
-async def show_payment_selection(message, state, selected):
+async def show_payment_selection(message, state, selected, *, update=False):
     rows = [
         [InlineKeyboardButton(text=f"{'✅' if method in selected else '⬜'} {method}",
                               callback_data=f"provider_payment:pick:{index}")]
@@ -147,12 +148,32 @@ async def show_payment_selection(message, state, selected):
     ]
     rows.append([InlineKeyboardButton(text="Сохранить", callback_data="provider_payment:save"),
                  InlineKeyboardButton(text="Отмена", callback_data="provider_payment:cancel")])
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    if update:
+        try:
+            await message.edit_reply_markup(reply_markup=markup)
+        except TelegramAPIError:
+            await retire_payment_panel(message, state)
+        else:
+            await state.update_data(payment_selection=sorted(selected))
+            return
     sent = await message.answer(
         "Выберите один или несколько способов оплаты и нажмите «Сохранить». "
         "Также можно перечислить варианты через запятую.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        reply_markup=markup,
     )
     await state.update_data(payment_selection=sorted(selected), payment_panel=sent.message_id)
+
+
+async def retire_payment_panel(message, state):
+    panel = (await state.get_data()).get("payment_panel")
+    if panel is None:
+        return
+    await state.update_data(payment_panel=None)
+    try:
+        await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=panel, reply_markup=None)
+    except TelegramAPIError:
+        pass  # Old callbacks remain inactive because the stored panel ID was cleared.
 
 
 @router.callback_query(F.data.startswith("provider_payment:pick:") | F.data.in_({
@@ -173,11 +194,12 @@ async def payment_selection_callback(callback: CallbackQuery, state: FSMContext)
     if action == "save":
         await finish_payment_selection(callback.message, state, callback.from_user.id, selected)
     elif action == "cancel":
+        await retire_payment_panel(callback.message, state)
         await state.clear()
         await callback.message.answer("Способы оплаты оставлены без изменений.",
                                       reply_markup=await executor_keyboard(callback.from_user.id, state))
     elif action in {"0", "1", "2"}:
-        await show_payment_selection(callback.message, state, selected ^ {PAYMENT_OPTIONS[int(action)]})
+        await show_payment_selection(callback.message, state, selected ^ {PAYMENT_OPTIONS[int(action)]}, update=True)
 
 
 @router.message(Register.payment)
@@ -191,6 +213,7 @@ async def provider_payment(message: Message, state: FSMContext):
 
 async def finish_payment_selection(message, state, user_id, methods):
     await payments.save_provider(user_id, methods, storage.DB_PATH)
+    await retire_payment_panel(message, state)
     await state.clear()
     await message.answer("Способы оплаты сохранены.", reply_markup=await executor_keyboard(user_id, state))
 

@@ -239,16 +239,31 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
 
         await provider_ui.edit_payment_methods(self.callback(provider, "provider_payment:edit"), state)
         await click("pick:1", 11)
-        await click("pick:2", 11)  # An older screen must not change the selection.
+        provider.edit_reply_markup.assert_awaited_once()
+        self.assertEqual(provider.answer.await_count, 1)
+        await click("pick:2", 10)  # An older screen must not change the selection.
         self.assertEqual(set((await state.get_data())["payment_selection"]), {payments.CASH, payments.VAT})
         self.assertEqual(await current_methods(), {payments.CASH})
-        await click("cancel", 12)
+        await click("cancel", 11)
+        self.telegram.edit_message_reply_markup.assert_awaited_with(chat_id=20, message_id=11, reply_markup=None)
         self.assertEqual(await current_methods(), {payments.CASH})
 
         await provider_ui.edit_payment_methods(self.callback(provider, "provider_payment:edit"), state)
-        await click("pick:2", 14)
-        await click("save", 15)
+        provider.edit_reply_markup.side_effect = TelegramNetworkError(SendMessage(chat_id=20, text="x"), "timeout")
+        await click("pick:2", 13)
+        self.assertEqual((await state.get_data())["payment_panel"], 14)
+        await click("save", 13)
+        self.assertEqual(await current_methods(), {payments.CASH})
+        await click("save", 14)
+        self.telegram.edit_message_reply_markup.assert_awaited_with(chat_id=20, message_id=14, reply_markup=None)
         self.assertEqual(await current_methods(), {payments.CASH, payments.NO_VAT})
+
+        await provider_ui.edit_payment_methods(self.callback(provider, "provider_payment:edit"), state)
+        await bot.pause_form(provider, state)
+        self.telegram.edit_message_reply_markup.assert_awaited_with(chat_id=20, message_id=16, reply_markup=None)
+        self.assertIsNone(await state.get_state())
+        self.assertEqual(set((await bot.draft_slot(state, "provider_action").get_data())["payment_selection"]),
+                         {payments.CASH, payments.NO_VAT})
 
     async def test_restart_requeues_only_unsent_and_claim_is_unique(self):
         ticket_id, _ = await support_storage.create_ticket(20, "help", "first", "Question", None)
