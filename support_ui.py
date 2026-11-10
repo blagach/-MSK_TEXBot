@@ -62,7 +62,8 @@ async def menu(message, user_id, admin_ids):
         (("📂 Мои обращения", "mine:0"),),
     ]
     if user_id in admin_ids:
-        rows.append((("📥 Очередь поддержки", "queue"),))
+        totals = await store.counts()
+        rows.append(((f"📥 Очередь поддержки · {totals.get('new', 0)}", "queue"),))
     await message.answer("Помощь / Поддержка", reply_markup=keys(*rows))
 
 

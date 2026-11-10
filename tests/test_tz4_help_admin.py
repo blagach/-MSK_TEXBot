@@ -93,6 +93,44 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await bot.open_admin_panel(ordinary, state)
         ordinary.answer.assert_awaited_with("Нет доступа.")
 
+    async def test_support_badges_and_lists_follow_status_transitions(self):
+        admin, admin_state = self.actor(1)
+        customer, customer_state = self.actor(20)
+
+        def buttons(message):
+            keyboard = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            return {button.callback_data: button.text for row in keyboard for button in row}
+
+        async def assert_totals(new, in_progress, closed):
+            await admin_ui.admin_action(self.callback(admin, "admin:home"), self.admins)
+            self.assertEqual(buttons(admin)["help:queue"], f"📥 Обращения · {new}")
+            await self.help_action(admin, admin_state, "home")
+            self.assertEqual(buttons(admin)["help:queue"], f"📥 Очередь поддержки · {new}")
+            await self.help_action(admin, admin_state, "queue")
+            labels = buttons(admin)
+            for status, title, count in (
+                ("new", "Новое", new), ("in_progress", "В работе", in_progress), ("closed", "Закрыто", closed),
+            ):
+                self.assertEqual(labels[f"help:list:{status}:0"], f"{title} · {count}")
+
+        await assert_totals(0, 0, 0)
+        ticket, _ = await support_storage.create_ticket(20, "help", "new-ticket", "Тест", None)
+        await assert_totals(1, 0, 0)
+        await self.help_action(admin, admin_state, "list:new:0")
+        self.assertTrue(any(f"help:ticket:{ticket}:" in action for action in buttons(admin)))
+
+        await self.help_action(admin, admin_state, f"status:{ticket}:in_progress:list:new:0")
+        await assert_totals(0, 1, 0)
+        await self.help_action(admin, admin_state, f"status:{ticket}:closed:list:in_progress:0")
+        await assert_totals(0, 0, 1)
+        await self.help_action(admin, admin_state, "list:closed:0")
+        self.assertTrue(any(f"help:ticket:{ticket}:" in action for action in buttons(admin)))
+
+        await self.help_action(customer, customer_state, "home")
+        self.assertNotIn("help:queue", buttons(customer))
+        denied = await self.help_action(customer, customer_state, "queue")
+        denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
+
     async def test_guides_search_and_training_do_not_create_records(self):
         message, state = self.actor(20)
         for role in ("customer", "provider"):
