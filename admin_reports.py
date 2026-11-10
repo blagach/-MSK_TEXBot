@@ -11,6 +11,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 import storage
+from lead_journey import OFFER_RESULT
 from provider_registry import _validate_phone
 
 USERS = """
@@ -40,12 +41,6 @@ SELECT * FROM (
 )
 ORDER BY provider_id, equipment_id
 """
-
-
-OFFER_RESULT = """CASE WHEN e.offer_id=o.id THEN 'Выбран'
-                       WHEN l.status IN ('closed','completed','cancelled','rejected') THEN 'Заявка закрыта'
-                       WHEN l.status IN ('archived','archive') THEN 'Заявка в архиве'
-                       ELSE 'Подан' END"""
 
 
 @asynccontextmanager

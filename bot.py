@@ -920,9 +920,8 @@ async def my_offers(message: Message, state: FSMContext) -> None:
 async def show_my_offers(message, user_id, before=2**63 - 1):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
-            """SELECT o.id, o.lead_id, o.price, o.comment, n.note, o.delivery_status,
-                      CASE WHEN e.offer_id=o.id THEN 'Выбран' WHEN l.status='closed' THEN 'Заявка закрыта'
-                      ELSE 'Подан' END AS outcome
+            f"""SELECT o.id, o.lead_id, o.price, o.comment, n.note, o.delivery_status,
+                      {lead_journey.OFFER_RESULT} AS outcome
                FROM offers o JOIN leads l ON l.id=o.lead_id
                LEFT JOIN offer_notes n ON n.offer_id=o.id
                LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected'

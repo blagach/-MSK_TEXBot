@@ -2,6 +2,12 @@
 import aiosqlite
 
 
+OFFER_RESULT = """CASE WHEN e.offer_id=o.id THEN 'Выбран'
+                       WHEN l.status IN ('closed','completed','cancelled','rejected') THEN 'Заявка закрыта'
+                       WHEN l.status IN ('archived','archive') THEN 'Заявка в архиве'
+                       ELSE 'Подан' END"""
+
+
 async def init_schema(db_path):
     async with aiosqlite.connect(db_path) as db:
         await db.executescript("""
