@@ -3,6 +3,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -10,12 +11,13 @@ from types import SimpleNamespace as Record
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
+from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError
 from aiogram.methods import SendMessage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, Update
 from openpyxl import load_workbook
 
 os.environ.update(BOT_TOKEN="123456:TEST", ADMIN_IDS="1,2", LEADS_CHANNEL_ID="-100123")
@@ -215,6 +217,52 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await self.help_action(customer, customer_state, f"ticket:{ticket}:0")
         self.assertTrue(any("Откройте /menu." in call.args[0] for call in customer.answer.await_args_list))
         customer.answer_photo.assert_awaited_once_with("screenshot")
+
+    async def test_support_notification_opens_requester_history_through_dispatcher(self):
+        ticket, _ = await support_storage.create_ticket(20, "bug", "dispatcher", "Пропал ответ", None)
+        stamp = int(datetime(2026, 11, 10, tzinfo=timezone.utc).timestamp())
+        delivered = []
+
+        def user(user_id):
+            return {"id": user_id, "is_bot": False, "first_name": "Тест"}
+
+        def chat(user_id):
+            return {"id": user_id, "type": "private"}
+
+        def callback(update_id, user_id, data):
+            return Update.model_validate({"update_id": update_id, "callback_query": {
+                "id": str(update_id), "from": user(user_id), "chat_instance": str(user_id), "data": data,
+                "message": {"message_id": update_id, "date": stamp, "chat": chat(user_id)},
+            }})
+
+        async def transport(_bot, method, **_kwargs):
+            if isinstance(method, SendMessage):
+                delivered.append(method)
+                return Message(message_id=500 + len(delivered), date=stamp, chat=chat(method.chat_id))
+            self.assertEqual(method.__api_method__, "answerCallbackQuery")
+            return True
+
+        fsm = bot.SQLiteDraftStorage(str(self.database))
+        await fsm.init_schema()
+        response = "Сохранённый ответ из уведомления"
+        async with Bot("99:TEST") as telegram:
+            with ExitStack() as stack:
+                for router in (bot.router, provider_ui.router, support_ui.router, admin_ui.router):
+                    stack.enter_context(patch.object(router, "_parent_router", None))
+                stack.enter_context(patch.object(telegram.session, "make_request", side_effect=transport))
+                dispatcher = bot.create_dispatcher(fsm)
+                await dispatcher.feed_update(telegram, callback(1, 1, f"help:reply:{ticket}"))
+                await dispatcher.feed_update(telegram, Update.model_validate({"update_id": 2, "message": {
+                    "message_id": 2, "date": stamp, "chat": chat(1), "from": user(1), "text": response,
+                }}))
+                notifications = [method for method in delivered if method.chat_id == 20]
+                self.assertEqual(len(notifications), 1)
+                self.assertIn(response, notifications[0].text)
+                link = notifications[0].reply_markup.inline_keyboard[0][0].callback_data
+                await dispatcher.feed_update(telegram, callback(3, 20, link))
+                self.assertTrue(any(method.chat_id == 20 and method.text == f"№{ticket} · Поддержка\n{response}"
+                                    for method in delivered))
+        self.assertEqual((await support_storage.history(ticket))[0]["delivery_status"], "sent")
 
     async def test_delivery_error_and_legacy_history_are_persisted(self):
         ticket_id, _ = await support_storage.create_ticket(20, "bug", "first", "Question", None)
