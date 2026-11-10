@@ -168,9 +168,10 @@ async def export_xlsx():
             LEFT JOIN lead_payment_preferences p ON p.lead_id=l.id ORDER BY l.id
         """)
         offers = await rows(db, """
-            SELECT o.*, CASE WHEN e.offer_id=o.id THEN 'Выбран' WHEN l.status='closed' THEN 'Заявка закрыта'
+            SELECT o.*, n.note, CASE WHEN e.offer_id=o.id THEN 'Выбран' WHEN l.status='closed' THEN 'Заявка закрыта'
                    ELSE 'Подан' END AS result
             FROM offers o LEFT JOIN leads l ON l.id=o.lead_id
+            LEFT JOIN offer_notes n ON n.offer_id=o.id
             LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected' ORDER BY o.id
         """)
         tickets = await rows(db, """
@@ -208,12 +209,12 @@ async def export_xlsx():
                                   normalized_phone(lead["phone"]), lead["status"], moscow_time(lead["created_at"])))
     responses = workbook.create_sheet("Отклики")
     responses.append(("№", "№ заявки", "Telegram ID исполнителя", "Исполнитель", "Username", "Профиль",
-                      "Телефон", "Стоимость", "Условия", "Результат", "Доставка", "Создано, МСК"))
+                      "Телефон", "Стоимость", "Условия", "Результат", "Доставка", "Создано, МСК", "Комментарий"))
     for offer in offers:
         append_text_safe(responses, (offer["id"], offer["lead_id"], str(offer["provider_id"]), offer["provider_name"],
                                      profile_name(offer["username"]), profile_url(offer["username"]),
                                      normalized_phone(offer["phone"]), offer["price"], offer["comment"], offer["result"],
-                                     offer["delivery_status"], moscow_time(offer["created_at"])))
+                                     offer["delivery_status"], moscow_time(offer["created_at"]), offer["note"]))
     requests = workbook.create_sheet("Обращения")
     requests.append(("№", "Telegram ID автора", "Тип", "Статус", "Первое сообщение", "Всего сообщений", "Создано, МСК"))
     for ticket in tickets:

@@ -115,6 +115,7 @@ class ProviderForm(StatesGroup):
 class OfferForm(StatesGroup):
     price = State()
     comment = State()
+    note = State()
     phone = State()
     review = State()
     edit = State()
@@ -124,6 +125,7 @@ class OfferForm(StatesGroup):
 OFFER_PROMPTS = {
     OfferForm.price: "Укажите вашу цену по заявке. Например: 28 000 ₽ за смену.",
     OfferForm.comment: "Коротко опишите условия: какая техника, подача, что включено.",
+    OfferForm.note: "Добавьте комментарий к отклику или нажмите «Без комментария».",
     OfferForm.phone: (
         "📱 Укажите номер телефона для связи.\n\n"
         "Введите номер в формате +79123456789 или нажмите кнопку ниже "
@@ -165,7 +167,8 @@ PROVIDER_ROLE = "🚜 Я исполнитель"
 MY_LEADS = "📋 Мои заявки"
 OFFER_EDIT_FIELDS = {
     "price": ("💰 Стоимость", OfferForm.price),
-    "comment": ("📝 Комментарий", OfferForm.comment),
+    "comment": ("📋 Условия", OfferForm.comment),
+    "note": ("📝 Комментарий", OfferForm.note),
     "phone": ("📱 Телефон", OfferForm.phone),
 }
 
@@ -454,7 +457,7 @@ async def back_in_form(message: Message, state: FSMContext, current: str) -> Non
         await offer_phone_back(message, state)
     elif current == OfferForm.comment.state and not (await state.get_data()).get("offer_editing"):
         await show_offer_step(message, state, OfferForm.price)
-    elif current in (OfferForm.price.state, OfferForm.comment.state) and (await state.get_data()).get("offer_editing"):
+    elif current in (OfferForm.price.state, OfferForm.comment.state, OfferForm.note.state) and (await state.get_data()).get("offer_editing"):
         await next_offer_step(message, state, OfferForm.review)
     elif current == OfferForm.cancel_confirmation.state:
         data = await state.get_data()
@@ -578,7 +581,7 @@ async def show_offer_step(message: Message, state: FSMContext, step: State, **fi
             "📋 Проверьте ваш отклик\n\n"
             f"🚜 Номер заявки: {data['lead_id']}\n"
             f"💰 Стоимость: {data['price']}\n"
-            f"📝 Комментарий: {data['comment']}\n"
+            f"{offer_terms_text(data['comment'], data.get('note'))}\n"
             f"📱 Телефон: {data['phone']}"
         )
         rows = [
@@ -604,7 +607,7 @@ async def show_offer_step(message: Message, state: FSMContext, step: State, **fi
             )
         else:
             prompt = OFFER_PROMPTS[step]
-            if step == OfferForm.comment:
+            if step in (OfferForm.comment, OfferForm.note):
                 rows.append([InlineKeyboardButton(text="Без комментария", callback_data="offer_step:skip")])
         navigation = []
         if step != OfferForm.price or data.get("offer_editing"):
@@ -866,7 +869,9 @@ async def show_customer_offers(message, lead, before):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            """SELECT o.*, e.offer_id AS selected FROM offers o LEFT JOIN lead_lifecycle_events e
+            """SELECT o.*, n.note, e.offer_id AS selected FROM offers o
+               LEFT JOIN offer_notes n ON n.offer_id=o.id
+               LEFT JOIN lead_lifecycle_events e
                ON e.lead_id=o.lead_id AND e.action='selected'
                WHERE o.lead_id=? AND o.id<? ORDER BY o.id DESC LIMIT 9""", (lead["id"], before),
         ) as cursor:
@@ -876,7 +881,7 @@ async def show_customer_offers(message, lead, before):
         if offer["selected"] is None and lead["status"] == "published":
             buttons.append([lead_key("Выбрать исполнителя", f"pick:{lead['id']}:{offer['id']}")])
         await message.answer(
-            f"{offer['provider_name']} · {offer['price']}\n{offer['comment'] or 'Без комментария'}"
+            f"{offer['provider_name']} · {offer['price']}\n{offer_terms_text(offer['comment'], offer['note'])}"
             + ("\n✅ Исполнитель выбран" if offer["selected"] == offer["id"] else ""),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
@@ -912,10 +917,11 @@ async def my_offers(message: Message, state: FSMContext) -> None:
 async def show_my_offers(message, user_id, before=2**63 - 1):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
-            """SELECT o.id, o.lead_id, o.price, o.comment, o.delivery_status,
+            """SELECT o.id, o.lead_id, o.price, o.comment, n.note, o.delivery_status,
                       CASE WHEN e.offer_id=o.id THEN 'Выбран' WHEN l.status='closed' THEN 'Заявка закрыта'
                       ELSE 'Подан' END AS outcome
                FROM offers o JOIN leads l ON l.id=o.lead_id
+               LEFT JOIN offer_notes n ON n.offer_id=o.id
                LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected'
                WHERE o.provider_id=? AND o.id<? ORDER BY o.id DESC LIMIT 9""",
             (user_id, before),
@@ -925,9 +931,9 @@ async def show_my_offers(message, user_id, before=2**63 - 1):
     if not offers:
         await message.answer("У вас пока нет откликов.")
         return
-    for _, lead_id, price, comment, status, outcome in offers[:8]:
+    for _, lead_id, price, comment, note, status, outcome in offers[:8]:
         await message.answer(
-            f"Отклик на заявку №{lead_id}\nСтоимость: {price}\nУсловия: {comment or 'не указаны'}"
+            f"Отклик на заявку №{lead_id}\nСтоимость: {price}\n{offer_terms_text(comment, note)}"
             f"\nСтатус: {outcome}\nДоставка: {statuses.get(status, status)}"
         )
 
@@ -1276,6 +1282,17 @@ async def offer_comment(message: Message, state: FSMContext) -> None:
     await next_offer_step(message, state, OfferForm.phone, comment=message.text)
 
 
+@router.message(OfferForm.note)
+async def offer_note(message: Message, state: FSMContext) -> None:
+    if await valid_input(message, 1000, phone=False):
+        await next_offer_step(message, state, OfferForm.review, note=message.text.strip())
+
+
+def offer_terms_text(conditions, note=None):
+    terms = conditions if conditions and conditions != "Без комментария" else "не указаны"
+    return f"Условия: {terms}\nКомментарий: {note or 'Без комментария'}"
+
+
 async def next_offer_step(message: Message, state: FSMContext, step: State, **fields) -> None:
     if (await state.get_data()).get("offer_editing"):
         fields["offer_editing"] = False
@@ -1330,6 +1347,8 @@ async def offer_step_action(callback: CallbackQuery, state: FSMContext, bot: Bot
         await show_main_menu(message, state)
     elif action == "skip" and current == OfferForm.comment.state:
         await next_offer_step(message, state, OfferForm.phone, comment="Без комментария")
+    elif action == "skip" and current == OfferForm.note.state:
+        await next_offer_step(message, state, OfferForm.review, note=None)
     elif action == "back":
         await back_in_form(message, state, current)
     elif action == "edit" and current == OfferForm.review.state:
@@ -1390,11 +1409,11 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
         f"🚜 Отклик на заявку №{lead['id']}\n\n"
         f"Исполнитель: {provider_name} ({username})\n"
         f"Цена: {data['price']}\n"
-        f"Условия: {data['comment']}"
+        f"{offer_terms_text(data['comment'], data.get('note'))}"
     )
     offer_id = await storage.save_offer(
         lead["id"], provider.id, provider_name, username,
-        data["price"], data["comment"], phone,
+        data["price"], data["comment"], phone, note=data.get("note"),
     )
     await clear_form_keyboard(message, state)
     await state.clear()

@@ -48,6 +48,10 @@ async def init_schema():
             message_id INTEGER NOT NULL
         )""")
         await db.execute("CREATE TABLE IF NOT EXISTS bot_visitors (telegram_id INTEGER PRIMARY KEY)")
+        await db.execute("""CREATE TABLE IF NOT EXISTS offer_notes (
+            offer_id INTEGER PRIMARY KEY REFERENCES offers(id),
+            note TEXT NOT NULL
+        )""")
         await db.commit()
     await lead_journey.init_schema(DB_PATH)
 
@@ -85,7 +89,7 @@ async def finish_publication(lead_id, chat_id, message_id):
         await db.commit()
 
 
-async def save_offer(lead_id, provider_id, name, username, price, comment, phone):
+async def save_offer(lead_id, provider_id, name, username, price, comment, phone, *, note=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute("SELECT status FROM leads WHERE id = ?", (lead_id,))
@@ -97,8 +101,13 @@ async def save_offer(lead_id, provider_id, name, username, price, comment, phone
                VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(lead_id, provider_id) DO NOTHING""",
             (lead_id, provider_id, name, username, price, comment, phone, datetime.now(timezone.utc).isoformat()),
         )
+        if cursor.rowcount != 1:
+            return None
+        offer_id = cursor.lastrowid
+        if note:
+            await db.execute("INSERT INTO offer_notes (offer_id, note) VALUES (?, ?)", (offer_id, note))
         await db.commit()
-        return cursor.lastrowid if cursor.rowcount == 1 else None
+        return offer_id
 
 
 async def has_offer(lead_id, provider_id):

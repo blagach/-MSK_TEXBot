@@ -341,7 +341,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 (stamp,),
             )
             await db.commit()
-        offer = await storage.save_offer(1, 50, "Исполнитель", "", "15000", "", "+79991234567")
+        offer = await storage.save_offer(1, 50, "Исполнитель", "", "15000", "Подача включена",
+                                         "+79991234567", note="Пропуск оформлен")
         await storage.mark_offer(offer, "sent")
         await storage.save_offer(3, 20, "Кран", "", "20000", "", "+79991234567")
         async with aiosqlite.connect(self.database) as db:
@@ -361,6 +362,10 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         workbook = load_workbook(BytesIO(await admin_reports.export_xlsx()))
         self.assertEqual(workbook.sheetnames, ["Пользователи", "Техника", "Заявки", "Отклики",
                                                "Обращения", "История статусов и закрытия"])
+        headers, submitted, legacy = list(workbook["Отклики"].values)
+        self.assertEqual(submitted[headers.index("Условия")], "Подача включена")
+        self.assertEqual(submitted[headers.index("Комментарий")], "Пропуск оформлен")
+        self.assertIsNone(legacy[headers.index("Комментарий")])
         people = workbook["Пользователи"]
         self.assertEqual((people["A2"].value, people["A2"].data_type), ("20", "s"))
         self.assertEqual((people["B2"].value, people["B2"].data_type), ("=HYPERLINK(1)", "s"))

@@ -589,9 +589,13 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("phone")
         self.message.text = "89990000002"
         await bot.offer_phone(self.message, self.state)
+        await self.click("edit")
+        await self.click("note")
+        self.message.text = "Есть пропуск на объект"
+        await bot.offer_note(self.message, self.state)
         review = self.message.answer.await_args.args[0]
         for expected in ("📋 Проверьте ваш отклик", "Номер заявки: 1", "30000",
-                         "Подача включена", "+79990000002"):
+                         "Условия: Подача включена", "Комментарий: Есть пропуск на объект", "+79990000002"):
             self.assertIn(expected, review)
         stale = self.step("send", old_review)
         await bot.offer_step_action(stale, self.state, self.telegram)
@@ -600,6 +604,9 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.telegram.send_message.assert_not_awaited()
         await self.click("send")
         self.assertEqual(await self.saved_offers(), [("30000", "Подача включена", "+79990000002")])
+        self.assertIn("Комментарий: Есть пропуск на объект", self.telegram.send_message.await_args_list[0].args[1])
+        await bot.show_my_offers(self.message, self.message.from_user.id)
+        self.assertIn("Комментарий: Есть пропуск на объект", self.message.answer.await_args.args[0])
 
     async def test_offer_and_private_copyable_phone(self):
         await self.enter_comment()
