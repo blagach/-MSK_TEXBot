@@ -473,6 +473,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         offer = await storage.save_offer(1, 50, "Исполнитель", "", "15000", "Подача включена",
                                          "+79991234567", note="Пропуск оформлен")
         await storage.mark_offer(offer, "sent")
+        self.assertTrue(await bot.lead_journey.change_lifecycle(storage.DB_PATH, 1, 20, offer_id=offer))
         await storage.save_offer(3, 20, "Кран", "", "20000", "", "+79991234567")
         async with aiosqlite.connect(self.database) as db:
             await db.execute("UPDATE leads SET status='archived' WHERE id=3")
@@ -481,10 +482,15 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         registrations = await admin_reports.registration_stats(datetime(2026, 11, 9, 15, tzinfo=timezone.utc))
         self.assertEqual([row["providers"] for row in registrations], [1, 1, 2])
         self.assertEqual([row["customers"] for row in registrations], [2, 2, 2])
-        leads, offers, delivery = await admin_reports.lead_and_offer_counts()
+        leads, offers, delivery, results = await admin_reports.lead_and_offer_counts()
         self.assertEqual(admin_reports.classify(leads), {"Активные": 1, "Закрытые": 1, "Архивные": 1, "Прочие": 0})
         self.assertEqual(admin_reports.classify(offers)["Архивные"], 1)
         self.assertEqual({row["status"]: row["n"] for row in delivery}, {"pending": 1, "sent": 1})
+        self.assertEqual({row["status"]: row["n"] for row in results}, {"Выбран": 1, "Заявка в архиве": 1})
+        admin, _ = self.actor(1)
+        await admin_ui.admin_action(self.callback(admin, "admin:records"), self.admins)
+        self.assertIn("Результаты откликов\nВыбран 1 · Заявка в архиве 1", admin.answer.await_args.args[0])
+        self.assertIn("Доставка откликов", admin.answer.await_args.args[0])
         equipment = await admin_reports.equipment_page(0)
         self.assertEqual(len(equipment), 3)
         self.assertIn("Москва, ЗАО", [item["location"] for item in equipment])
@@ -495,6 +501,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted[headers.index("Условия")], "Подача включена")
         self.assertEqual(submitted[headers.index("Комментарий")], "Пропуск оформлен")
         self.assertIsNone(legacy[headers.index("Комментарий")])
+        self.assertEqual(submitted[headers.index("Результат")], "Выбран")
+        self.assertEqual(legacy[headers.index("Результат")], "Заявка в архиве")
         people = workbook["Пользователи"]
         self.assertEqual((people["A2"].value, people["A2"].data_type), ("20", "s"))
         self.assertEqual((people["B2"].value, people["B2"].data_type), ("=HYPERLINK(1)", "s"))

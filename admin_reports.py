@@ -42,6 +42,12 @@ ORDER BY provider_id, equipment_id
 """
 
 
+OFFER_RESULT = """CASE WHEN e.offer_id=o.id THEN 'Выбран'
+                       WHEN l.status IN ('closed','completed','cancelled','rejected') THEN 'Заявка закрыта'
+                       WHEN l.status IN ('archived','archive') THEN 'Заявка в архиве'
+                       ELSE 'Подан' END"""
+
+
 @asynccontextmanager
 async def read_db():
     uri = Path(storage.DB_PATH).resolve().as_uri() + "?mode=ro"
@@ -137,7 +143,13 @@ async def lead_and_offer_counts():
             SELECT l.status, COUNT(*) AS n FROM offers o LEFT JOIN leads l ON l.id=o.lead_id GROUP BY l.status
         """)
         deliveries = await rows(db, "SELECT delivery_status AS status, COUNT(*) AS n FROM offers GROUP BY delivery_status")
-    return leads, offers, deliveries
+        results = await rows(db, f"""
+            SELECT {OFFER_RESULT} AS status, COUNT(*) AS n
+            FROM offers o LEFT JOIN leads l ON l.id=o.lead_id
+            LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected'
+            GROUP BY status ORDER BY status
+        """)
+    return leads, offers, deliveries, results
 
 
 def classify(records):
@@ -195,9 +207,8 @@ async def export_xlsx():
             LEFT JOIN lead_work_details d ON d.lead_id=l.id
             LEFT JOIN lead_payment_preferences p ON p.lead_id=l.id ORDER BY l.id
         """)
-        offers = await rows(db, """
-            SELECT o.*, n.note, CASE WHEN e.offer_id=o.id THEN 'Выбран' WHEN l.status='closed' THEN 'Заявка закрыта'
-                   ELSE 'Подан' END AS result
+        offers = await rows(db, f"""
+            SELECT o.*, n.note, {OFFER_RESULT} AS result
             FROM offers o LEFT JOIN leads l ON l.id=o.lead_id
             LEFT JOIN offer_notes n ON n.offer_id=o.id
             LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected' ORDER BY o.id

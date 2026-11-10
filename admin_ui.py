@@ -56,13 +56,15 @@ async def admin_action(callback: CallbackQuery, support_admin_ids):
             reply_markup=keyboard(HOME),
         )
     elif action == "records":
-        leads, offers, delivery = await reports.lead_and_offer_counts()
+        leads, offers, delivery, results = await reports.lead_and_offer_counts()
         lead_counts = " · ".join(f"{label} {n}" for label, n in reports.classify(leads).items())
         offer_counts = " · ".join(f"{label} {n}" for label, n in reports.classify(offers).items())
         labels = {"sent": "отправлен", "pending": "ожидается", "unconfirmed": "не подтверждена"}
         deliveries = " · ".join(f"{labels.get(r['status'], r['status'])} {r['n']}" for r in delivery)
+        outcomes = " · ".join(f"{row['status']} {row['n']}" for row in results)
         await message.answer(
             f"Заявки\n{lead_counts}\n\nОтклики по статусу связанной заявки\n{offer_counts}\n\n"
+            f"Результаты откликов\n{outcomes or 'Нет записей'}\n\n"
             f"Доставка откликов\n{deliveries or 'Нет записей'}", reply_markup=keyboard(HOME),
         )
     elif action == "stats":
