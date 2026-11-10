@@ -120,7 +120,7 @@ async def registration_stats(at=None):
 async def equipment_totals():
     async with read_db() as db:
         return (await rows(db, USERS + """
-            SELECT (SELECT count(*) FROM performers) AS providers,
+            SELECT (SELECT count(*) FROM registrations) AS providers,
                    (SELECT count(*) FROM provider_equipment) AS units
         """))[0]
 

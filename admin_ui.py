@@ -78,5 +78,5 @@ async def admin_action(callback: CallbackQuery, support_admin_ids):
         await message.answer_document(document, caption="Служебная выгрузка MSK TEXBot.", reply_markup=keyboard(HOME))
     elif re.fullmatch(r"equipment:[0-9]{1,7}", action):
         totals = await reports.equipment_totals()
-        await message.answer(f"Исполнители · {totals['providers']}\nЕдиницы техники · {totals['units']}",
+        await message.answer(f"Зарегистрированные исполнители · {totals['providers']}\nЕдиницы техники · {totals['units']}",
                              reply_markup=keyboard(HOME))

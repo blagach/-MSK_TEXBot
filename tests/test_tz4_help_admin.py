@@ -418,6 +418,38 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             {"providers": 3, "customers": 3, "created": 4, "published": 3, "offers": 3},
         ])
 
+    async def test_equipment_panel_counts_registered_providers_and_units_without_cards(self):
+        admin, _ = self.actor(1)
+        await admin_ui.admin_action(self.callback(admin, "admin:equipment:0"), self.admins)
+        self.assertEqual(admin.answer.await_args.args[0], "Зарегистрированные исполнители · 0\nЕдиницы техники · 0")
+        stamp = "2026-11-09T10:00:00+00:00"
+        await provider_registry.register_provider(20, "Современный профиль", "+79991234567", True, db_path=self.database)
+        async with aiosqlite.connect(self.database) as db:
+            await db.executemany(
+                "INSERT INTO providers VALUES (?,?,'трал','Москва','+79991234567',?)",
+                [(20, "Старый профиль", stamp), (40, "Только старая регистрация", stamp)],
+            )
+            await db.executemany(
+                """INSERT INTO provider_equipment(provider_id,category,description,region,area,active,created_at)
+                   VALUES (20,'автокран',?,'Москва','ЗАО',?,?)""",
+                [("Первая машина", 1, stamp), ("Вторая машина", 0, stamp)],
+            )
+            await db.execute(
+                """INSERT INTO leads(customer_id,equipment,place,work_date,details,phone,status,created_at)
+                   VALUES (70,'кран','Москва','завтра','','+79991234567','published',?)""",
+                (stamp,),
+            )
+            await db.commit()
+        await storage.save_offer(1, 50, "Только отклик", "", "15000", "", "+79991234567")
+
+        admin.answer.reset_mock()
+        await admin_ui.admin_action(self.callback(admin, "admin:equipment:0"), self.admins)
+        admin.answer.assert_awaited_once()
+        self.assertEqual(admin.answer.await_args.args[0], "Зарегистрированные исполнители · 2\nЕдиницы техники · 2")
+        buttons = admin.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual([button.callback_data for row in buttons for button in row], ["admin:home"])
+        self.assertEqual((await admin_reports.user_totals())["providers"], 3)
+
     async def test_report_counts_and_excel_use_existing_records(self):
         stamp = "2026-11-09T10:00:00+00:00"
         async with aiosqlite.connect(self.database) as db:
