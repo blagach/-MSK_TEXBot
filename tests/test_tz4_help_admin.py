@@ -10,6 +10,8 @@ from types import SimpleNamespace as Record
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
+from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError
+from aiogram.methods import SendMessage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -35,7 +37,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         config.start()
         self.addCleanup(config.stop)
         await bot.init_db()
-        self.telegram = Record(send_message=AsyncMock(), edit_message_reply_markup=AsyncMock(), id=99)
+        self.telegram = Record(send_message=AsyncMock(return_value=Record(message_id=100)), edit_message_reply_markup=AsyncMock(), id=99)
         self.admins = {1, 2}
         self.memory = MemoryStorage()
 
@@ -137,6 +139,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         admin.text = "Откройте /menu."
         await support_ui.reply_to_ticket(admin, admin_state, self.telegram, self.admins)
         self.assertEqual(self.telegram.send_message.await_args.args[0], 20)
+        self.assertEqual((await support_storage.history(ticket))[0]["delivery_status"], "sent")
         self.assertEqual((await support_storage.ticket(ticket))["status"], "in_progress")
         await self.help_action(admin, admin_state, f"status:{ticket}:closed")
         self.assertEqual((await support_storage.ticket(ticket))["status"], "closed")
@@ -144,6 +147,73 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await self.help_action(customer, customer_state, f"ticket:{ticket}:0")
         self.assertTrue(any("Откройте /menu." in call.args[0] for call in customer.answer.await_args_list))
         customer.answer_photo.assert_awaited_once_with("screenshot")
+
+    async def test_delivery_error_and_legacy_history_are_persisted(self):
+        ticket_id, _ = await support_storage.create_ticket(20, "bug", "first", "Question", None)
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute(
+                "INSERT INTO support_messages(ticket_id,request_id,actor_id,is_admin,text,created_at) "
+                "VALUES (?,'old',1,1,'Historical reply','2026-11-09')", (ticket_id,),
+            )
+            await db.commit()
+        await support_storage.init_schema()
+        self.assertEqual(await support_storage.queued_deliveries(), [])
+        self.assertIsNone((await support_storage.history(ticket_id))[0]["delivery_status"])
+        request = SendMessage(chat_id=20, text="x")
+        for error, expected, code in (
+            (TelegramForbiddenError(request, "Forbidden: bot was blocked by the user"), "failed", "bot_blocked"),
+            (TelegramNetworkError(request, "timeout"), "uncertain", "TelegramNetworkError"),
+            (support_ui.IsolationError("blocked by test guard"), "failed", "IsolationError"),
+        ):
+            self.telegram.send_message.side_effect = error
+            admin, state = self.actor(1)
+            await self.help_action(admin, state, f"reply:{ticket_id}")
+            admin.text = "New answer"
+            await support_ui.reply_to_ticket(admin, state, self.telegram, self.admins)
+            self.assertNotEqual(admin.answer.await_args.args[0], "Ответ сохранён и отправлен.")
+            row = (await support_storage.history(ticket_id))[0]
+            self.assertEqual((row["delivery_status"], row["delivery_error"]), (expected, code))
+            self.assertIsNone(await support_ui.deliver_reply(self.telegram, row["id"]))
+        self.assertEqual(self.telegram.send_message.await_count, 3)
+
+    async def test_restart_requeues_only_unsent_and_claim_is_unique(self):
+        ticket_id, _ = await support_storage.create_ticket(20, "help", "first", "Question", None)
+        interrupted = await support_storage.add_reply(ticket_id, 1, "r1", "First answer")
+        queued = await support_storage.add_reply(ticket_id, 1, "r2", "Second answer")
+        self.assertFalse(await support_storage.add_reply(ticket_id, 1, "r2", "Duplicate"))
+        self.assertIsNotNone(await support_storage.claim_delivery(interrupted))
+        await support_storage.recover_deliveries()
+        self.assertEqual(await support_storage.queued_deliveries(), [queued])
+        outcomes = await asyncio.gather(
+            support_ui.deliver_reply(self.telegram, queued), support_ui.deliver_reply(self.telegram, queued),
+        )
+        self.assertCountEqual(outcomes, ["sent", None])
+        self.telegram.send_message.assert_awaited_once()
+        rows = await support_storage.history(ticket_id)
+        self.assertEqual((rows[1]["delivery_status"], rows[1]["delivery_error"]), ("uncertain", "interrupted"))
+
+    async def test_edit_invalidates_old_send_and_ticket_returns_to_filtered_page(self):
+        user, state = self.actor(20)
+        await self.help_action(user, state, "new:help")
+        user.text = "Before"
+        await support_ui.compose_ticket(user, state)
+        old_nonce = (await state.get_data())["support_nonce"]
+        await self.help_action(user, state, f"edit:{old_nonce}")
+        await self.help_action(user, state, f"send:{old_nonce}")
+        self.assertEqual(await support_storage.list_tickets(requester_id=20), [])
+        user.text = "After"
+        await support_ui.compose_ticket(user, state)
+        await self.help_action(user, state, f"send:{(await state.get_data())['support_nonce']}")
+        ticket_id = (await support_storage.list_tickets(requester_id=20))[0]["id"]
+        self.assertEqual((await support_storage.history(ticket_id))[0]["text"], "After")
+        admin, state = self.actor(1)
+        await self.help_action(admin, state, f"ticket:{ticket_id}:0:list:new:8")
+        markup = admin.answer.await_args.kwargs["reply_markup"]
+        self.assertIn("help:list:new:8", [b.callback_data for row in markup.inline_keyboard for b in row])
+        self.assertIn("help:queue", [b.callback_data for row in markup.inline_keyboard for b in row])
+        await self.help_action(admin, state, f"status:{ticket_id}:in_progress:list:new:8")
+        markup = admin.answer.await_args.kwargs["reply_markup"]
+        self.assertIn("help:list:new:8", [b.callback_data for row in markup.inline_keyboard for b in row])
 
     async def test_simultaneous_confirmations_are_idempotent(self):
         results = await asyncio.gather(*[

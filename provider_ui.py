@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 
-from draft_storage import draft_slot
+from draft_storage import offer_draft_ids
 
 import provider_registry as registry
 import payment_preferences as payments
@@ -46,7 +46,7 @@ async def executor_keyboard(user_id: int, state: FSMContext) -> ReplyKeyboardMar
         ) as cursor:
             notifications_enabled, legacy = await cursor.fetchone()
 
-    draft = (OFFER_DRAFT,) if await draft_slot(state, "offer").get_state() else ()
+    draft = (OFFER_DRAFT,) if await offer_draft_ids(state) else ()
     if notifications_enabled is not None:
         notifications = NOTIFICATIONS_ON if notifications_enabled else NOTIFICATIONS_OFF
         rows = [

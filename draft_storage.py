@@ -7,10 +7,50 @@ import aiosqlite
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import BaseStorage, DefaultKeyBuilder, StateType, StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
 
 
 def draft_slot(state: FSMContext, form: str) -> FSMContext:
     return FSMContext(state.storage, replace(state.key, destiny=f"draft_{form}"))
+
+
+async def offer_draft_ids(state: FSMContext) -> list[int]:
+    storage = state.storage
+    prefix = "draft_offer_"
+    if isinstance(storage, SQLiteDraftStorage):
+        marker = storage.keys.build(replace(state.key, destiny=prefix))
+        async with aiosqlite.connect(storage.db_path) as db:
+            async with db.execute(
+                "SELECT substr(storage_key, ?) FROM form_drafts WHERE state IS NOT NULL "
+                "AND storage_key >= ? AND storage_key < ?",
+                (len(marker) + 1, marker + "0", marker + ":"),
+            ) as cursor:
+                candidates = [row[0] for row in await cursor.fetchall()]
+    elif isinstance(storage, MemoryStorage):
+        candidates = [
+            key.destiny[len(prefix):] for key, record in storage.storage.items()
+            if record.state and key.destiny.startswith(prefix)
+            and replace(key, destiny=state.key.destiny) == state.key
+        ]
+    else:
+        candidates = []
+    ids = {int(value) for value in candidates if value.isascii() and value.isdecimal() and len(value) <= 18}
+    legacy = draft_slot(state, "offer")
+    if await legacy.get_state():
+        value = str((await legacy.get_data()).get("lead_id"))
+        if value.isascii() and value.isdecimal() and len(value) <= 18:
+            ids.add(int(value))
+    return sorted(ids, reverse=True)
+
+
+async def offer_draft_slot(state: FSMContext, lead_id: int) -> FSMContext:
+    scoped = draft_slot(state, f"offer_{lead_id}")
+    if await scoped.get_state():
+        return scoped
+    legacy = draft_slot(state, "offer")
+    if await legacy.get_state() and str((await legacy.get_data()).get("lead_id")) == str(lead_id):
+        return legacy
+    return scoped
 
 
 class SQLiteDraftStorage(BaseStorage):

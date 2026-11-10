@@ -39,6 +39,15 @@ async def init_schema():
                 photo_id TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS support_reply_deliveries (
+                message_id INTEGER PRIMARY KEY REFERENCES support_messages(id),
+                status TEXT NOT NULL CHECK(status IN ('queued','sending','sent','failed','uncertain')),
+                telegram_message_id INTEGER,
+                error_code TEXT,
+                attempted_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS support_reply_deliveries_queue
+                ON support_reply_deliveries(status, message_id);
             CREATE INDEX IF NOT EXISTS support_tickets_requester ON support_tickets(requester_id, id);
             CREATE INDEX IF NOT EXISTS support_messages_ticket ON support_messages(ticket_id, id);
         """)
@@ -91,8 +100,9 @@ async def list_tickets(*, requester_id=None, status=None, offset=0):
 async def history(ticket_id, offset=0):
     async with connection() as db:
         async with db.execute(
-            """SELECT * FROM support_messages WHERE ticket_id=?
-               ORDER BY id DESC LIMIT 7 OFFSET ?""",
+            """SELECT m.*, d.status AS delivery_status, d.error_code AS delivery_error
+               FROM support_messages m LEFT JOIN support_reply_deliveries d ON d.message_id=m.id
+               WHERE m.ticket_id=? ORDER BY m.id DESC LIMIT 7 OFFSET ?""",
             (ticket_id, offset),
         ) as cursor:
             return await cursor.fetchall()
@@ -122,6 +132,55 @@ async def add_reply(ticket_id, admin_id, request_id, text):
         )
         if not cursor.rowcount:
             return False
+        await db.execute(
+            "INSERT INTO support_reply_deliveries(message_id,status) VALUES (?,'queued')", (cursor.lastrowid,),
+        )
         await db.execute("UPDATE support_tickets SET status='in_progress' WHERE id=? AND status='new'", (ticket_id,))
         await db.commit()
-        return True
+        return cursor.lastrowid
+
+
+async def claim_delivery(message_id):
+    async with connection() as db:
+        cursor = await db.execute(
+            """UPDATE support_reply_deliveries SET status='sending', attempted_at=?
+               WHERE message_id=? AND status='queued'""",
+            (now(), message_id),
+        )
+        if not cursor.rowcount:
+            return None
+        async with db.execute(
+            """SELECT m.ticket_id, m.text, t.requester_id
+               FROM support_messages m JOIN support_tickets t ON t.id=m.ticket_id WHERE m.id=?""",
+            (message_id,),
+        ) as cursor:
+            reply = await cursor.fetchone()
+        await db.commit()
+        return reply
+
+
+async def finish_delivery(message_id, status, *, telegram_message_id=None, error_code=None):
+    async with connection() as db:
+        await db.execute(
+            """UPDATE support_reply_deliveries SET status=?, telegram_message_id=?, error_code=?
+               WHERE message_id=? AND status='sending'""",
+            (status, telegram_message_id, error_code, message_id),
+        )
+        await db.commit()
+
+
+async def queued_deliveries():
+    async with connection() as db:
+        async with db.execute(
+            "SELECT message_id FROM support_reply_deliveries WHERE status='queued' ORDER BY message_id LIMIT 20",
+        ) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+
+async def recover_deliveries():
+    async with connection() as db:
+        await db.execute(
+            """UPDATE support_reply_deliveries SET status='uncertain', error_code='interrupted'
+               WHERE status='sending'""",
+        )
+        await db.commit()

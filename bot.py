@@ -27,7 +27,7 @@ from aiogram.types import (
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
-from draft_storage import SQLiteDraftStorage, draft_slot
+from draft_storage import SQLiteDraftStorage, draft_slot, offer_draft_ids, offer_draft_slot
 
 import admin_ui
 import support_storage
@@ -300,11 +300,12 @@ async def pause_form(message: Message, state: FSMContext) -> None:
     kind = form_kind(current)
     await clear_form_keyboard(message, state)
     if kind:
-        draft = draft_slot(state, kind)
+        data = await state.get_data()
+        lead_id = storage.parse_id(f"lead_{data.get('lead_id')}", "lead_")
+        draft = draft_slot(state, f"offer_{lead_id}" if kind == "offer" and lead_id else kind)
         if isinstance(state.storage, SQLiteDraftStorage):
             await state.storage.transfer(state.key, draft.key)
             return
-        data = await state.get_data()
         data.pop("form_keyboard_id", None)
         await draft.set_data(data)
         await draft.set_state(current)
@@ -319,12 +320,17 @@ async def restore_form_step(message: Message, state: FSMContext, current: str) -
         await show_offer_step(message, state, step)
 
 
-async def resume_draft(message: Message, state: FSMContext, kind: str) -> bool:
-    draft = draft_slot(state, kind)
+async def resume_draft(message: Message, state: FSMContext, kind: str, lead_id: int | None = None) -> bool:
+    if kind == "offer" and lead_id is None:
+        ids = await offer_draft_ids(state)
+        if len(ids) != 1:
+            return False
+        lead_id = ids[0]
+    draft = await offer_draft_slot(state, lead_id) if lead_id is not None else draft_slot(state, kind)
     current = await draft.get_state()
     if current is None:
         return False
-    if form_kind(await state.get_state()) == kind:
+    if kind == "lead" and form_kind(await state.get_state()) == kind:
         await open_navigation(message, state)
         return True
     await pause_form(message, state)
@@ -396,8 +402,54 @@ async def form_navigation(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(F.text.in_({LEAD_DRAFT, OFFER_DRAFT}))
 async def resume_form_from_menu(message: Message, state: FSMContext) -> None:
-    if not await resume_draft(message, state, "lead" if message.text == LEAD_DRAFT else "offer"):
-        await open_navigation(message, state)
+    if message.text == LEAD_DRAFT:
+        if not await resume_draft(message, state, "lead"):
+            await open_navigation(message, state)
+        return
+    await pause_form(message, state)
+    ids = await offer_draft_ids(state)
+    if len(ids) == 1:
+        await open_offer(message, state, ids[0], state.key.user_id)
+    else:
+        await offer_draft_menu(message, state)
+
+
+async def offer_draft_menu(message: Message, state: FSMContext, offset: int = 0) -> None:
+    ids = await offer_draft_ids(state)
+    if not ids:
+        await message.answer("Сохранённых черновиков откликов нет.")
+        return
+    rows = [[InlineKeyboardButton(text=f"Заявка №{lead_id}", callback_data=f"offer_draft:open:{lead_id}")]
+            for lead_id in ids[offset:offset + 10]]
+    nav = []
+    if offset:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"offer_draft:page:{offset - 10}"))
+    if offset + 10 < len(ids):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"offer_draft:page:{offset + 10}"))
+    await message.answer("Выберите черновик отклика.", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=rows + ([nav] if nav else []),
+    ))
+
+
+@router.callback_query(F.data.startswith("offer_draft:"))
+async def offer_draft_action(callback: CallbackQuery, state: FSMContext) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.id != callback.from_user.id:
+        await callback.answer("Недоступно.")
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not re.fullmatch(r"[0-9]{1,18}", parts[2]):
+        await callback.answer("Недоступно.")
+        return
+    action, number = parts[1], int(parts[2])
+    if action == "page" and number % 10 == 0:
+        await callback.answer()
+        await offer_draft_menu(message, state, number)
+    elif action == "open" and number in await offer_draft_ids(state):
+        await callback.answer()
+        await open_offer(message, state, number, callback.from_user.id)
+    else:
+        await callback.answer("Этот черновик недоступен.")
 
 
 async def show_offer_step(message: Message, state: FSMContext, step: State, **fields) -> None:
@@ -475,27 +527,23 @@ async def cancel(message: Message, state: FSMContext) -> None:
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
     lead_id = storage.parse_id(command.args, "lead_")
+    await open_offer(message, state, lead_id, message.from_user.id)
+
+
+async def open_offer(message: Message, state: FSMContext, lead_id: int | None, user_id: int) -> None:
     lead = await get_lead(lead_id) if lead_id else None
     if not lead or lead["status"] != "published":
         await message.answer("Ссылка на заявку устарела или заявка недоступна.")
         await open_navigation(message, state)
         return
-    if await storage.has_offer(lead_id, message.from_user.id):
+    if await storage.has_offer(lead_id, user_id):
         await message.answer(f"Вы уже откликнулись на заявку №{lead_id}.")
         return
     current = await state.get_state()
-    if form_kind(current) == "offer":
-        if (await state.get_data()).get("lead_id") == lead_id:
-            await restore_form_step(message, state, current)
-        else:
-            await message.answer("У вас открыт другой отклик. Продолжите его или отмените командой /cancel.")
-            await open_navigation(message, state)
+    if form_kind(current) == "offer" and (await state.get_data()).get("lead_id") == lead_id:
+        await restore_form_step(message, state, current)
         return
-    saved = draft_slot(state, "offer")
-    if await saved.get_state():
-        if (await saved.get_data()).get("lead_id") != lead_id:
-            await message.answer("У вас есть черновик другого отклика. Сначала завершите его или отмените командой /cancel.")
-        await resume_draft(message, state, "offer")
+    if await resume_draft(message, state, "offer", lead_id):
         return
     await pause_form(message, state)
     await message.answer(f"Отклик на заявку №{lead_id}.", reply_markup=ReplyKeyboardRemove())
@@ -596,13 +644,19 @@ async def my_offers(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
-            "SELECT lead_id, price, delivery_status FROM offers WHERE provider_id=? ORDER BY id DESC LIMIT 10",
+            "SELECT lead_id, price, comment, delivery_status FROM offers WHERE provider_id=? ORDER BY id DESC LIMIT 10",
             (message.from_user.id,),
         ) as cursor:
             offers = await cursor.fetchall()
     statuses = {"sent": "отправлен", "pending": "доставка ожидается", "unconfirmed": "доставка не подтверждена"}
-    lines = [f"Заявка №{lead_id} · {price} · {statuses.get(status, status)}" for lead_id, price, status in offers]
-    await message.answer("Ваши последние отклики:\n" + "\n".join(lines) if lines else "У вас пока нет откликов.")
+    if not offers:
+        await message.answer("У вас пока нет откликов.")
+        return
+    for lead_id, price, comment, status in offers:
+        await message.answer(
+            f"Отклик на заявку №{lead_id}\nСтоимость: {price}\nУсловия: {comment or 'не указаны'}"
+            f"\nСтатус: {statuses.get(status, status)}"
+        )
 
 
 @router.message(F.text == "📝 Оставить заявку")
@@ -1092,6 +1146,7 @@ def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatch
     dispatcher.include_router(provider_ui.router)
     dispatcher.include_router(support_ui.router)
     dispatcher.include_router(admin_ui.router)
+    support_ui.configure_delivery_worker(dispatcher)
     return dispatcher
 
 

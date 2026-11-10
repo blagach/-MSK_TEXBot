@@ -307,6 +307,69 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.state.get_state(), bot.LeadForm.region.state)
         self.assertEqual(await self.state.get_data(), before)
 
+    async def test_independent_offers_restore_legacy_and_survive_switch_and_restart(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            for lead_id in (11, 14):
+                await db.execute("INSERT INTO leads SELECT ?, customer_id, customer_name, equipment, place, "
+                                 "work_date, details, phone, status, created_at FROM leads WHERE id=1", (lead_id,))
+            await db.commit()
+        legacy = bot.draft_slot(self.state, "offer")
+        await self.state.storage.checkpoint(legacy.key, bot.OfferForm.comment, {"lead_id": 11, "price": "11000"})
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_14"))
+        self.assertEqual((await self.state.get_data())["lead_id"], 14)
+        self.message.text = "14000"
+        await bot.offer_price(self.message, self.state)
+        stale = self.step("skip", (await self.state.get_data())["form_keyboard_id"])
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_11"))
+        self.assertEqual((await self.state.get_data())["price"], "11000")
+        await bot.offer_step_action(stale, self.state, self.telegram)
+        stale.answer.assert_awaited_once_with("Этот шаг уже неактуален.")
+        await bot.show_main_menu(self.message, self.state)
+        self.state = self.reopen_sqlite_state()
+        self.message.text = bot.OFFER_DRAFT
+        await bot.resume_form_from_menu(self.message, self.state)
+        rows = self.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual([r[0].callback_data for r in rows], ["offer_draft:open:14", "offer_draft:open:11"])
+        other = self.reopen_sqlite_state(21)
+        self.assertEqual(await bot.offer_draft_ids(other), [])
+        callback = self.step("unused", 200)
+        callback.data = "offer_draft:open:11"
+        await bot.offer_draft_action(callback, self.state)
+        await bot.cancel_unsent_offer(self.message, 20, self.state)
+        self.assertEqual(await bot.offer_draft_ids(self.state), [14])
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_14"))
+        self.assertEqual((await self.state.get_data())["price"], "14000")
+        await self.click("skip")
+        self.message.text = "+79990000001"
+        await bot.offer_phone(self.message, self.state)
+        review = self.step("send", (await self.state.get_data())["form_keyboard_id"])
+        await bot.offer_step_action(review, self.state, self.telegram)
+        await bot.offer_step_action(review, self.state, self.telegram)
+        self.assertEqual(await self.saved_offers(), [("14000", "Без комментария", "+79990000001")])
+        await bot.my_offers(self.message, self.state)
+        card = self.message.answer.await_args.args[0]
+        for value in ("№14", "14000", "Без комментария", "отправлен"):
+            self.assertIn(value, card)
+
+    async def test_sent_offer_with_stale_draft_does_not_block_new_application(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            for lead_id in (11, 14):
+                await db.execute("INSERT INTO leads SELECT ?, customer_id, customer_name, equipment, place, "
+                                 "work_date, details, phone, status, created_at FROM leads WHERE id=1", (lead_id,))
+            await db.commit()
+        await storage.save_offer(11, 20, "Исполнитель", "", "11000", "", "+79990000001")
+        legacy = bot.draft_slot(self.state, "offer")
+        await self.state.storage.checkpoint(legacy.key, bot.OfferForm.comment, {"lead_id": 11, "price": "11000"})
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_14"))
+        self.assertEqual((await self.state.get_data())["lead_id"], 14)
+        await bot.start_offer(self.message, self.state, CommandObject(args="lead_11"))
+        self.assertEqual((await self.state.get_data())["lead_id"], 14)
+        self.assertEqual(await legacy.get_state(), bot.OfferForm.comment.state)
+
     async def test_skip_description_publish_and_open_offer_from_button(self):
         await bot.lead_start(self.message, self.state)
         await self.pick_lead_option(0)
@@ -379,7 +442,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.region.state)
         await bot.executor_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows()[3], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
-        self.assertEqual((await bot.draft_slot(self.state, "offer").get_data())["price"], "28000")
+        self.assertEqual((await bot.draft_slot(self.state, "offer_1").get_data())["price"], "28000")
         self.message.text = "🔕 Уведомления выключены"
         await bot.provider_ui.notifications(self.message, self.state)
         self.assertEqual(self.keyboard_rows()[3][0], "🔔 Уведомления включены")
@@ -450,7 +513,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.state.get_state())
         self.assertEqual(await self.state.get_data(), {})
         self.assertEqual(self.message.answer.await_args.kwargs["reply_markup"], bot.main_menu())
-        self.assertEqual(await bot.draft_slot(self.state, "offer").get_state(), bot.OfferForm.comment.state)
+        self.assertEqual(await bot.draft_slot(self.state, "offer_1").get_state(), bot.OfferForm.comment.state)
         self.assertEqual(await self.saved_offers(), [])
 
     async def test_phone_validation_and_own_contact(self):
