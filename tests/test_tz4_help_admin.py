@@ -259,6 +259,34 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await support_ui.deliver_reply(self.telegram, row["id"]))
         self.assertEqual(self.telegram.send_message.await_count, 4)
 
+    async def test_equipment_catalog_retires_old_panels_and_ignores_their_callbacks(self):
+        provider, state = self.actor(20)
+        provider.answer.side_effect = [Record(message_id=i) for i in range(200, 205)]
+        await provider_ui.machine_catalog(provider, state)
+
+        provider.message_id = 200
+        await provider_ui.machine_catalog_action(self.callback(provider, "machine_catalog:0"), state)
+        self.telegram.edit_message_reply_markup.assert_awaited_once_with(
+            chat_id=20, message_id=200, reply_markup=None,
+        )
+        stale = self.callback(provider, "machine_catalog:1")
+        await provider_ui.machine_catalog_action(stale, state)
+        stale.answer.assert_awaited_once_with("Этот шаг уже неактуален.")
+        self.assertEqual((await state.get_data())["machine_panel"], 201)
+
+        provider.message_id = 201
+        await provider_ui.machine_catalog_action(self.callback(provider, "machine_catalog:back"), state)
+        provider.message_id = 202
+        await provider_ui.machine_catalog_action(self.callback(provider, "machine_catalog:0"), state)
+        provider.message_id = 203
+        await provider_ui.machine_catalog_action(self.callback(provider, "machine_catalog:0"), state)
+
+        self.assertEqual(await state.get_state(), provider_ui.AddMachine.description.state)
+        self.assertEqual((await state.get_data())["category"], "мини-экскаватор")
+        self.assertIsNone((await state.get_data())["machine_panel"])
+        self.assertEqual([call.kwargs["message_id"] for call in
+                          self.telegram.edit_message_reply_markup.await_args_list], [200, 201, 202, 203])
+
     async def test_provider_payment_buttons_keep_draft_until_saved(self):
         provider, state = self.actor(20)
         await provider_registry.register_provider(20, "Тест", "+79990000000", True, db_path=self.database)

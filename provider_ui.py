@@ -166,10 +166,14 @@ async def show_payment_selection(message, state, selected, *, update=False):
 
 
 async def retire_payment_panel(message, state):
-    panel = (await state.get_data()).get("payment_panel")
+    await retire_inline_panel(message, state, "payment_panel")
+
+
+async def retire_inline_panel(message, state, key):
+    panel = (await state.get_data()).get(key)
     if panel is None:
         return
-    await state.update_data(payment_panel=None)
+    await state.update_data(**{key: None})
     try:
         await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=panel, reply_markup=None)
     except TelegramAPIError:
@@ -219,6 +223,7 @@ async def finish_payment_selection(message, state, user_id, methods):
 
 
 async def machine_catalog(message, state, group=None):
+    await retire_inline_panel(message, state, "machine_panel")
     if group is None:
         await state.set_state(AddMachine.category)
         labels = tuple(name for name, _ in equipment_catalog.GROUPS)
@@ -270,6 +275,7 @@ async def machine_catalog_action(callback: CallbackQuery, state: FSMContext):
 
 
 async def select_machine(message, state, category):
+    await retire_inline_panel(message, state, "machine_panel")
     await state.update_data(category=category)
     if (await state.get_data()).get("edit_field") == "category":
         await review_machine(message, state, (await state.get_data())["area"])
@@ -328,6 +334,7 @@ async def machine_area(message: Message, state: FSMContext):
 
 
 async def review_machine(message, state, area):
+    await retire_inline_panel(message, state, "machine_panel")
     data = await state.update_data(area=area)
     await state.set_state(AddMachine.review)
     sent = await message.answer(
@@ -371,6 +378,7 @@ async def machine_review(callback: CallbackQuery, state: FSMContext):
         except ValueError as exc:
             await callback.message.answer(str(exc))
             return
+        await retire_inline_panel(callback.message, state, "machine_panel")
         await state.clear()
         await callback.message.answer(f"Техника №{item_id} сохранена.",
                                       reply_markup=await executor_keyboard(callback.from_user.id, state))
@@ -429,6 +437,7 @@ async def machine_action(callback: CallbackQuery, state: FSMContext):
 
 
 async def machine_edit_fields(message, state):
+    await retire_inline_panel(message, state, "machine_panel")
     await state.set_state(AddMachine.review)
     sent = await message.answer("Выберите поле техники:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Вид техники", callback_data="machine_field:category"),
@@ -452,7 +461,7 @@ async def machine_edit_field(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Неизвестное поле.")
         return
     await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await retire_inline_panel(callback.message, state, "machine_panel")
     if field == "cancel":
         await state.clear()
         item = next((item for item in await registry.list_equipment(callback.from_user.id, storage.DB_PATH)
