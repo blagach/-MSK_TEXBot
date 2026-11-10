@@ -140,9 +140,33 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         admin, admin_state = self.actor(1)
         await self.help_action(admin, admin_state, f"reply:{ticket}")
         admin.text = "Откройте /menu."
+        admin.answer.reset_mock()
+        self.telegram.send_message.reset_mock()
+
+        async def telegram_accepts(chat_id, text, *, reply_markup):
+            self.assertEqual(chat_id, customer.from_user.id)
+            self.assertIn(f"Ответ поддержки по обращению №{ticket}", text)
+            self.assertIn(admin.text, text)
+            self.assertEqual(reply_markup.inline_keyboard[0][0].callback_data, f"help:ticket:{ticket}:0")
+            self.assertEqual((await support_storage.history(ticket))[0]["delivery_status"], "sending")
+            admin.answer.assert_not_awaited()
+            return Record(message_id=100)
+
+        self.telegram.send_message.side_effect = telegram_accepts
         await support_ui.reply_to_ticket(admin, admin_state, self.telegram, self.admins)
-        self.assertEqual(self.telegram.send_message.await_args.args[0], 20)
-        self.assertEqual((await support_storage.history(ticket))[0]["delivery_status"], "sent")
+        self.telegram.send_message.assert_awaited_once()
+        self.telegram.send_message.side_effect = None
+        self.assertEqual(admin.answer.await_args.args[0], "Ответ сохранён и отправлен.")
+        response = (await support_storage.history(ticket))[0]
+        self.assertEqual(response["delivery_status"], "sent")
+        async with aiosqlite.connect(self.database) as db:
+            async with db.execute(
+                "SELECT telegram_message_id FROM support_reply_deliveries WHERE message_id=?",
+                (response["id"],),
+            ) as cursor:
+                self.assertEqual(await cursor.fetchone(), (100,))
+        await self.help_action(admin, admin_state, f"ticket:{ticket}:0")
+        self.assertTrue(any(admin.text in call.args[0] for call in admin.answer.await_args_list))
         self.assertEqual((await support_storage.ticket(ticket))["status"], "in_progress")
         await self.help_action(admin, admin_state, f"status:{ticket}:closed")
         self.assertEqual((await support_storage.ticket(ticket))["status"], "closed")
@@ -163,19 +187,33 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await support_storage.queued_deliveries(), [])
         self.assertIsNone((await support_storage.history(ticket_id))[0]["delivery_status"])
         request = SendMessage(chat_id=20, text="x")
-        for error, expected, code in (
-            (TelegramForbiddenError(request, "Forbidden: bot was blocked by the user"), "failed", "bot_blocked"),
-            (TelegramNetworkError(request, "timeout"), "uncertain", "TelegramNetworkError"),
-            (support_ui.IsolationError("blocked by test guard"), "failed", "IsolationError"),
+        for error, expected, code, notice in (
+            (TelegramForbiddenError(request, "Forbidden: bot was blocked by the user"), "failed", "bot_blocked",
+             "Уведомление не отправлено."),
+            (TelegramNetworkError(request, "timeout"), "uncertain", "TelegramNetworkError",
+             "Отправка уведомления не подтверждена."),
+            (support_ui.IsolationError("blocked by test guard"), "failed", "IsolationError",
+             "Уведомление не отправлено."),
         ):
             self.telegram.send_message.side_effect = error
             admin, state = self.actor(1)
             await self.help_action(admin, state, f"reply:{ticket_id}")
-            admin.text = "New answer"
+            admin.text = f"Ответ для проверки {code}"
             await support_ui.reply_to_ticket(admin, state, self.telegram, self.admins)
-            self.assertNotEqual(admin.answer.await_args.args[0], "Ответ сохранён и отправлен.")
+            self.assertEqual(admin.answer.await_args.args[0], f"Ответ сохранён в истории. {notice}")
+            self.assertEqual(self.telegram.send_message.await_args.args[0], 20)
             row = (await support_storage.history(ticket_id))[0]
             self.assertEqual((row["delivery_status"], row["delivery_error"]), (expected, code))
+
+            await self.help_action(admin, state, f"ticket:{ticket_id}:0")
+            admin_history = [call.args[0] for call in admin.answer.await_args_list]
+            self.assertTrue(any(admin.text in item and code in item for item in admin_history))
+            customer, customer_state = self.actor(20)
+            await self.help_action(customer, customer_state, f"ticket:{ticket_id}:0")
+            self.assertIn(
+                f"№{ticket_id} · Поддержка\n{admin.text}",
+                [call.args[0] for call in customer.answer.await_args_list],
+            )
             self.assertIsNone(await support_ui.deliver_reply(self.telegram, row["id"]))
         self.assertEqual(self.telegram.send_message.await_count, 3)
 
