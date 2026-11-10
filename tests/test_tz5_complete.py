@@ -10,14 +10,19 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
 
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("ADMIN_IDS", "1")
 os.environ.setdefault("LEADS_CHANNEL_ID", "-100123")
 
 import bot
+import equipment_catalog
 import lead_journey
 import provider_registry
+import provider_ui
 import render_test_backup
 import storage
 import support_storage
@@ -46,6 +51,39 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
     async def publish(self, lead_id):
         self.assertTrue(await storage.transition(lead_id, "new", "publishing"))
         await storage.finish_publication(lead_id, -100123, lead_id)
+
+    async def test_both_roles_show_the_same_catalog_and_return_controls(self):
+        states = MemoryStorage()
+        buyer = FSMContext(states, StorageKey(bot_id=1, chat_id=12, user_id=12))
+        provider = FSMContext(states, StorageKey(bot_id=1, chat_id=21, user_id=21))
+
+        def actor(user_id):
+            return SimpleNamespace(chat=SimpleNamespace(id=user_id),
+                                   answer=AsyncMock(return_value=SimpleNamespace(message_id=101)),
+                                   bot=SimpleNamespace(edit_message_reply_markup=AsyncMock()))
+
+        customer_chat = actor(12)
+        provider_chat = actor(21)
+        await bot.show_lead_step(customer_chat, buyer, bot.LeadForm.equipment)
+        await provider_ui.machine_catalog(provider_chat, provider)
+
+        def keyboard(chat):
+            rows = chat.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            return [[button.text for button in row] for row in rows]
+
+        self.assertEqual(keyboard(customer_chat)[:-1], keyboard(provider_chat))
+        for index, (group, labels) in enumerate(equipment_catalog.GROUPS):
+            with self.subTest(group=group):
+                await bot.show_lead_step(customer_chat, buyer, bot.LeadForm.equipment_type,
+                                         equipment_group=index)
+                await provider_ui.machine_catalog(provider_chat, provider, index)
+                customer_rows = keyboard(customer_chat)
+                provider_rows = keyboard(provider_chat)
+                self.assertEqual(customer_rows[:-1], provider_rows[:-1])
+                self.assertEqual(len([button for row in provider_rows[:-1] for button in row]), len(labels))
+                self.assertTrue(all(1 <= len(row) <= 2 for row in provider_rows))
+                self.assertEqual(customer_rows[-1][0], "⬅️ К категориям")
+                self.assertEqual(provider_rows[-1], ["⬅️ К категориям"])
 
     async def test_approved_catalog_and_symmetric_matching(self):
         for kind in ("КДМ", "автогудронатор", "поливомоечная машина", "каток"):
