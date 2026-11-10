@@ -47,8 +47,15 @@ async def init_schema():
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL
         )""")
+        await db.execute("CREATE TABLE IF NOT EXISTS bot_visitors (telegram_id INTEGER PRIMARY KEY)")
         await db.commit()
     await lead_journey.init_schema(DB_PATH)
+
+
+async def record_visitor(telegram_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO bot_visitors VALUES (?) ON CONFLICT DO NOTHING", (telegram_id,))
+        await db.commit()
 
 
 async def transition(lead_id, expected, target):

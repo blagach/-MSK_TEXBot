@@ -23,6 +23,9 @@ os.environ.update(BOT_TOKEN="123456:TEST", ADMIN_IDS="1,2", LEADS_CHANNEL_ID="-1
 import admin_reports
 import admin_ui
 import bot
+import payment_preferences as payments
+import provider_registry
+import provider_ui
 import storage
 import support_storage
 import support_ui
@@ -192,6 +195,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
              "Уведомление не отправлено."),
             (TelegramNetworkError(request, "timeout"), "uncertain", "TelegramNetworkError",
              "Отправка уведомления не подтверждена."),
+            (TimeoutError(), "uncertain", "TimeoutError", "Отправка уведомления не подтверждена."),
             (support_ui.IsolationError("blocked by test guard"), "failed", "IsolationError",
              "Уведомление не отправлено."),
         ):
@@ -215,7 +219,36 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 [call.args[0] for call in customer.answer.await_args_list],
             )
             self.assertIsNone(await support_ui.deliver_reply(self.telegram, row["id"]))
-        self.assertEqual(self.telegram.send_message.await_count, 3)
+        self.assertEqual(self.telegram.send_message.await_count, 4)
+
+    async def test_provider_payment_buttons_keep_draft_until_saved(self):
+        provider, state = self.actor(20)
+        await provider_registry.register_provider(20, "Тест", "+79990000000", True, db_path=self.database)
+        await payments.save_provider(20, {payments.CASH}, self.database)
+        provider.message_id = 10
+        provider.answer.side_effect = [Record(message_id=i) for i in range(11, 18)]
+
+        async def current_methods():
+            async with aiosqlite.connect(self.database) as db:
+                async with db.execute("SELECT method FROM provider_payment_preferences WHERE provider_id=20") as cursor:
+                    return {row[0] for row in await cursor.fetchall()}
+
+        async def click(action, panel):
+            provider.message_id = panel
+            await provider_ui.payment_selection_callback(self.callback(provider, f"provider_payment:{action}"), state)
+
+        await provider_ui.edit_payment_methods(self.callback(provider, "provider_payment:edit"), state)
+        await click("pick:1", 11)
+        await click("pick:2", 11)  # An older screen must not change the selection.
+        self.assertEqual(set((await state.get_data())["payment_selection"]), {payments.CASH, payments.VAT})
+        self.assertEqual(await current_methods(), {payments.CASH})
+        await click("cancel", 12)
+        self.assertEqual(await current_methods(), {payments.CASH})
+
+        await provider_ui.edit_payment_methods(self.callback(provider, "provider_payment:edit"), state)
+        await click("pick:2", 14)
+        await click("save", 15)
+        self.assertEqual(await current_methods(), {payments.CASH, payments.NO_VAT})
 
     async def test_restart_requeues_only_unsent_and_claim_is_unique(self):
         ticket_id, _ = await support_storage.create_ticket(20, "help", "first", "Question", None)
@@ -273,6 +306,20 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         admin, _ = self.actor(1)
         await admin_ui.admin_action(self.callback(admin, "admin:export"), self.admins)
         self.assertTrue(admin.answer_document.await_args.args[0].filename.endswith(".xlsx"))
+
+    async def test_private_visitors_are_deduplicated_in_admin_and_excel(self):
+        visitor, _ = self.actor(99)
+        visitor.from_user.is_bot = False
+        group_member, _ = self.actor(100, chat_type="group")
+        group_member.from_user.is_bot = False
+        handler = AsyncMock()
+        for event in (visitor, visitor, group_member):
+            await bot.track_private_visitor(handler, event, {})
+
+        self.assertEqual(dict(await admin_reports.user_totals()),
+                         {"total": 1, "customers": 0, "providers": 0, "both": 0})
+        people = load_workbook(BytesIO(await admin_reports.export_xlsx()))["Пользователи"]
+        self.assertEqual([row[0] for row in people.iter_rows(min_row=2, values_only=True)], ["99"])
 
     async def test_report_counts_and_excel_use_existing_records(self):
         stamp = "2026-11-09T10:00:00+00:00"

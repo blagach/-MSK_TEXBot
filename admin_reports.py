@@ -25,6 +25,7 @@ WITH customers AS (
     SELECT id FROM registrations UNION SELECT provider_id FROM offers
 ), users AS (
     SELECT id FROM customers UNION SELECT id FROM performers UNION SELECT requester_id FROM support_tickets
+    UNION SELECT telegram_id FROM bot_visitors
 )
 """
 EQUIPMENT = """

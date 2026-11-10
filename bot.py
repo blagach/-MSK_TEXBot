@@ -1537,11 +1537,24 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
             logging.warning("Cannot update moderation message for lead %s", lead_id)
 
 
+async def track_private_visitor(handler, event, data):
+    message = event.message if isinstance(event, CallbackQuery) else event
+    user = event.from_user
+    if isinstance(message, Message) and message.chat.type == "private" and user and not user.is_bot:
+        try:
+            await storage.record_visitor(user.id)
+        except aiosqlite.Error:
+            logging.warning("Could not record private bot visit")
+    return await handler(event, data)
+
+
 def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatcher:
     dispatcher = Dispatcher(
         storage=fsm_storage or MemoryStorage(), events_isolation=SimpleEventIsolation(),
         support_admin_ids=settings.admin_ids, support_group_id=settings.support_group_id,
     )
+    dispatcher.message.outer_middleware(track_private_visitor)
+    dispatcher.callback_query.outer_middleware(track_private_visitor)
     dispatcher.include_router(router)
     dispatcher.include_router(provider_ui.router)
     dispatcher.include_router(support_ui.router)

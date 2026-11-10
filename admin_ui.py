@@ -51,6 +51,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids):
             f"Всего известных пользователей · {data['total']}\n"
             f"Заказчики · {data['customers']}\nИсполнители · {data['providers']}\n"
             f"Две роли · {data['both']}\n\n"
+            "Общий итог включает зафиксированные посещения. Старые посещения без действий могли не сохраниться.\n"
             "Заказчики учитываются по заявкам, исполнители по регистрации или отклику.",
             reply_markup=keyboard(HOME),
         )

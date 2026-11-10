@@ -456,7 +456,8 @@ async def deliver_reply(bot, reply_id):
     except (IsolationError, TelegramBadRequest, TelegramForbiddenError, TelegramNotFound, TelegramRetryAfter) as error:
         status = "failed"
         await store.finish_delivery(reply_id, status, error_code=delivery_error_code(error))
-    except TelegramAPIError as error:
+    except (TelegramAPIError, TimeoutError) as error:
+        # Telegram may have accepted a request whose response never reached us.
         status = "uncertain"
         await store.finish_delivery(reply_id, status, error_code=delivery_error_code(error))
     else:

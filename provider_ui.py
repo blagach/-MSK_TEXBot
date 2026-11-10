@@ -24,6 +24,7 @@ REGISTER_PROVIDER = "🚜 Зарегистрироваться как испол
 LEGACY_PROVIDER = "🛠 Обновить быструю регистрацию"
 MY_TECH = "🚜 Моя техника"
 PAYMENT_METHOD = "💳 Способ оплаты"
+PAYMENT_OPTIONS = (payments.CASH, payments.VAT, payments.NO_VAT)
 NOTIFICATIONS_ON = "🔔 Уведомления включены"
 NOTIFICATIONS_OFF = "🔕 Уведомления выключены"
 NOTIFICATION_ACTIONS = {
@@ -127,8 +128,56 @@ async def phone(message: Message, state: FSMContext):
     except ValueError as exc:
         await message.answer(str(exc))
         return
+    await start_payment_selection(message, state, message.from_user.id)
+
+
+async def start_payment_selection(message, state, user_id):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute("SELECT method FROM provider_payment_preferences WHERE provider_id=?", (user_id,)) as cursor:
+            selected = {row[0] for row in await cursor.fetchall()}
     await state.set_state(Register.payment)
-    await message.answer("Какие формы оплаты принимаете? Укажите один или несколько вариантов через запятую:\n" + "\n".join(sorted(payments.METHODS)))
+    await show_payment_selection(message, state, selected)
+
+
+async def show_payment_selection(message, state, selected):
+    rows = [
+        [InlineKeyboardButton(text=f"{'✅' if method in selected else '⬜'} {method}",
+                              callback_data=f"provider_payment:pick:{index}")]
+        for index, method in enumerate(PAYMENT_OPTIONS)
+    ]
+    rows.append([InlineKeyboardButton(text="Сохранить", callback_data="provider_payment:save"),
+                 InlineKeyboardButton(text="Отмена", callback_data="provider_payment:cancel")])
+    sent = await message.answer(
+        "Выберите один или несколько способов оплаты и нажмите «Сохранить». "
+        "Также можно перечислить варианты через запятую.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await state.update_data(payment_selection=sorted(selected), payment_panel=sent.message_id)
+
+
+@router.callback_query(F.data.startswith("provider_payment:pick:") | F.data.in_({
+    "provider_payment:save", "provider_payment:cancel",
+}))
+async def payment_selection_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if (await state.get_state() != Register.payment.state or not isinstance(callback.message, Message)
+            or callback.message.message_id != data.get("payment_panel")):
+        await callback.answer("Этот экран устарел. Откройте способы оплаты снова.")
+        return
+    action = callback.data.rsplit(":", 1)[-1]
+    selected = set(data["payment_selection"])
+    if action == "save" and not selected:
+        await callback.answer("Выберите хотя бы один способ оплаты.", show_alert=True)
+        return
+    await callback.answer()
+    if action == "save":
+        await finish_payment_selection(callback.message, state, callback.from_user.id, selected)
+    elif action == "cancel":
+        await state.clear()
+        await callback.message.answer("Способы оплаты оставлены без изменений.",
+                                      reply_markup=await executor_keyboard(callback.from_user.id, state))
+    elif action in {"0", "1", "2"}:
+        await show_payment_selection(callback.message, state, selected ^ {PAYMENT_OPTIONS[int(action)]})
 
 
 @router.message(Register.payment)
@@ -137,10 +186,13 @@ async def provider_payment(message: Message, state: FSMContext):
     if not methods or not methods <= payments.METHODS:
         await message.answer("Укажите формы оплаты точно из списка, через запятую.")
         return
-    await payments.init_schema(storage.DB_PATH)
-    await payments.save_provider(message.from_user.id, methods, storage.DB_PATH)
+    await finish_payment_selection(message, state, message.from_user.id, methods)
+
+
+async def finish_payment_selection(message, state, user_id, methods):
+    await payments.save_provider(user_id, methods, storage.DB_PATH)
     await state.clear()
-    await message.answer("Профиль и формы оплаты сохранены. Добавьте технику через меню.", reply_markup=await executor_keyboard(message.from_user.id, state))
+    await message.answer("Способы оплаты сохранены.", reply_markup=await executor_keyboard(user_id, state))
 
 
 async def machine_catalog(message, state, group=None):
@@ -481,9 +533,7 @@ async def edit_payment_methods(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Профиль недоступен.")
         return
     await callback.answer()
-    await state.set_state(Register.payment)
-    await callback.message.answer("Укажите один или несколько способов через запятую:\n"
-                                  + "\n".join(sorted(payments.METHODS)))
+    await start_payment_selection(callback.message, state, callback.from_user.id)
 
 
 async def resume_provider_step(message, state, current):
@@ -497,6 +547,11 @@ async def resume_provider_step(message, state, current):
             await review_machine(message, state, data["area"])
     elif current == AddMachine.region.state:
         await ask_machine_region(message, state)
+    elif current == Register.payment.state:
+        if "payment_selection" in data:
+            await show_payment_selection(message, state, set(data["payment_selection"]))
+        else:
+            await start_payment_selection(message, state, state.key.user_id)
     else:
         prompts = {
             AddMachine.area.state: "Укажите район или введите «весь регион».",
@@ -504,7 +559,5 @@ async def resume_provider_step(message, state, current):
             Register.consent.state: "Сохраняем контакт и сведения о технике для подбора заявок. Согласны? Ответьте «Да».",
             Register.name.state: "Укажите имя или название компании.",
             Register.phone.state: "Укажите телефон в формате +7XXXXXXXXXX или 8XXXXXXXXXX.",
-            Register.payment.state: "Перечислите принимаемые формы оплаты через запятую:\n"
-                                    + "\n".join(sorted(payments.METHODS)),
         }
         await message.answer(prompts[current], reply_markup=section_keyboard((HOME,)))
