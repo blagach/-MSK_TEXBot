@@ -15,9 +15,9 @@ from provider_registry import _validate_phone
 
 USERS = """
 WITH customers AS (
-    SELECT customer_id AS id, MIN(created_at) AS first_seen FROM leads GROUP BY customer_id
+    SELECT customer_id AS id, MIN(report_utc(created_at)) AS first_seen FROM leads GROUP BY customer_id
 ), registrations AS (
-    SELECT id, MIN(registered_at) AS first_seen FROM (
+    SELECT id, MIN(report_utc(registered_at)) AS first_seen FROM (
         SELECT telegram_id AS id, consent_at AS registered_at FROM provider_profiles
         UNION ALL SELECT telegram_id, created_at FROM providers
     ) GROUP BY id
@@ -54,6 +54,7 @@ async def read_db():
     async with aiosqlite.connect(uri, uri=True) as db:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA query_only=ON")
+        await db.create_function("report_utc", 1, utc_report_timestamp, deterministic=True)
         await db.execute("BEGIN")
         yield db
 
@@ -95,7 +96,6 @@ async def registration_stats(at=None):
     boundaries, current = registration_periods(at)
     async with read_db() as db:
         # SQLite julianday rounds sub-millisecond values at period boundaries.
-        await db.create_function("report_utc", 1, utc_report_timestamp, deterministic=True)
         result = []
         for start in boundaries:
             result.append((await rows(db, """
@@ -182,18 +182,22 @@ def append_text_safe(sheet, values):
 
 async def export_xlsx():
     async with read_db() as db:
+        await db.create_function("report_phone", 1, normalized_phone, deterministic=True)
+        await db.create_function("report_username", 1, profile_name, deterministic=True)
         users = await rows(db, USERS + """
-            SELECT u.id, COALESCE(profile.display_name, legacy.name,
-                   (SELECT customer_name FROM leads WHERE customer_id=u.id AND customer_name IS NOT NULL ORDER BY id DESC LIMIT 1),
-                   (SELECT provider_name FROM offers WHERE provider_id=u.id ORDER BY id DESC LIMIT 1), '') AS display_name,
-                   COALESCE(profile.phone, legacy.phone,
-                            (SELECT l.phone FROM leads l WHERE l.customer_id=u.id ORDER BY l.id DESC LIMIT 1),
-                            (SELECT o.phone FROM offers o WHERE o.provider_id=u.id ORDER BY o.id DESC LIMIT 1)) AS phone,
-                   COALESCE((SELECT NULLIF(d.customer_username, '') FROM lead_work_details d JOIN leads l
-                             ON l.id=d.lead_id WHERE l.customer_id=u.id AND d.customer_username IS NOT NULL
+            SELECT u.id, COALESCE(NULLIF(TRIM(profile.display_name), ''), NULLIF(TRIM(legacy.name), ''),
+                   (SELECT customer_name FROM leads WHERE customer_id=u.id AND TRIM(customer_name)!='' ORDER BY id DESC LIMIT 1),
+                   (SELECT provider_name FROM offers WHERE provider_id=u.id AND TRIM(provider_name)!='' ORDER BY id DESC LIMIT 1)) AS display_name,
+                   COALESCE(report_phone(profile.phone), report_phone(legacy.phone),
+                            (SELECT report_phone(l.phone) FROM leads l WHERE l.customer_id=u.id
+                             AND report_phone(l.phone) IS NOT NULL ORDER BY l.id DESC LIMIT 1),
+                            (SELECT report_phone(o.phone) FROM offers o WHERE o.provider_id=u.id
+                             AND report_phone(o.phone) IS NOT NULL ORDER BY o.id DESC LIMIT 1)) AS phone,
+                   COALESCE((SELECT report_username(d.customer_username) FROM lead_work_details d JOIN leads l
+                             ON l.id=d.lead_id WHERE l.customer_id=u.id AND report_username(d.customer_username) IS NOT NULL
                              ORDER BY l.id DESC LIMIT 1),
-                            (SELECT NULLIF(o.username, '') FROM offers o WHERE o.provider_id=u.id
-                             AND o.username!='' ORDER BY o.id DESC LIMIT 1)) AS username,
+                            (SELECT report_username(o.username) FROM offers o WHERE o.provider_id=u.id
+                             AND report_username(o.username) IS NOT NULL ORDER BY o.id DESC LIMIT 1)) AS username,
                    c.first_seen AS customer_since, r.first_seen AS registered_at,
                    c.id IS NOT NULL AS customer, p.id IS NOT NULL AS performer
             FROM users u LEFT JOIN customers c ON c.id=u.id LEFT JOIN performers p ON p.id=u.id
@@ -277,7 +281,9 @@ def moscow_time(value):
         stamp = datetime.fromisoformat(value)
     except ValueError:
         return value
-    return stamp.astimezone(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds") if stamp.tzinfo else value
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds")
 
 
 def normalized_phone(value):

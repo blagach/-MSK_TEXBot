@@ -418,6 +418,37 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             {"providers": 3, "customers": 3, "created": 4, "published": 3, "offers": 3},
         ])
 
+    async def test_excel_prefers_available_contact_data_and_sorts_first_seen_by_time(self):
+        earlier = "2026-11-10T01:00:00+03:00"
+        later = "2026-11-09 23:00:00"
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute(
+                "INSERT INTO providers VALUES (20,'Перевозчик','трал','Москва','89991234567',?)",
+                (earlier,),
+            )
+            await db.execute(
+                """INSERT INTO provider_profiles(telegram_id,display_name,phone,consent_at,updated_at)
+                   VALUES (20,' ','?',?,?)""", (later, later),
+            )
+            await db.executemany(
+                """INSERT INTO leads(customer_id,equipment,place,work_date,details,phone,status,created_at)
+                   VALUES (20,'трал','Москва','завтра','','','published',?)""",
+                [(earlier,), (later,)],
+            )
+            await db.executemany(
+                "INSERT INTO lead_work_details(lead_id,customer_username) VALUES (?,?)",
+                [(1, "Actual_handle"), (2, "bad/name")],
+            )
+            await db.commit()
+        users = load_workbook(BytesIO(await admin_reports.export_xlsx()))["Пользователи"]
+        headers, row = list(users.values)
+        user = dict(zip(headers, row))
+        self.assertEqual(user["Имя или компания"], "Перевозчик")
+        self.assertEqual(user["Телефон"], "+79991234567")
+        self.assertEqual(user["Профиль"], "https://t.me/Actual_handle")
+        self.assertEqual(user["Первая заявка"], earlier)
+        self.assertEqual(user["Регистрация исполнителя"], earlier)
+
     async def test_equipment_panel_counts_registered_providers_and_units_without_cards(self):
         admin, _ = self.actor(1)
         await admin_ui.admin_action(self.callback(admin, "admin:equipment:0"), self.admins)
