@@ -1,6 +1,6 @@
 """Read-only operations and export for the administrator panel."""
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -73,19 +73,47 @@ def registration_periods(at=None):
     return (day, day - timedelta(days=day.weekday()), day.replace(day=1)), current
 
 
+def utc_report_timestamp(value):
+    if not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    except (ValueError, OverflowError):
+        return None
+
+
 async def registration_stats(at=None):
     boundaries, current = registration_periods(at)
     async with read_db() as db:
+        # SQLite julianday rounds sub-millisecond values at period boundaries.
+        await db.create_function("report_utc", 1, utc_report_timestamp, deterministic=True)
         result = []
         for start in boundaries:
-            result.append((await rows(db, USERS + """
-                SELECT (SELECT COUNT(*) FROM registrations WHERE julianday(first_seen) BETWEEN julianday(?) AND julianday(?)) AS providers,
-                       (SELECT COUNT(*) FROM customers WHERE julianday(first_seen) BETWEEN julianday(?) AND julianday(?)) AS customers,
-                       (SELECT COUNT(*) FROM leads WHERE julianday(created_at) BETWEEN julianday(?) AND julianday(?)) AS created,
-                       (SELECT COUNT(*) FROM lead_lifecycle_events WHERE action='published'
-                            AND julianday(created_at) BETWEEN julianday(?) AND julianday(?)) AS published,
-                       (SELECT COUNT(*) FROM offers WHERE julianday(created_at) BETWEEN julianday(?) AND julianday(?)) AS offers
-            """, (start.isoformat(), current.isoformat()) * 5))[0])
+            result.append((await rows(db, """
+                WITH period(start_at, end_at) AS (VALUES (report_utc(?), report_utc(?))),
+                created AS (
+                    SELECT customer_id, report_utc(created_at) AS at FROM leads
+                ),
+                first_requests AS (
+                    SELECT MIN(at) AS at FROM created GROUP BY customer_id
+                ),
+                registrations AS (
+                    SELECT MIN(report_utc(registered_at)) AS at FROM (
+                        SELECT telegram_id, consent_at AS registered_at FROM provider_profiles
+                        UNION ALL SELECT telegram_id, created_at FROM providers
+                    ) GROUP BY telegram_id
+                )
+                SELECT (SELECT COUNT(*) FROM registrations WHERE at BETWEEN start_at AND end_at) AS providers,
+                       (SELECT COUNT(*) FROM first_requests WHERE at BETWEEN start_at AND end_at) AS customers,
+                       (SELECT COUNT(*) FROM created WHERE at BETWEEN start_at AND end_at) AS created,
+                       (SELECT COUNT(DISTINCT lead_id) FROM lead_lifecycle_events WHERE action='published'
+                            AND report_utc(created_at) BETWEEN start_at AND end_at) AS published,
+                       (SELECT COUNT(*) FROM offers WHERE report_utc(created_at) BETWEEN start_at AND end_at) AS offers
+                FROM period
+            """, (start.isoformat(), current.isoformat())))[0])
         return result
 
 

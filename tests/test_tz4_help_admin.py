@@ -336,6 +336,50 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         people = load_workbook(BytesIO(await admin_reports.export_xlsx()))["Пользователи"]
         self.assertEqual([row[0] for row in people.iter_rows(min_row=2, values_only=True)], ["99"])
 
+    async def test_stats_separate_events_at_moscow_calendar_boundaries(self):
+        before_month = "2026-10-31T23:59:59.999999+03:00"
+        month = "2026-11-01T00:00:00+03:00"
+        week = "2026-11-08T21:00:00+00:00"
+        before_day = "2026-11-09T20:59:59.999999+00:00"
+        day = "2026-11-10T00:00:00+03:00"
+        future = "2026-11-09T21:00:00.000200+00:00"
+
+        async with aiosqlite.connect(self.database) as db:
+            await db.executemany(
+                """INSERT INTO leads(customer_id,equipment,place,work_date,details,phone,status,created_at)
+                   VALUES (?,'кран','Москва','завтра','','+79991234567','published',?)""",
+                [(10, before_month), (20, month), (30, week), (30, before_day), (40, day), (50, future)],
+            )
+            await db.executemany(
+                "INSERT INTO providers VALUES (?,'Тест','трал','Москва','+79991234567',?)",
+                [(1, before_month), (2, month), (3, week)],
+            )
+            await db.executemany(
+                """INSERT INTO provider_profiles(telegram_id,display_name,phone,consent_at,updated_at)
+                   VALUES (?,'Тест','+79991234567',?,?)""",
+                [(user, stamp, stamp) for user, stamp in [(1, day), (4, day), (5, future)]],
+            )
+            events = [(1, month), (2, week), (4, day), (5, future)]
+            await db.executemany(
+                "INSERT INTO lead_lifecycle_events(lead_id,action,created_at) VALUES (?,'published',?)",
+                events,
+            )
+            await db.executemany(
+                """INSERT INTO offers(lead_id,provider_id,provider_name,username,price,comment,phone,created_at)
+                   VALUES (?,7,'Тест','','5000','','+79991234567',?)""",
+                events,
+            )
+            await db.commit()
+
+        with self.assertRaises(ValueError):
+            await storage.finish_publication(4, 1, 1)
+        at = datetime(2026, 11, 9, 21, 0, 0, 100, tzinfo=timezone.utc)
+        self.assertEqual([dict(row) for row in await admin_reports.registration_stats(at)], [
+            {"providers": 1, "customers": 1, "created": 1, "published": 1, "offers": 1},
+            {"providers": 2, "customers": 2, "created": 3, "published": 2, "offers": 2},
+            {"providers": 3, "customers": 3, "created": 4, "published": 3, "offers": 3},
+        ])
+
     async def test_report_counts_and_excel_use_existing_records(self):
         stamp = "2026-11-09T10:00:00+00:00"
         async with aiosqlite.connect(self.database) as db:
