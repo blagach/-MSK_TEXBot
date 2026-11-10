@@ -3,17 +3,20 @@ from aiogram import F, Router
 import aiosqlite
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, CallbackQuery, Message, ReplyKeyboardMarkup
 
 from draft_storage import offer_draft_ids
 
 import provider_registry as registry
 import payment_preferences as payments
 import storage
+import equipment_catalog
 
 router = Router()
+router.message.filter(F.chat.type == "private")
+router.callback_query.filter(F.message.chat.type == "private")
 
-AVAILABLE_LEADS = "🔎 Смотреть заявки"
+AVAILABLE_LEADS = "🔎 Подходящие заявки"
 MY_OFFERS = "📋 Мои отклики"
 OFFER_DRAFT = "▶️ Продолжить отклик"
 HOME = "🏠 Главное меню"
@@ -74,6 +77,8 @@ class Register(StatesGroup):
 
 class AddMachine(StatesGroup):
     category = State()
+    equipment_type = State()
+    review = State()
     description = State()
     region = State()
     area = State()
@@ -138,21 +143,74 @@ async def provider_payment(message: Message, state: FSMContext):
     await message.answer("Профиль и формы оплаты сохранены. Добавьте технику через меню.", reply_markup=await executor_keyboard(message.from_user.id, state))
 
 
+async def machine_catalog(message, state, group=None):
+    if group is None:
+        await state.set_state(AddMachine.category)
+        labels = tuple(name for name, _ in equipment_catalog.GROUPS)
+    else:
+        await state.set_state(AddMachine.equipment_type)
+        labels = equipment_catalog.GROUPS[group][1]
+    rows = equipment_catalog.button_rows(
+        labels, lambda index, label: InlineKeyboardButton(text=label, callback_data=f"machine_catalog:{index}"),
+    )
+    if group is not None:
+        rows.append([InlineKeyboardButton(text="⬅️ К категориям", callback_data="machine_catalog:back")])
+    sent = await message.answer("Выберите категорию техники:" if group is None else "Выберите вид техники:",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await state.update_data(machine_group=group, machine_panel=sent.message_id)
+
+
 @router.message(F.text == "➕ Добавить технику")
 async def begin_machine(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(AddMachine.category)
-    await message.answer("Выберите категорию техники:\n" + "\n".join(sorted(registry.CATEGORIES)))
+    await machine_catalog(message, state)
 
 
-@router.message(AddMachine.category)
+@router.callback_query(F.data.startswith("machine_catalog:"))
+async def machine_catalog_action(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    step = await state.get_state()
+    if not isinstance(callback.message, Message) or callback.message.message_id != data.get("machine_panel") or step not in (
+        AddMachine.category.state, AddMachine.equipment_type.state,
+    ):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    action = callback.data.partition(":")[2]
+    if action == "back" and step == AddMachine.equipment_type.state:
+        await callback.answer()
+        await machine_catalog(callback.message, state)
+        return
+    if not action.isascii() or not action.isdecimal() or len(action) > 2:
+        await callback.answer("Неизвестный вид.")
+        return
+    index = int(action)
+    await callback.answer()
+    if step == AddMachine.category.state:
+        if index < len(equipment_catalog.GROUPS):
+            await machine_catalog(callback.message, state, index)
+        return
+    kinds = equipment_catalog.GROUPS[data["machine_group"]][1]
+    if index < len(kinds):
+        await select_machine(callback.message, state, kinds[index])
+
+
+async def select_machine(message, state, category):
+    await state.update_data(category=category)
+    if (await state.get_data()).get("edit_field") == "category":
+        await review_machine(message, state, (await state.get_data())["area"])
+        return
+    await state.set_state(AddMachine.description)
+    prompt = ("Укажите название и характеристики техники." if category == equipment_catalog.OTHER
+              else "Опишите машину: марка, модель, грузоподъёмность или характеристики.")
+    await message.answer(prompt)
+
+
+@router.message(AddMachine.category, F.text)
 async def machine_category(message: Message, state: FSMContext):
     if message.text not in registry.CATEGORIES:
-        await message.answer("Выберите категорию точно из списка.")
+        await message.answer("Выберите категорию кнопкой или откройте /menu.")
         return
-    await state.update_data(category=message.text)
-    await state.set_state(AddMachine.description)
-    await message.answer("Опишите машину: марка, модель, грузоподъёмность или характеристики.")
+    await select_machine(message, state, message.text)
 
 
 @router.message(AddMachine.description)
@@ -160,7 +218,14 @@ async def machine_description(message: Message, state: FSMContext):
     if not message.text or not 1 <= len(message.text.strip()) <= 200:
         await message.answer("Описание должно содержать от 1 до 200 символов.")
         return
-    await state.update_data(description=message.text.strip())
+    data = await state.update_data(description=message.text.strip())
+    if data.get("edit_field") == "description":
+        await review_machine(message, state, data["area"])
+        return
+    await ask_machine_region(message, state)
+
+
+async def ask_machine_region(message, state):
     await state.set_state(AddMachine.region)
     await message.answer("Выберите зону работы: Москва, Московская область или Москва и Московская область.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Москва"), KeyboardButton(text="Московская область")], [KeyboardButton(text="Москва и Московская область")]], resize_keyboard=True))
 
@@ -173,44 +238,165 @@ async def machine_region(message: Message, state: FSMContext):
     await state.update_data(region=message.text)
     await state.set_state(AddMachine.area)
     if message.text == registry.BOTH_REGIONS:
-        await state.update_data(area="весь регион")
-        data = await state.get_data()
-        try:
-            item_id = await registry.add_equipment(message.from_user.id, data["category"], data["description"], data["region"], "весь регион", db_path=storage.DB_PATH)
-        except ValueError as exc:
-            await message.answer(str(exc))
-            return
-        await state.clear()
-        await message.answer(f"Техника №{item_id} добавлена: выезд по Москве и всей Московской области.", reply_markup=await executor_keyboard(message.from_user.id, state))
+        await review_machine(message, state, "весь регион")
         return
     await message.answer("Укажите район (например, СЗАО или Химки) либо выберите «весь регион».", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="весь регион")]], resize_keyboard=True))
 
 
 @router.message(AddMachine.area)
 async def machine_area(message: Message, state: FSMContext):
-    data = await state.get_data()
-    try:
-        item_id = await registry.add_equipment(
-            message.from_user.id, data["category"], data["description"],
-            data["region"], message.text, db_path=storage.DB_PATH,
-        )
-    except ValueError as exc:
-        await message.answer(str(exc))
+    area = (message.text or "").strip()
+    if not 1 <= len(area) <= 120:
+        await message.answer("Укажите район или «весь регион».")
         return
-    await state.clear()
-    await message.answer(f"Техника №{item_id} добавлена.", reply_markup=await executor_keyboard(message.from_user.id, state))
+    await review_machine(message, state, area)
+
+
+async def review_machine(message, state, area):
+    data = await state.update_data(area=area)
+    await state.set_state(AddMachine.review)
+    sent = await message.answer(
+        f"Проверьте карточку техники:\n{data['category']} · {data['description']}\n{data['region']}, {area}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Сохранить", callback_data="machine_review:save"),
+            InlineKeyboardButton(text="✏️ Изменить данные", callback_data="machine_review:edit"),
+        ]]),
+    )
+    await state.update_data(machine_panel=sent.message_id, machine_choosing_field=False)
+
+
+@router.callback_query(F.data.startswith("machine_review:"))
+async def machine_review(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if await state.get_state() != AddMachine.review.state or not isinstance(callback.message, Message) or (
+        callback.message.message_id != data.get("machine_panel")
+    ):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    await callback.answer()
+    action = callback.data.partition(":")[2]
+    if action == "edit":
+        await machine_edit_fields(callback.message, state)
+    elif action == "save":
+        try:
+            if data.get("edit_machine"):
+                if not await registry.update_equipment(
+                    callback.from_user.id, data["edit_machine"], category=data["category"],
+                    description=data["description"], region=data["region"], area=data["area"],
+                    active=data["machine_active"], db_path=storage.DB_PATH,
+                ):
+                    await callback.message.answer("Карточка недоступна.")
+                    return
+                item_id = data["edit_machine"]
+            else:
+                item_id = await registry.add_equipment(
+                    callback.from_user.id, data["category"], data["description"], data["region"],
+                    data["area"], db_path=storage.DB_PATH,
+                )
+        except ValueError as exc:
+            await callback.message.answer(str(exc))
+            return
+        await state.clear()
+        await callback.message.answer(f"Техника №{item_id} сохранена.",
+                                      reply_markup=await executor_keyboard(callback.from_user.id, state))
 
 
 @router.message(F.text.in_({MY_TECH, "📋 Моя техника"}))
 async def my_machines(message: Message, state: FSMContext):
     items = await registry.list_equipment(message.from_user.id, storage.DB_PATH)
-    if not items:
-        await message.answer("Техника пока не добавлена.", reply_markup=await executor_keyboard(message.from_user.id, state))
+    for item in items:
+        await show_machine(message, item)
+    await message.answer("Ваша техника" if items else "Техника пока не добавлена.",
+                         reply_markup=await executor_keyboard(message.from_user.id, state))
+
+
+async def show_machine(message, item):
+    active = item["active"]
+    await message.answer(
+        f"Техника №{item['id']} · {item['category']}\n{item['description']}\n"
+        f"{item['region']}, {item['area']}\n{'✅ Активна' if active else '⏸ Приостановлена'}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"machine:edit:{item['id']}"),
+            InlineKeyboardButton(text="⏸ Приостановить" if active else "▶️ Активировать",
+                                 callback_data=f"machine:{'pause' if active else 'activate'}:{item['id']}"),
+        ]]),
+    )
+
+
+@router.callback_query(F.data.startswith("machine:"))
+async def machine_action(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not isinstance(callback.message, Message):
+        await callback.answer("Карточка недоступна.")
         return
-    lines = [f"№{item['id']}: {item['category']} — {item['description']}; "
-             f"{item['region']}, {item['area']}; "
-             f"{'активна' if item['active'] else 'неактивна'}" for item in items]
-    await message.answer("\n".join(lines), reply_markup=await executor_keyboard(message.from_user.id, state))
+    item = next((item for item in await registry.list_equipment(callback.from_user.id, storage.DB_PATH)
+                 if str(item["id"]) == parts[2]), None)
+    if not item or await state.get_state():
+        await callback.answer("Завершите текущее действие или откройте главное меню.", show_alert=True)
+        return
+    action = parts[1]
+    await callback.answer()
+    if action == "edit":
+        await state.update_data(edit_machine=item["id"], machine_active=item["active"],
+                                **{field: item[field] for field in ("category", "description", "region", "area")})
+        await machine_edit_fields(callback.message, state)
+    elif action in {"pause", "activate"}:
+        active = action == "activate"
+        if active == item["active"]:
+            return
+        changed = await registry.update_equipment(
+            callback.from_user.id, item["id"], category=item["category"], description=item["description"],
+            region=item["region"], area=item["area"], active=active, db_path=storage.DB_PATH,
+        )
+        if changed:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await show_machine(callback.message, {**item, "active": active})
+
+
+async def machine_edit_fields(message, state):
+    await state.set_state(AddMachine.review)
+    sent = await message.answer("Выберите поле техники:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Вид техники", callback_data="machine_field:category"),
+         InlineKeyboardButton(text="Описание", callback_data="machine_field:description")],
+        [InlineKeyboardButton(text="Зона работы", callback_data="machine_field:region"),
+         InlineKeyboardButton(text="Отмена", callback_data="machine_field:cancel")],
+    ]))
+    await state.update_data(machine_panel=sent.message_id, machine_choosing_field=True)
+
+
+@router.callback_query(F.data.startswith("machine_field:"))
+async def machine_edit_field(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not isinstance(callback.message, Message) or callback.message.message_id != data.get("machine_panel") or (
+        await state.get_state() != AddMachine.review.state
+    ):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    field = callback.data.partition(":")[2]
+    if field not in {"category", "description", "region", "cancel"}:
+        await callback.answer("Неизвестное поле.")
+        return
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    if field == "cancel":
+        await state.clear()
+        item = next((item for item in await registry.list_equipment(callback.from_user.id, storage.DB_PATH)
+                     if item["id"] == data.get("edit_machine")), None)
+        if item:
+            await show_machine(callback.message, item)
+        else:
+            await callback.message.answer("Изменения не сохранены.", reply_markup=await executor_keyboard(
+                callback.from_user.id, state,
+            ))
+        return
+    await state.update_data(edit_field=field)
+    if field == "category":
+        await machine_catalog(callback.message, state)
+    elif field == "description":
+        await state.set_state(AddMachine.description)
+        await callback.message.answer("Введите новое описание техники.")
+    else:
+        await ask_machine_region(callback.message, state)
 
 
 @router.message(F.text.in_(NOTIFICATION_ACTIONS))
@@ -273,10 +459,52 @@ async def my_payment_methods(message: Message, state: FSMContext):
             (message.from_user.id,),
         ) as cursor:
             methods = [row[0] for row in await cursor.fetchall()]
-    if not methods:
-        await message.answer("Способы оплаты пока не указаны.", reply_markup=await executor_keyboard(message.from_user.id, state))
-        return
     await message.answer(
-        "💳 Принимаемые формы оплаты:\n" + "\n".join(f"• {method}" for method in methods),
-        reply_markup=await executor_keyboard(message.from_user.id, state),
+        "💳 Принимаемые формы оплаты:\n" + ("\n".join(f"• {method}" for method in methods) or "Не указаны"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✏️ Изменить способы оплаты", callback_data="provider_payment:edit"),
+        ]]),
     )
+    await message.answer("Меню исполнителя", reply_markup=await executor_keyboard(message.from_user.id, state))
+
+
+@router.callback_query(F.data == "provider_payment:edit")
+async def edit_payment_methods(callback: CallbackQuery, state: FSMContext):
+    if not isinstance(callback.message, Message) or await state.get_state():
+        await callback.answer("Сначала завершите текущее действие.")
+        return
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM provider_profiles WHERE telegram_id=? AND blocked=0",
+                              (callback.from_user.id,)) as cursor:
+            allowed = await cursor.fetchone()
+    if not allowed:
+        await callback.answer("Профиль недоступен.")
+        return
+    await callback.answer()
+    await state.set_state(Register.payment)
+    await callback.message.answer("Укажите один или несколько способов через запятую:\n"
+                                  + "\n".join(sorted(payments.METHODS)))
+
+
+async def resume_provider_step(message, state, current):
+    data = await state.get_data()
+    if current in (AddMachine.category.state, AddMachine.equipment_type.state):
+        await machine_catalog(message, state, data.get("machine_group"))
+    elif current == AddMachine.review.state:
+        if data.get("machine_choosing_field"):
+            await machine_edit_fields(message, state)
+        else:
+            await review_machine(message, state, data["area"])
+    elif current == AddMachine.region.state:
+        await ask_machine_region(message, state)
+    else:
+        prompts = {
+            AddMachine.area.state: "Укажите район или введите «весь регион».",
+            AddMachine.description.state: "Введите название и описание техники.",
+            Register.consent.state: "Сохраняем контакт и сведения о технике для подбора заявок. Согласны? Ответьте «Да».",
+            Register.name.state: "Укажите имя или название компании.",
+            Register.phone.state: "Укажите телефон в формате +7XXXXXXXXXX или 8XXXXXXXXXX.",
+            Register.payment.state: "Перечислите принимаемые формы оплаты через запятую:\n"
+                                    + "\n".join(sorted(payments.METHODS)),
+        }
+        await message.answer(prompts[current], reply_markup=section_keyboard((HOME,)))

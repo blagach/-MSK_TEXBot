@@ -11,6 +11,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 import storage
+from provider_registry import _validate_phone
 
 USERS = """
 WITH customers AS (
@@ -23,7 +24,7 @@ WITH customers AS (
 ), performers AS (
     SELECT id FROM registrations UNION SELECT provider_id FROM offers
 ), users AS (
-    SELECT id FROM customers UNION SELECT id FROM performers
+    SELECT id FROM customers UNION SELECT id FROM performers UNION SELECT requester_id FROM support_tickets
 )
 """
 EQUIPMENT = """
@@ -78,9 +79,21 @@ async def registration_stats(at=None):
         for start in boundaries:
             result.append((await rows(db, USERS + """
                 SELECT (SELECT COUNT(*) FROM registrations WHERE julianday(first_seen) BETWEEN julianday(?) AND julianday(?)) AS providers,
-                       (SELECT COUNT(*) FROM customers WHERE julianday(first_seen) BETWEEN julianday(?) AND julianday(?)) AS customers
-            """, (start.isoformat(), current.isoformat()) * 2))[0])
+                       (SELECT COUNT(*) FROM customers WHERE julianday(first_seen) BETWEEN julianday(?) AND julianday(?)) AS customers,
+                       (SELECT COUNT(*) FROM leads WHERE julianday(created_at) BETWEEN julianday(?) AND julianday(?)) AS created,
+                       (SELECT COUNT(*) FROM lead_lifecycle_events WHERE action='published'
+                            AND julianday(created_at) BETWEEN julianday(?) AND julianday(?)) AS published,
+                       (SELECT COUNT(*) FROM offers WHERE julianday(created_at) BETWEEN julianday(?) AND julianday(?)) AS offers
+            """, (start.isoformat(), current.isoformat()) * 5))[0])
         return result
+
+
+async def equipment_totals():
+    async with read_db() as db:
+        return (await rows(db, USERS + """
+            SELECT (SELECT count(*) FROM performers) AS providers,
+                   (SELECT count(*) FROM provider_equipment) AS units
+        """))[0]
 
 
 async def equipment_page(offset):
@@ -132,6 +145,14 @@ async def export_xlsx():
             SELECT u.id, COALESCE(profile.display_name, legacy.name,
                    (SELECT customer_name FROM leads WHERE customer_id=u.id AND customer_name IS NOT NULL ORDER BY id DESC LIMIT 1),
                    (SELECT provider_name FROM offers WHERE provider_id=u.id ORDER BY id DESC LIMIT 1), '') AS display_name,
+                   COALESCE(profile.phone, legacy.phone,
+                            (SELECT l.phone FROM leads l WHERE l.customer_id=u.id ORDER BY l.id DESC LIMIT 1),
+                            (SELECT o.phone FROM offers o WHERE o.provider_id=u.id ORDER BY o.id DESC LIMIT 1)) AS phone,
+                   COALESCE((SELECT NULLIF(d.customer_username, '') FROM lead_work_details d JOIN leads l
+                             ON l.id=d.lead_id WHERE l.customer_id=u.id AND d.customer_username IS NOT NULL
+                             ORDER BY l.id DESC LIMIT 1),
+                            (SELECT NULLIF(o.username, '') FROM offers o WHERE o.provider_id=u.id
+                             AND o.username!='' ORDER BY o.id DESC LIMIT 1)) AS username,
                    c.first_seen AS customer_since, r.first_seen AS registered_at,
                    c.id IS NOT NULL AS customer, p.id IS NOT NULL AS performer
             FROM users u LEFT JOIN customers c ON c.id=u.id LEFT JOIN performers p ON p.id=u.id
@@ -139,17 +160,99 @@ async def export_xlsx():
             LEFT JOIN providers legacy ON legacy.telegram_id=u.id ORDER BY u.id
         """)
         equipment = await rows(db, EQUIPMENT)
+        leads = await rows(db, """
+            SELECT l.*, r.region, r.area, d.equipment_name, d.map_link, d.schedule, p.method
+            FROM leads l LEFT JOIN lead_routing r ON r.lead_id=l.id
+            LEFT JOIN lead_work_details d ON d.lead_id=l.id
+            LEFT JOIN lead_payment_preferences p ON p.lead_id=l.id ORDER BY l.id
+        """)
+        offers = await rows(db, """
+            SELECT o.*, CASE WHEN e.offer_id=o.id THEN 'Выбран' WHEN l.status='closed' THEN 'Заявка закрыта'
+                   ELSE 'Подан' END AS result
+            FROM offers o LEFT JOIN leads l ON l.id=o.lead_id
+            LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected' ORDER BY o.id
+        """)
+        tickets = await rows(db, """
+            SELECT t.*, (SELECT count(*) FROM support_messages m WHERE m.ticket_id=t.id) AS messages,
+                   (SELECT m.text FROM support_messages m WHERE m.ticket_id=t.id ORDER BY m.id LIMIT 1) AS opening
+            FROM support_tickets t ORDER BY t.id
+        """)
+        events = await rows(db, """
+            SELECT 'Заявка' AS entity, lead_id AS record_id, actor_id, action, reason, offer_id, created_at
+            FROM lead_lifecycle_events
+            UNION ALL
+            SELECT 'Обращение', ticket_id, actor_id, status, NULL, NULL, created_at FROM support_status_events
+            ORDER BY created_at, entity, record_id
+        """)
     workbook = Workbook(write_only=True)
     people = workbook.create_sheet("Пользователи")
-    people.append(("Telegram ID", "Имя или компания", "Заказчик", "Исполнитель", "Первая заявка", "Регистрация исполнителя"))
+    people.append(("Telegram ID", "Имя или компания", "Заказчик", "Исполнитель", "Первая заявка", "Регистрация исполнителя", "Телефон", "Username", "Профиль"))
     for user in users:
         append_text_safe(people, (str(user["id"]), user["display_name"], "Да" if user["customer"] else "Нет",
-                                  "Да" if user["performer"] else "Нет", user["customer_since"], user["registered_at"]))
+                                  "Да" if user["performer"] else "Нет", moscow_time(user["customer_since"]), moscow_time(user["registered_at"]),
+                                  normalized_phone(user["phone"]), profile_name(user["username"]),
+                                  profile_url(user["username"])))
     machines = workbook.create_sheet("Техника")
     machines.append(("ID записи", "Telegram ID исполнителя", "Исполнитель", "Категория", "Описание", "Местоположение", "Статус"))
     for item in equipment:
         append_text_safe(machines, (item["equipment_id"], str(item["provider_id"]), item["owner"],
                                     item["category"], item["description"], item["location"], item["status"]))
+    orders = workbook.create_sheet("Заявки")
+    orders.append(("№", "Telegram ID заказчика", "Имя", "Техника", "Уточнение техники", "Регион", "Район",
+                   "Адрес", "Карта", "Дата и время работ", "График", "Описание", "Оплата", "Телефон", "Статус", "Создано, МСК"))
+    for lead in leads:
+        append_text_safe(orders, (lead["id"], str(lead["customer_id"]), lead["customer_name"], lead["equipment"],
+                                  lead["equipment_name"], lead["region"], lead["area"], lead["place"], lead["map_link"],
+                                  lead["work_date"], lead["schedule"], lead["details"], lead["method"],
+                                  normalized_phone(lead["phone"]), lead["status"], moscow_time(lead["created_at"])))
+    responses = workbook.create_sheet("Отклики")
+    responses.append(("№", "№ заявки", "Telegram ID исполнителя", "Исполнитель", "Username", "Профиль",
+                      "Телефон", "Стоимость", "Условия", "Результат", "Доставка", "Создано, МСК"))
+    for offer in offers:
+        append_text_safe(responses, (offer["id"], offer["lead_id"], str(offer["provider_id"]), offer["provider_name"],
+                                     profile_name(offer["username"]), profile_url(offer["username"]),
+                                     normalized_phone(offer["phone"]), offer["price"], offer["comment"], offer["result"],
+                                     offer["delivery_status"], moscow_time(offer["created_at"])))
+    requests = workbook.create_sheet("Обращения")
+    requests.append(("№", "Telegram ID автора", "Тип", "Статус", "Первое сообщение", "Всего сообщений", "Создано, МСК"))
+    for ticket in tickets:
+        append_text_safe(requests, (ticket["id"], str(ticket["requester_id"]), ticket["kind"], ticket["status"],
+                                    ticket["opening"], ticket["messages"], moscow_time(ticket["created_at"])))
+    history = workbook.create_sheet("История статусов и закрытия")
+    history.append(("Тип записи", "Номер", "Telegram ID автора", "Событие", "Причина", "№ отклика", "Дата, МСК"))
+    for event in events:
+        append_text_safe(history, (event["entity"], event["record_id"],
+                                   str(event["actor_id"]) if event["actor_id"] is not None else None,
+                                   event["action"], event["reason"], event["offer_id"], moscow_time(event["created_at"])))
     stream = BytesIO()
     workbook.save(stream)
     return stream.getvalue()
+
+
+def moscow_time(value):
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return stamp.astimezone(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds") if stamp.tzinfo else value
+
+
+def normalized_phone(value):
+    try:
+        return _validate_phone(value)
+    except ValueError:
+        return None
+
+
+def profile_name(username):
+    if not username:
+        return None
+    handle = username.lstrip("@")
+    return handle if handle.isascii() and handle.replace("_", "").isalnum() else None
+
+
+def profile_url(username):
+    handle = profile_name(username)
+    return f"https://t.me/{handle}" if handle else None

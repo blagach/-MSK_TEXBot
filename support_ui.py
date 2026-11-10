@@ -40,6 +40,7 @@ class Support(StatesGroup):
     search = State()
     compose = State()
     reply = State()
+    requester_reply = State()
 
 
 def keys(*rows):
@@ -89,10 +90,13 @@ async def show_guide(message, role, index):
         rows.append((("⬅️ Назад", f"guide:{role}:{index - 1}"),))
     if index + 1 < len(steps):
         rows.append((("Далее ➡️", f"guide:{role}:{index + 1}"),))
+    else:
+        rows.append((("Завершить инструкцию", "home"),))
     rows.append(BACK)
     text = f"{index + 1}/{len(steps)} · {title}\n\n{body}"
-    if not index:
-        await message.answer_photo(FSInputFile(ASSETS / f"{role}.png"), caption=text, reply_markup=keys(*rows))
+    screenshot = ASSETS / f"{role}-{index + 1}.png"
+    if screenshot.is_file():
+        await message.answer_photo(FSInputFile(screenshot), caption=text, reply_markup=keys(*rows))
     else:
         await message.answer(text, reply_markup=keys(*rows))
 
@@ -102,12 +106,11 @@ async def show_training(message, role, index):
     if index == len(steps):
         await message.answer("🎉 Тренировка завершена. Учебные данные не отправлялись.", reply_markup=keys(BACK))
         return
-    question, good, bad = steps[index]
-    options = (((good, f"try:{role}:{index}:1"),), ((bad, f"try:{role}:{index}:0"),))
-    if index % 2:
-        options = options[::-1]
-    await message.answer(f"🎓 Тренировка · {index + 1}/{len(steps)}\n\n{question}", reply_markup=keys(*options, BACK))
-
+    title, button, details = steps[index]
+    await message.answer(
+        f"🎓 Тренировка · {index + 1}/{len(steps)}\n\n{title}\n{details}",
+        reply_markup=keys(((button, f"try:{role}:{index}:1"),), BACK),
+    )
 
 async def ticket_list(message, user_id, *, status=None, offset=0):
     rows = await store.list_tickets(requester_id=user_id, status=status, offset=offset)
@@ -159,6 +162,8 @@ async def show_ticket(message, ticket_id, user_id, admin, offset=0, origin=""):
         actions.append((("К новым сообщениям", f"ticket:{ticket_id}:{offset - HISTORY_PAGE}{suffix}"),))
     if len(rows) > HISTORY_PAGE:
         actions.append((("Более ранние сообщения", f"ticket:{ticket_id}:{offset + HISTORY_PAGE}{suffix}"),))
+    if ticket["requester_id"] == user_id and ticket["status"] != "closed":
+        actions.append((("✉️ Написать сообщение", f"follow:{ticket_id}"),))
     if admin and ticket["status"] != "closed":
         if ticket["status"] == "new":
             actions.append((("Взять в работу", f"status:{ticket_id}:in_progress{suffix}"),))
@@ -167,6 +172,8 @@ async def show_ticket(message, ticket_id, user_id, admin, offset=0, origin=""):
     actions.append((("⬅️ К обращениям", origin or default_list),))
     if admin:
         actions.append((("К статусам", "queue"),))
+    if admin:
+        actions.append((("⬅️ В админ-панель", "panel"),))
     await message.answer(
         f"Обращение №{ticket_id} · {KINDS[ticket['kind']]} · {STATUSES[ticket['status']]}",
         reply_markup=keys(*actions, BACK),
@@ -216,11 +223,19 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
             (("📋 Заказчик", f"{prefix}:customer:0"), ("🚜 Исполнитель", f"{prefix}:provider:0")), BACK,
         ))
     elif action == "guide" and len(parts) == 3 and parts[1] in GUIDES and parts[2] in {str(index) for index in range(len(GUIDES[parts[1]]))}:
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
         await show_guide(message, parts[1], int(parts[2]))
     elif action == "train" and len(parts) == 3 and parts[1] in TRAINING and parts[2] == "0":
         await show_training(message, parts[1], 0)
     elif action == "try" and len(parts) == 4 and parts[1] in TRAINING and parts[2] in {str(index) for index in range(len(TRAINING[parts[1]]))}:
         if parts[3] == "1":
+            try:
+                await message.edit_reply_markup(reply_markup=None)
+            except TelegramAPIError:
+                pass
             await show_training(message, parts[1], int(parts[2]) + 1)
         elif parts[3] == "0":
             await message.answer("Попробуйте другой вариант.")
@@ -243,7 +258,7 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         await state.set_data({"support_kind": parts[1], "support_nonce": uuid4().hex})
         await state.set_state(Support.compose)
         text = "Опишите, что произошло, что ожидали и на каком шаге." if parts[1] == "bug" else "Опишите, с чем нужна помощь."
-        await message.answer(f"{text}\nПри желании приложите скриншот как фото. Не добавляйте пароли и коды.", reply_markup=keys(BACK))
+        await message.answer(f"{text}\nПри желании приложите скриншот. Не добавляйте пароли и коды.", reply_markup=keys(BACK))
     elif action == "edit" and len(parts) == 2 and await state.get_state() == Support.compose.state:
         if (await state.get_data()).get("support_nonce") == parts[1]:
             await state.update_data(support_nonce=uuid4().hex)
@@ -262,9 +277,14 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         await message.answer(f"Обращение №{ticket_id} принято.", reply_markup=keys(
             (("Открыть обращение", f"ticket:{ticket_id}:0"),), BACK,
         ))
+    elif parts == ["panel"] and admin:
+        import admin_ui
+        await admin_ui.menu(message)
     elif parts == ["queue"]:
+        totals = await store.counts()
         await message.answer("Очередь поддержки", reply_markup=keys(
-            *(((label, f"list:{status}:0"),) for status, label in STATUSES.items()), BACK,
+            *(((f"{label} · {totals.get(status, 0)}", f"list:{status}:0"),) for status, label in STATUSES.items()),
+            (("⬅️ В админ-панель", "panel"),), BACK,
         ))
     elif action == "mine" and len(parts) == 2 and page_number(parts[1], TICKET_PAGE) is not None:
         await ticket_list(message, user_id, offset=int(parts[1]))
@@ -280,9 +300,17 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
             (("Вернуться", f"ticket:{parts[1]}:0{suffix}"),),
         ))
     elif action == "status" and len(parts) >= 3 and positive_id(parts[1]) and parts[2] in {"in_progress", "closed"}:
-        changed = await store.change_status(int(parts[1]), parts[2])
+        changed = await store.change_status(int(parts[1]), parts[2], user_id)
         await message.answer(f"Статус обновлён: {STATUSES[parts[2]]}." if changed else "Статус уже изменён или обращение недоступно.")
         await show_ticket(message, int(parts[1]), user_id, admin, origin=ticket_list_origin(parts[3:], admin))
+    elif action == "follow" and len(parts) == 2 and positive_id(parts[1]):
+        ticket = await store.ticket(int(parts[1]), user_id)
+        if not ticket or ticket["status"] == "closed" or await state.get_state() is not None:
+            await message.answer("Обращение недоступно или открыта другая анкета.")
+            return
+        await state.set_data({"support_ticket": int(parts[1]), "support_nonce": uuid4().hex})
+        await state.set_state(Support.requester_reply)
+        await message.answer("Введите сообщение для поддержки.", reply_markup=keys(BACK))
     elif action == "reply" and len(parts) >= 2 and positive_id(parts[1]):
         if await state.get_state() is not None:
             await message.answer("Сначала завершите открытую анкету или перейдите в главное меню.")
@@ -321,7 +349,7 @@ async def search_faq(message: Message):
 async def compose_ticket(message: Message, state: FSMContext):
     text = (message.text or message.caption or "").strip()
     if len(text) > 1200 or (not text and not message.photo):
-        await message.answer("Отправьте текст до 1200 символов и, при желании, скриншот как фото.", reply_markup=keys(BACK))
+        await message.answer("Отправьте текст до 1200 символов и, при желании, скриншот.", reply_markup=keys(BACK))
         return
     fields = {"support_text": text} if text else {}
     if message.photo:
@@ -331,10 +359,46 @@ async def compose_ticket(message: Message, state: FSMContext):
     if not data.get("support_text"):
         await message.answer("Скриншот добавлен. Теперь опишите проблему текстом.", reply_markup=keys(BACK))
         return
+    await show_ticket_preview(message, data)
+
+
+async def resume_support_step(message, state, current):
+    data = await state.get_data()
+    if current == Support.compose.state and data.get("support_text"):
+        await show_ticket_preview(message, data)
+    elif current == Support.compose.state:
+        await message.answer("Опишите, с чем нужна помощь. При желании приложите скриншот. Не добавляйте пароли и коды.",
+                             reply_markup=keys(BACK))
+    else:
+        await message.answer(f"Введите сообщение для обращения №{data['support_ticket']}.", reply_markup=keys(BACK))
+
+
+async def show_ticket_preview(message, data):
     photo = "Скриншот приложен." if data.get("support_photo") else "Можно дополнить обращение скриншотом."
     await message.answer(f"Проверьте обращение\n\n{data['support_text']}\n\n{photo}", reply_markup=keys(
         (("✅ Отправить обращение", f"send:{data['support_nonce']}"),
          ("✏️ Изменить", f"edit:{data['support_nonce']}")), BACK,
+    ))
+
+
+@router.message(Support.requester_reply)
+async def requester_reply(message: Message, state: FSMContext, bot, support_admin_ids, support_group_id=None):
+    text = (message.text or "").strip()
+    if not 1 <= len(text) <= 1200:
+        await message.answer("Введите сообщение длиной до 1200 символов.", reply_markup=keys(BACK))
+        return
+    data = await state.get_data()
+    ticket_id = data["support_ticket"]
+    actor_id = message.from_user.id
+    ticket = await store.ticket(ticket_id, actor_id)
+    if not ticket or not await store.add_requester_message(ticket_id, actor_id, data["support_nonce"], text):
+        await message.answer("Обращение закрыто или сообщение уже сохранено.", reply_markup=keys(BACK))
+        await state.clear()
+        return
+    await state.clear()
+    await notify_admins(bot, support_admin_ids, support_group_id, ticket_id, ticket["kind"])
+    await message.answer("Сообщение сохранено в обращении.", reply_markup=keys(
+        (("Открыть обращение", f"ticket:{ticket_id}:0"),), BACK,
     ))
 
 

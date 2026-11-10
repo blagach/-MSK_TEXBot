@@ -46,6 +46,13 @@ async def init_schema():
                 error_code TEXT,
                 attempted_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS support_status_events (
+                id INTEGER PRIMARY KEY,
+                ticket_id INTEGER NOT NULL REFERENCES support_tickets(id),
+                actor_id INTEGER,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS support_reply_deliveries_queue
                 ON support_reply_deliveries(status, message_id);
             CREATE INDEX IF NOT EXISTS support_tickets_requester ON support_tickets(requester_id, id);
@@ -108,7 +115,25 @@ async def history(ticket_id, offset=0):
             return await cursor.fetchall()
 
 
-async def change_status(ticket_id, status):
+async def counts():
+    async with connection() as db:
+        async with db.execute("SELECT status, count(*) FROM support_tickets GROUP BY status") as cursor:
+            return dict(await cursor.fetchall())
+
+
+async def add_requester_message(ticket_id, requester_id, request_id, text):
+    async with connection() as db:
+        cursor = await db.execute(
+            """INSERT INTO support_messages(ticket_id,request_id,actor_id,is_admin,text,created_at)
+               SELECT id,?,?,0,?,? FROM support_tickets WHERE id=? AND requester_id=? AND status!='closed'
+               ON CONFLICT(request_id) DO NOTHING""",
+            (request_id, requester_id, text, now(), ticket_id, requester_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def change_status(ticket_id, status, actor_id=None):
     if status not in ("in_progress", "closed"):
         raise ValueError("Invalid support status")
     async with connection() as db:
@@ -117,6 +142,9 @@ async def change_status(ticket_id, status):
                AND (status='new' OR (status='in_progress' AND ?='closed'))""",
             (status, ticket_id, status),
         )
+        if cursor.rowcount:
+            await db.execute("INSERT INTO support_status_events(ticket_id,actor_id,status,created_at) VALUES (?,?,?,?)",
+                             (ticket_id, actor_id, status, now()))
         await db.commit()
         return cursor.rowcount == 1
 
@@ -135,7 +163,10 @@ async def add_reply(ticket_id, admin_id, request_id, text):
         await db.execute(
             "INSERT INTO support_reply_deliveries(message_id,status) VALUES (?,'queued')", (cursor.lastrowid,),
         )
-        await db.execute("UPDATE support_tickets SET status='in_progress' WHERE id=? AND status='new'", (ticket_id,))
+        updated = await db.execute("UPDATE support_tickets SET status='in_progress' WHERE id=? AND status='new'", (ticket_id,))
+        if updated.rowcount:
+            await db.execute("INSERT INTO support_status_events(ticket_id,actor_id,status,created_at) VALUES (?,?,?,?)",
+                             (ticket_id, admin_id, "in_progress", now()))
         await db.commit()
         return cursor.lastrowid
 

@@ -58,7 +58,8 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_publication_only_one_send(self):
         await asyncio.gather(*(bot.publish_lead(self.callback, self.telegram) for _ in range(8)))
-        self.telegram.send_message.assert_awaited_once()
+        self.assertEqual([call.args[0] for call in self.telegram.send_message.await_args_list],
+                         [bot.settings.leads_channel_id, (await bot.get_lead(1))["customer_id"]])
         self.assertEqual(await self.status(), 'published')
         async with aiosqlite.connect(storage.DB_PATH) as db:
             row = await (await db.execute('SELECT chat_id,message_id FROM lead_publications')).fetchone()

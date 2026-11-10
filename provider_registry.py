@@ -8,13 +8,11 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+import equipment_catalog
+
 DEFAULT_DB_PATH = "bot.db"
 PHONE_RE = re.compile(r"(?:\+7|8)[0-9]{10}\Z")
-CATEGORIES = frozenset({
-    "мини-экскаватор", "мини-погрузчик", "экскаватор-погрузчик",
-    "экскаватор", "манипулятор", "автокран", "каток",
-    "самосвал", "трал", "другая техника",
-})
+CATEGORIES = equipment_catalog.TYPES
 REGIONS = frozenset({"Москва", "Московская область"})
 BOTH_REGIONS = "Москва и Московская область"
 SERVICE_REGIONS = REGIONS | {BOTH_REGIONS}
@@ -33,7 +31,8 @@ def _validate_name(name):
 def _validate_phone(phone):
     if not isinstance(phone, str) or not PHONE_RE.fullmatch(phone.strip()):
         raise ValueError("Номер телефона должен быть в формате +7XXXXXXXXXX или 8XXXXXXXXXX")
-    return phone.strip()
+    number = phone.strip()
+    return "+7" + number[-10:]
 
 
 async def init_schema(db_path=DEFAULT_DB_PATH):
@@ -103,7 +102,7 @@ async def add_equipment(telegram_id, category, description, region, area,
 
 async def update_equipment(telegram_id, equipment_id, *, category, description,
                            region, area, active=True, db_path=DEFAULT_DB_PATH):
-    if category not in CATEGORIES or region not in REGIONS:
+    if category not in CATEGORIES or region not in SERVICE_REGIONS:
         raise ValueError("Некорректная категория или регион")
     if not isinstance(description, str) or not 1 <= len(description.strip()) <= 200:
         raise ValueError("Некорректное описание")
@@ -150,8 +149,22 @@ async def list_equipment(telegram_id, db_path=DEFAULT_DB_PATH):
             (telegram_id,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
+def normalize_area(value):
+    return " ".join((value or "").casefold().replace("ё", "е").split())
 
-async def matching_providers(category, region, area, db_path=DEFAULT_DB_PATH):
+
+def equipment_match(category, region, area):
+    return f"""(e.category={category} OR (e.category IN ('каток','дорожный каток')
+                       AND {category} IN ('каток','дорожный каток')))
+              AND (e.region={region} OR e.region='Москва и Московская область')
+              AND (area_key(e.area)=area_key({area}) OR area_key(e.area)='весь регион')"""
+
+
+async def register_area_key(db):
+    await db.create_function("area_key", 1, normalize_area, deterministic=True)
+
+
+async def matching_providers(category, region, area, db_path=DEFAULT_DB_PATH, *, notifications=True):
     """Exact area match, or a provider covering the entire selected region.
 
     More flexible district matching must use structured locations, not substrings.
@@ -159,11 +172,13 @@ async def matching_providers(category, region, area, db_path=DEFAULT_DB_PATH):
     if category not in CATEGORIES or region not in REGIONS:
         return []
     async with aiosqlite.connect(db_path) as db:
-        async with db.execute("""SELECT DISTINCT p.telegram_id
-            FROM provider_profiles p
-            JOIN provider_equipment e ON e.provider_id=p.telegram_id
-            WHERE p.blocked=0 AND p.notifications_enabled=1
-              AND e.active=1 AND e.category=? AND (e.region=? OR e.region=?)
-              AND (e.area=? OR e.area='весь регион')
-            ORDER BY p.telegram_id""", (category, region, BOTH_REGIONS, area)) as cursor:
+        await register_area_key(db)
+        predicate = equipment_match("target.category", "target.region", "target.area")
+        async with db.execute(f"""WITH target(category, region, area) AS (VALUES (?, ?, ?))
+            SELECT DISTINCT p.telegram_id FROM provider_profiles p
+            JOIN provider_equipment e ON e.provider_id=p.telegram_id CROSS JOIN target
+            WHERE p.blocked=0 AND (p.notifications_enabled=1 OR ?=0)
+              AND e.active=1 AND {predicate} ORDER BY p.telegram_id""",
+            (category, region, area, notifications),
+        ) as cursor:
             return [row[0] for row in await cursor.fetchall()]

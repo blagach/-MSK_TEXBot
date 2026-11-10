@@ -5,6 +5,7 @@ on:
     branches:
       - feature/provider-registration-moscow
       - test/tz4-help-support
+      - test/tz5-complete
   pull_request:
     paths:
       - bot.py

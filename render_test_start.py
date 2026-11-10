@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramConflictError
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, MenuButtonCommands
 from draft_storage import SQLiteDraftStorage
 
-from render_test_backup import snapshot, verify_small_snapshot
+from render_test_backup import restore_candidate, snapshot, verify_preserved_rows
 from render_test_guard import IsolationError, TelegramIsolation, verify_identity
 
 TEST_BOT = "Msktex_test_dmitry_bot"
@@ -85,14 +85,11 @@ async def start() -> None:
         telegram.session.middleware(prevent_duplicate_polling)
         await guard.check_channel(telegram)
 
+        backup_path = None
         if database.exists():
-            backup_path, digest = snapshot(database)
+            backup_path, digest = await asyncio.to_thread(snapshot, database)
             logging.info("Test SQLite backup %s SHA-256 %s", backup_path.name, digest)
-            counts = verify_small_snapshot(backup_path)
-            if counts is not None:
-                logging.info("Test SQLite restore verified: leads=%s offers=%s", *counts)
-            else:
-                logging.info("Test SQLite restore requires a separate file (snapshot exceeds 16 MiB)")
+            candidate = await asyncio.to_thread(restore_candidate, backup_path, digest)
 
         os.environ.update(
             BOT_TOKEN=config.token, BOT_USERNAME=TEST_BOT, ADMIN_IDS=str(config.admin_id),
@@ -102,10 +99,20 @@ async def start() -> None:
         if config.support_group_id is not None:
             os.environ["SUPPORT_GROUP_ID"] = str(config.support_group_id)
         app = importlib.import_module("bot")
+        if backup_path is not None:
+            app.storage.DB_PATH = str(candidate)
+            await app.init_db()
+            await SQLiteDraftStorage(str(candidate)).init_schema()
+            checked = await asyncio.to_thread(verify_preserved_rows, backup_path, candidate)
+            logging.info("Test SQLite candidate restored and migrated; %s source tables verified", checked)
+
         app.storage.DB_PATH = str(database)
         await app.init_db()
         drafts = SQLiteDraftStorage(str(database))
         await drafts.init_schema()
+        if backup_path is not None:
+            checked = await asyncio.to_thread(verify_preserved_rows, backup_path, database)
+            logging.info("Test SQLite live migration verified; %s source tables preserved", checked)
         dispatcher = app.create_dispatcher(drafts)
         dispatcher.update.outer_middleware(guard.incoming)
         await telegram.set_my_commands([

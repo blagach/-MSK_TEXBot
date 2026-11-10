@@ -53,6 +53,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         message.answer = AsyncMock()
         message.answer_photo = AsyncMock()
         message.answer_document = AsyncMock()
+        message.edit_reply_markup = AsyncMock()
         return message, state
 
     def callback(self, message, data):
@@ -93,8 +94,10 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         message, state = self.actor(20)
         for role in ("customer", "provider"):
             await self.help_action(message, state, f"guide:{role}:0")
-            image = message.answer_photo.await_args.args[0]
-            self.assertTrue(Path(image.path).read_bytes().startswith(b"\x89PNG"))
+            self.assertIn("1/6", message.answer.await_args.args[0])
+            await self.help_action(message, state, f"guide:{role}:5")
+            buttons = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertIn("Завершить инструкцию", [row[0].text for row in buttons])
             for step in range(4):
                 await self.help_action(message, state, f"try:{role}:{step}:1")
             self.assertIn("Тренировка завершена", message.answer.await_args.args[0])
@@ -271,12 +274,13 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(equipment), 3)
         self.assertIn("Москва, ЗАО", [item["location"] for item in equipment])
         workbook = load_workbook(BytesIO(await admin_reports.export_xlsx()))
-        self.assertEqual(workbook.sheetnames, ["Пользователи", "Техника"])
+        self.assertEqual(workbook.sheetnames, ["Пользователи", "Техника", "Заявки", "Отклики",
+                                               "Обращения", "История статусов и закрытия"])
         people = workbook["Пользователи"]
         self.assertEqual((people["A2"].value, people["A2"].data_type), ("20", "s"))
         self.assertEqual((people["B2"].value, people["B2"].data_type), ("=HYPERLINK(1)", "s"))
         self.assertEqual(workbook["Техника"].max_row, 4)
-        self.assertNotIn("+79991234567", [cell.value for sheet in workbook for row in sheet for cell in row])
+        self.assertIn("+79991234567", [cell.value for sheet in workbook for row in sheet for cell in row])
 
     async def test_support_group_gets_only_metadata_and_unknown_members_trigger_fallback(self):
         telegram = self.telegram

@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 from draft_storage import SQLiteDraftStorage, draft_slot, offer_draft_ids, offer_draft_slot
 
 import admin_ui
+import equipment_catalog
 import support_storage
 import support_ui
 import storage
@@ -38,6 +39,7 @@ import provider_ui
 from provider_ui import AVAILABLE_LEADS, LEGACY_PROVIDER, MY_OFFERS, OFFER_DRAFT, section_keyboard
 import provider_dispatch
 import notification_reservations
+import lead_journey
 import lead_routing
 import moderation_history
 import lead_moderation
@@ -80,17 +82,28 @@ def read_settings() -> Settings:
 
 settings = read_settings()
 router = Router()
+router.message.filter(F.chat.type == "private")
 
 
 class LeadForm(StatesGroup):
     equipment = State()
+    equipment_type = State()
+    equipment_other = State()
     region = State()
     area = State()
     place = State()
     date = State()
+    schedule = State()
+    map_link = State()
     details = State()
     payment = State()
     phone = State()
+    review = State()
+    edit = State()
+
+
+class CloseLead(StatesGroup):
+    reason = State()
 
 
 class ProviderForm(StatesGroup):
@@ -121,11 +134,15 @@ OFFER_BACK = "⬅️ Назад"
 OFFER_HOME = "🏠 Главное меню"
 LEAD_PROMPTS = {
     LeadForm.equipment: "Выберите категорию техники:",
+    LeadForm.equipment_type: "Выберите вид техники:",
+    LeadForm.equipment_other: "Укажите название нужной техники.",
+    LeadForm.map_link: "Пришлите HTTPS-ссылку на карту или пропустите этот шаг.",
+    LeadForm.schedule: "Укажите продолжительность и график смен или пропустите этот шаг.",
     LeadForm.region: "Выберите регион:",
     LeadForm.area: "Укажите район или населённый пункт (например, СЗАО или Химки).",
     LeadForm.place: "Укажите точный адрес, ориентир или ближайшее метро.",
     LeadForm.date: "На какую дату и время нужна техника?",
-    LeadForm.details: "Опишите работу: объём, срок, груз/навесное оборудование, важные условия.",
+    LeadForm.details: "Опишите работу: объём, срок, груз, навесное оборудование, важные условия.",
     LeadForm.payment: "Выберите форму оплаты:",
     LeadForm.phone: (
         "Введите номер телефона для связи без пробелов, скобок и дефисов. "
@@ -133,7 +150,6 @@ LEAD_PROMPTS = {
     ),
 }
 LEAD_CHOICES = {
-    LeadForm.equipment: (tuple(sorted(provider_registry.CATEGORIES)), "equipment", LeadForm.region),
     LeadForm.region: (("Москва", "Московская область"), "region", LeadForm.area),
     LeadForm.payment: (
         (payment_preferences.CASH, payment_preferences.VAT, payment_preferences.NO_VAT, payment_preferences.ANY),
@@ -142,6 +158,8 @@ LEAD_CHOICES = {
 }
 FORM_STEPS = {step.state: step for step in (*LeadForm.__all_states__, *OfferForm.__all_states__)}
 LEAD_DRAFT = "▶️ Продолжить заявку"
+PROVIDER_ACTION_DRAFT = "▶️ Продолжить настройку исполнителя"
+SUPPORT_ACTION_DRAFT = "▶️ Продолжить обращение"
 CUSTOMER_ROLE = "📋 Я заказчик"
 PROVIDER_ROLE = "🚜 Я исполнитель"
 MY_LEADS = "📋 Мои заявки"
@@ -156,9 +174,9 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
-def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
+def main_menu(admin: bool = False, extra=()) -> ReplyKeyboardMarkup:
     actions = (support_ui.HELP_LABEL, admin_ui.ADMIN_LABEL) if admin else (support_ui.HELP_LABEL,)
-    return section_keyboard((CUSTOMER_ROLE, PROVIDER_ROLE), actions)
+    return section_keyboard((CUSTOMER_ROLE, PROVIDER_ROLE), actions, *extra)
 
 
 def respond_button(lead_id: int) -> InlineKeyboardButton:
@@ -203,23 +221,36 @@ async def init_db() -> None:
     await support_storage.init_schema()
 
 
+PUBLIC_PHONE = re.compile(r"(?<![0-9])(?:\+7|[78])(?:[ ()-]*[0-9]){10}(?![0-9])")
+
+
+def public_text(text):
+    return re.sub(r"(?<!\w)#[\w-]+", "", PUBLIC_PHONE.sub("[контакт скрыт]", text))
+
+
 def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
-    text = (
-        f"📌 Заявка №{lead['id']}\n"
-        f"Техника: {lead['equipment']}\n"
-        f"Место: {lead['place']}\n"
-        f"Когда: {lead['work_date']}\n"
-        f"Детали: {lead['details'] or 'не указаны'}"
-    )
-    if with_phone:
-        text += f"\nКонтакт заказчика: {lead['phone']}"
-    return text
+    values = dict(lead)
+    fields = [
+        ("Техника", values.get("equipment_name") or lead["equipment"]),
+        ("Регион", ", ".join(filter(None, (values.get("region"), values.get("area"))))),
+        ("Адрес", lead["place"]), ("Карта", values.get("map_link")),
+        ("Когда", lead["work_date"]), ("График смен", values.get("schedule")),
+        ("Детали", lead["details"] or "не указаны"),
+        ("Форма оплаты", values.get("payment_method") or "Не указана"),
+    ]
+    text = f"📌 Заявка №{lead['id']}\n" + "\n".join(f"{label}: {value}" for label, value in fields if value)
+    return text + f"\nКонтакт заказчика: {lead['phone']}" if with_phone else public_text(text)
 
 
 async def get_lead(lead_id: int):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)) as cursor:
+        async with db.execute(
+            """SELECT l.*, r.region, r.area, p.method AS payment_method, d.equipment_name, d.map_link, d.schedule
+               FROM leads l LEFT JOIN lead_routing r ON r.lead_id=l.id
+               LEFT JOIN lead_payment_preferences p ON p.lead_id=l.id
+               LEFT JOIN lead_work_details d ON d.lead_id=l.id WHERE l.id=?""", (lead_id,),
+        ) as cursor:
             return await cursor.fetchone()
 
 
@@ -274,17 +305,35 @@ async def checkpoint_form(state: FSMContext, step: State, **fields) -> None:
 async def show_lead_step(message: Message, state: FSMContext, step: State, **fields) -> None:
     await clear_form_keyboard(message, state)
     await checkpoint_form(state, step, **fields)
-    options = LEAD_CHOICES[step][0] if step in LEAD_CHOICES else ()
-    rows = [[InlineKeyboardButton(text=label, callback_data=f"lead_step:{index}")]
-            for index, label in enumerate(options)]
+    data = await state.get_data()
+    options = lead_options(step, data)
+    rows = equipment_catalog.button_rows(
+        options, lambda index, label: InlineKeyboardButton(text=label, callback_data=f"lead_step:{index}"),
+    )
+    if step == LeadForm.review:
+        rows = [[InlineKeyboardButton(text="✅ Отправить на модерацию", callback_data="lead_review:send")],
+                [InlineKeyboardButton(text="✏️ Изменить данные", callback_data="lead_review:edit")]]
+    if step == LeadForm.edit:
+        rows = equipment_catalog.button_rows(
+            tuple(LEAD_EDIT_FIELDS.values()),
+            lambda index, label: InlineKeyboardButton(text=label, callback_data=f"lead_review:{index}"),
+        )
+    if step in (LeadForm.schedule, LeadForm.map_link):
+        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="lead_optional_skip")])
     if step == LeadForm.details:
         rows.append([InlineKeyboardButton(text="Пропустить описание", callback_data="lead_skip_details")])
     navigation = []
     if step != LeadForm.equipment:
-        navigation.append(InlineKeyboardButton(text=OFFER_BACK, callback_data="form_nav:back"))
+        label = "⬅️ К категориям" if step == LeadForm.equipment_type and not data.get("lead_editing") else OFFER_BACK
+        navigation.append(InlineKeyboardButton(text=label, callback_data="form_nav:back"))
     navigation.append(InlineKeyboardButton(text=OFFER_HOME, callback_data="form_nav:home"))
     rows.append(navigation)
-    await send_form_panel(message, state, LEAD_PROMPTS[step], rows)
+    prompt = (
+        lead_review_text(data) if step == LeadForm.review
+        else "Что изменить?" if step == LeadForm.edit
+        else LEAD_PROMPTS[step]
+    )
+    await send_form_panel(message, state, prompt, rows)
 
 
 def form_kind(current: str | None) -> str | None:
@@ -298,9 +347,16 @@ def form_kind(current: str | None) -> str | None:
 async def pause_form(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
     kind = form_kind(current)
+    if current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__):
+        kind = "provider_action"
+    elif current in (support_ui.Support.compose.state, support_ui.Support.reply.state,
+                     support_ui.Support.requester_reply.state):
+        kind = "support_action"
+    data = await state.get_data()
     await clear_form_keyboard(message, state)
     if kind:
-        data = await state.get_data()
+        if data.get("machine_panel"):
+            await remove_form_keyboard(message, data["machine_panel"])
         lead_id = storage.parse_id(f"lead_{data.get('lead_id')}", "lead_")
         draft = draft_slot(state, f"offer_{lead_id}" if kind == "offer" and lead_id else kind)
         if isinstance(state.storage, SQLiteDraftStorage):
@@ -310,6 +366,35 @@ async def pause_form(message: Message, state: FSMContext) -> None:
         await draft.set_data(data)
         await draft.set_state(current)
     await state.clear()
+
+
+async def menu_with_paused_actions(state):
+    rows = []
+    for kind, label in (("provider_action", PROVIDER_ACTION_DRAFT), ("support_action", SUPPORT_ACTION_DRAFT)):
+        if await draft_slot(state, kind).get_state():
+            rows.append((label,))
+    return main_menu(is_admin(state.key.user_id), rows)
+
+
+@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT}))
+async def resume_auxiliary_action(message: Message, state: FSMContext):
+    provider = message.text == PROVIDER_ACTION_DRAFT
+    draft = draft_slot(state, "provider_action" if provider else "support_action")
+    current = await draft.get_state()
+    if not current:
+        await message.answer("Незавершённого действия нет.")
+        return
+    await pause_form(message, state)
+    if isinstance(state.storage, SQLiteDraftStorage):
+        await state.storage.transfer(draft.key, state.key)
+    else:
+        await state.set_data(await draft.get_data())
+        await state.set_state(current)
+        await draft.clear()
+    if provider:
+        await provider_ui.resume_provider_step(message, state, current)
+    else:
+        await support_ui.resume_support_step(message, state, current)
 
 
 async def restore_form_step(message: Message, state: FSMContext, current: str) -> None:
@@ -347,9 +432,24 @@ async def resume_draft(message: Message, state: FSMContext, kind: str, lead_id: 
 
 async def back_in_form(message: Message, state: FSMContext, current: str) -> None:
     if form_kind(current) == "lead":
-        steps = LeadForm.__all_states__
-        index = steps.index(FORM_STEPS[current])
-        await show_lead_step(message, state, steps[max(0, index - 1)])
+        data = await state.get_data()
+        step = FORM_STEPS[current]
+        if step == LeadForm.edit or data.get("lead_editing"):
+            await show_lead_step(message, state, LeadForm.review, lead_editing=None)
+            return
+        if step == LeadForm.equipment_type and "equipment_group" not in data:
+            await show_lead_step(message, state, LeadForm.equipment)
+            return
+        if step == LeadForm.region:
+            previous = LeadForm.equipment_other if data.get("equipment_name") else (
+                LeadForm.equipment_type if "equipment_group" in data else LeadForm.equipment
+            )
+        else:
+            steps = (LeadForm.equipment, LeadForm.equipment_type, LeadForm.equipment_other, LeadForm.region,
+                     LeadForm.area, LeadForm.place, LeadForm.map_link, LeadForm.date, LeadForm.schedule,
+                     LeadForm.details, LeadForm.payment, LeadForm.phone, LeadForm.review)
+            previous = steps[max(0, steps.index(step) - 1)]
+        await show_lead_step(message, state, previous)
     elif current == OfferForm.phone.state:
         await offer_phone_back(message, state)
     elif current == OfferForm.comment.state and not (await state.get_data()).get("offer_editing"):
@@ -555,7 +655,7 @@ async def start(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await message.answer(
         "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
-        reply_markup=main_menu(is_admin(state.key.user_id)),
+        reply_markup=await menu_with_paused_actions(state),
     )
 
 
@@ -563,7 +663,7 @@ async def start(message: Message, state: FSMContext) -> None:
 async def show_main_menu(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await message.answer("Главное меню MSK_TEX. Выберите нужный раздел:",
-                         reply_markup=main_menu(is_admin(state.key.user_id)))
+                         reply_markup=await menu_with_paused_actions(state))
 
 
 @router.message(Command("support"), F.chat.type == "private")
@@ -605,58 +705,237 @@ async def executor_menu(message: Message, state: FSMContext) -> None:
                          reply_markup=await provider_ui.executor_keyboard(message.from_user.id, state))
 
 
+LEAD_STATUS = {
+    "new": "на модерации", "publishing": "публикуется", "published": "опубликована",
+    "rejected": "отклонена", "closed": "закрыта", "archived": "в архиве",
+}
+
+
+def lead_key(label, data):
+    return InlineKeyboardButton(text=label, callback_data=f"lc:{data}")
+
+
+async def list_customer_leads(message, user_id, before=2**63 - 1, admin=False):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        query = """SELECT id, equipment, status FROM leads WHERE id < ? AND
+                   ((? = 1 AND status IN ('new','publishing','published')) OR (? = 0 AND customer_id=?))
+                   ORDER BY id DESC LIMIT 9"""
+        async with db.execute(query, (before, admin, admin, user_id)) as cursor:
+            leads = await cursor.fetchall()
+    prefix = "admin" if admin else "list"
+    rows = [[lead_key(f"№{number} · {equipment} · {LEAD_STATUS.get(status, status)}", f"open:{number}")]
+            for number, equipment, status in leads[:8]]
+    if len(leads) > 8:
+        rows.append([lead_key("Ещё заявки", f"{prefix}:{leads[7][0]}")])
+    if before != 2**63 - 1:
+        rows.append([lead_key("К началу списка", f"{prefix}:0")])
+    await message.answer("Заявки для модерации и опубликованные" if admin else "Ваши заявки",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+    if not leads:
+        await message.answer("Заявок пока нет.")
+
+
 @router.message(F.text == MY_LEADS)
 async def my_leads(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
-    async with aiosqlite.connect(storage.DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, equipment, status FROM leads WHERE customer_id=? ORDER BY id DESC LIMIT 10",
-            (message.from_user.id,),
-        ) as cursor:
-            leads = await cursor.fetchall()
-    statuses = {"new": "на проверке", "publishing": "публикуется", "published": "опубликована",
-                "rejected": "отклонена"}
-    lines = [f"№{lead_id} · {equipment} · {statuses.get(status, status)}" for lead_id, equipment, status in leads]
-    await message.answer("Ваши последние заявки:\n" + "\n".join(lines) if lines else "У вас пока нет заявок.")
+    await list_customer_leads(message, message.from_user.id)
 
 
-@router.message(F.text.in_({AVAILABLE_LEADS, "🚜 Смотреть заявки"}))
+@router.message(F.text.in_({AVAILABLE_LEADS, "🔎 Смотреть заявки", "🚜 Смотреть заявки"}))
 async def available_leads(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
+    await show_matching_leads(message, message.from_user.id)
+
+
+async def show_matching_leads(message, user_id, before=2**63 - 1):
     async with aiosqlite.connect(storage.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await provider_registry.register_area_key(db)
+        predicate = provider_registry.equipment_match("r.category", "r.region", "r.area")
         async with db.execute(
-            """SELECT id, equipment, place, work_date FROM leads WHERE status='published'
-               ORDER BY id DESC LIMIT 10"""
+            f"""SELECT l.*, r.category, r.region, r.area, p2.method AS payment_method,
+                      d.equipment_name, d.map_link, d.schedule FROM leads l
+               JOIN lead_routing r ON r.lead_id=l.id
+               LEFT JOIN lead_work_details d ON d.lead_id=l.id
+               LEFT JOIN lead_payment_preferences p2 ON p2.lead_id=l.id
+               WHERE l.status='published' AND l.id<? AND EXISTS (
+                   SELECT 1 FROM provider_profiles p JOIN provider_equipment e ON e.provider_id=p.telegram_id
+                   WHERE p.telegram_id=? AND p.blocked=0 AND e.active=1
+                   AND {predicate}
+               ) ORDER BY l.id DESC LIMIT 9""",
+            (before, user_id),
         ) as cursor:
             leads = await cursor.fetchall()
+    for lead in leads[:8]:
+        await message.answer(lead_text(lead), reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[respond_button(lead["id"])]],
+        ))
+    if len(leads) > 8:
+        await message.answer("Другие подходящие заявки", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[lead_key("Следующая страница", f"match:{leads[7]['id']}")]],
+        ))
     if not leads:
-        await message.answer("Опубликованных заявок пока нет.")
+        await message.answer("Подходящих заявок пока нет. Все опубликованные заявки доступны в канале.")
+
+
+@router.callback_query(F.data.startswith("lc:"))
+async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    parts = callback.data.split(":")
+    if len(parts) not in (3, 4) or not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        await callback.answer("Карточка недоступна.")
         return
-    for lead_id, equipment, place, date in leads:
+    _, action, value = parts[:3]
+    lead_id = storage.parse_id("lead_" + value, "lead_")
+    user_id = callback.from_user.id
+    admin = is_admin(user_id)
+    message = callback.message
+    if message.chat.id != user_id:
+        await callback.answer("Карточка недоступна.")
+        return
+    if action in {"admin", "list", "match", "myoffers"} and (lead_id or value == "0"):
+        if action == "admin" and not admin:
+            await callback.answer("Нет доступа.")
+            return
+        await callback.answer()
+        if action == "myoffers":
+            await show_my_offers(message, user_id, lead_id or 2**63 - 1)
+        elif action == "match":
+            await show_matching_leads(message, user_id, lead_id or 2**63 - 1)
+        else:
+            await list_customer_leads(message, user_id, lead_id or 2**63 - 1, action == "admin")
+        return
+    lead = await get_lead(lead_id) if lead_id else None
+    if not lead or (user_id != lead["customer_id"] and not admin):
+        await callback.answer("Заявка недоступна.")
+        return
+    owner = user_id == lead["customer_id"]
+    await callback.answer()
+    if action == "open":
+        await show_customer_lead(message, lead, owner, admin)
+    elif action == "offers" and owner:
+        before = storage.parse_id(parts[3], "") if len(parts) == 4 else 2**63 - 1
+        if before:
+            await show_customer_offers(message, lead, before)
+    elif action == "pick" and owner and len(parts) == 4:
+        offer_id = storage.parse_id(parts[3], "")
+        if offer_id and await lead_journey.change_lifecycle(storage.DB_PATH, lead_id, user_id, offer_id=offer_id):
+            await message.answer(f"Исполнитель по заявке №{lead_id} выбран.")
+        else:
+            await message.answer("Выбор недоступен или исполнитель уже выбран.")
+    elif action == "close" and lead["status"] == "published":
+        await pause_form(message, state)
+        await state.set_state(CloseLead.reason)
+        await state.update_data(closing_lead=lead_id)
+        await message.answer("Укажите причину закрытия заявки.",
+                             reply_markup=section_keyboard((OFFER_HOME,)))
+    elif action == "repeat" and owner:
+        if form_kind(await state.get_state()) == "lead" or await draft_slot(state, "lead").get_state():
+            await message.answer("Сначала завершите или отмените текущий черновик заявки.")
+            return
+        await pause_form(message, state)
+        data = {key: lead[key] for key in (
+            "equipment", "equipment_name", "region", "area", "place", "map_link", "work_date",
+            "schedule", "details", "payment_method", "phone",
+        )}
+        step = LeadForm.review if data["region"] and data["area"] else LeadForm.region
+        await show_lead_step(message, state, step, **data, draft_id=uuid4().hex)
+
+
+async def show_customer_lead(message, lead, owner, admin):
+    lead_id = lead["id"]
+    status = lead["status"]
+    rows = []
+    if owner:
+        rows.append([lead_key("Отклики", f"offers:{lead_id}"), lead_key("Повторить заявку", f"repeat:{lead_id}")])
+    if status == "published":
+        rows.append([lead_key("Закрыть заявку", f"close:{lead_id}")])
+    if admin and status == "new":
+        rows.append([InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
+                     InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}")])
+    rows.append([lead_key("К заявкам", "list:0" if owner else "admin:0")])
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        async with db.execute("SELECT reason FROM lead_lifecycle_events WHERE lead_id=? AND action='closed'",
+                              (lead_id,)) as cursor:
+            closing = await cursor.fetchone()
+    closing_text = f"\nПричина закрытия: {closing[0]}" if closing else ""
+    await message.answer(f"{lead_text(lead, True)}\nСтатус: {LEAD_STATUS.get(status, status)}{closing_text}",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def show_customer_offers(message, lead, before):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT o.*, e.offer_id AS selected FROM offers o LEFT JOIN lead_lifecycle_events e
+               ON e.lead_id=o.lead_id AND e.action='selected'
+               WHERE o.lead_id=? AND o.id<? ORDER BY o.id DESC LIMIT 9""", (lead["id"], before),
+        ) as cursor:
+            offers = await cursor.fetchall()
+    for offer in offers[:8]:
+        buttons = [[InlineKeyboardButton(text="📞 Показать номер", callback_data=f"offer_call:{offer['id']}")]]
+        if offer["selected"] is None and lead["status"] == "published":
+            buttons.append([lead_key("Выбрать исполнителя", f"pick:{lead['id']}:{offer['id']}")])
         await message.answer(
-            f"Заявка №{lead_id} · {equipment}\n{place} · {date}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead_id)]]),
+            f"{offer['provider_name']} · {offer['price']}\n{offer['comment'] or 'Без комментария'}"
+            + ("\n✅ Исполнитель выбран" if offer["selected"] == offer["id"] else ""),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
+    buttons = [[lead_key("К карточке заявки", f"open:{lead['id']}")]]
+    if len(offers) > 8:
+        buttons.insert(0, [lead_key("Ещё отклики", f"offers:{lead['id']}:{offers[7]['id']}")])
+    await message.answer("Отклики по заявке" if offers else "Откликов пока нет.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.message(CloseLead.reason)
+async def close_lead_reason(message: Message, state: FSMContext):
+    if not await valid_input(message, 500):
+        return
+    lead_id = (await state.get_data()).get("closing_lead")
+    user_id = message.from_user.id
+    changed = await lead_journey.change_lifecycle(
+        storage.DB_PATH, lead_id, user_id, admin=is_admin(user_id), reason=message.text.strip(),
+    )
+    await state.clear()
+    await message.answer(
+        f"Заявка №{lead_id} закрыта. Причина сохранена." if changed else "Заявка недоступна или уже закрыта.",
+        reply_markup=main_menu(is_admin(user_id)),
+    )
 
 
 @router.message(F.text == MY_OFFERS)
 async def my_offers(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
+    await show_my_offers(message, message.from_user.id)
+
+
+async def show_my_offers(message, user_id, before=2**63 - 1):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
-            "SELECT lead_id, price, comment, delivery_status FROM offers WHERE provider_id=? ORDER BY id DESC LIMIT 10",
-            (message.from_user.id,),
+            """SELECT o.id, o.lead_id, o.price, o.comment, o.delivery_status,
+                      CASE WHEN e.offer_id=o.id THEN 'Выбран' WHEN l.status='closed' THEN 'Заявка закрыта'
+                      ELSE 'Подан' END AS outcome
+               FROM offers o JOIN leads l ON l.id=o.lead_id
+               LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected'
+               WHERE o.provider_id=? AND o.id<? ORDER BY o.id DESC LIMIT 9""",
+            (user_id, before),
         ) as cursor:
             offers = await cursor.fetchall()
     statuses = {"sent": "отправлен", "pending": "доставка ожидается", "unconfirmed": "доставка не подтверждена"}
     if not offers:
         await message.answer("У вас пока нет откликов.")
         return
-    for lead_id, price, comment, status in offers:
+    for _, lead_id, price, comment, status, outcome in offers[:8]:
         await message.answer(
             f"Отклик на заявку №{lead_id}\nСтоимость: {price}\nУсловия: {comment or 'не указаны'}"
-            f"\nСтатус: {statuses.get(status, status)}"
+            f"\nСтатус: {outcome}\nДоставка: {statuses.get(status, status)}"
         )
+
+
+    if len(offers) > 8:
+        await message.answer("История откликов", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[lead_key("Ещё отклики", f"myoffers:{offers[7][0]}")]],
+        ))
 
 
 @router.message(F.text == "📝 Оставить заявку")
@@ -671,9 +950,37 @@ async def lead_start(message: Message, state: FSMContext) -> None:
         await show_lead_step(message, state, LeadForm.equipment, **draft_fields)
 
 
+def lead_options(step, data):
+    if step == LeadForm.equipment:
+        return tuple(name for name, _ in equipment_catalog.GROUPS)
+    if step == LeadForm.equipment_type:
+        return equipment_catalog.GROUPS[data["equipment_group"]][1] if "equipment_group" in data else ()
+    return LEAD_CHOICES[step][0] if step in LEAD_CHOICES else ()
+
+
+async def advance_lead(message, state, next_step, **fields):
+    data = await state.get_data()
+    if data.get("lead_editing"):
+        editing_equipment = data["lead_editing"] == LeadForm.equipment.state
+        if not editing_equipment or next_step == LeadForm.region:
+            next_step = LeadForm.review
+            fields["lead_editing"] = None
+    await show_lead_step(message, state, next_step, **fields)
+
+
 async def apply_lead_choice(message: Message, state: FSMContext, step: State, choice: str) -> None:
+    if step == LeadForm.equipment:
+        await show_lead_step(message, state, LeadForm.equipment_type, equipment_group=lead_options(step, {}).index(choice))
+        return
+    if step == LeadForm.equipment_type:
+        next_step = LeadForm.equipment_other if choice == equipment_catalog.OTHER else LeadForm.region
+        if next_step == LeadForm.equipment_other:
+            await show_lead_step(message, state, next_step)
+        else:
+            await advance_lead(message, state, next_step, equipment=choice, equipment_name="")
+        return
     _, field, next_step = LEAD_CHOICES[step]
-    await show_lead_step(message, state, next_step, **{field: choice})
+    await advance_lead(message, state, next_step, **{field: choice})
 
 
 @router.callback_query(F.data.startswith("lead_step:"))
@@ -682,15 +989,15 @@ async def lead_choice(callback: CallbackQuery, state: FSMContext) -> None:
     suffix = callback.data.removeprefix("lead_step:")
     data = await state.get_data()
     if (
-        step not in LEAD_CHOICES or not isinstance(callback.message, Message)
+        not lead_options(step, data) or not isinstance(callback.message, Message)
         or callback.message.message_id != data.get("form_keyboard_id")
         or not re.fullmatch(r"[0-9]{1,3}", suffix)
-        or int(suffix) >= len(LEAD_CHOICES[step][0])
+        or int(suffix) >= len(lead_options(step, data))
     ):
         await callback.answer("Этот шаг уже неактуален.")
         return
     await callback.answer()
-    await apply_lead_choice(callback.message, state, step, LEAD_CHOICES[step][0][int(suffix)])
+    await apply_lead_choice(callback.message, state, step, lead_options(step, data)[int(suffix)])
 
 
 @router.message(LeadForm.equipment)
@@ -698,7 +1005,17 @@ async def lead_equipment(message: Message, state: FSMContext) -> None:
     if message.text not in provider_registry.CATEGORIES:
         await message.answer("Выберите категорию техники кнопкой из списка или введите /menu.")
         return
-    await apply_lead_choice(message, state, LeadForm.equipment, message.text)
+    if message.text == equipment_catalog.OTHER:
+        await show_lead_step(message, state, LeadForm.equipment_other)
+    else:
+        await advance_lead(message, state, LeadForm.region, equipment=message.text, equipment_name="")
+
+
+@router.message(LeadForm.equipment_other)
+async def lead_equipment_other(message: Message, state: FSMContext) -> None:
+    if await valid_input(message, 120):
+        await advance_lead(message, state, LeadForm.region, equipment=equipment_catalog.OTHER,
+                           equipment_name=message.text.strip())
 
 
 @router.message(LeadForm.region)
@@ -713,21 +1030,50 @@ async def lead_region(message: Message, state: FSMContext) -> None:
 async def lead_area(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 120):
         return
-    await show_lead_step(message, state, LeadForm.place, area=message.text.strip())
+    await advance_lead(message, state, LeadForm.place, area=message.text.strip())
 
 
 @router.message(LeadForm.place)
 async def lead_place(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 300, phone=False):
         return
-    await show_lead_step(message, state, LeadForm.date, place=message.text)
+    await advance_lead(message, state, LeadForm.map_link, place=message.text)
 
 
 @router.message(LeadForm.date)
 async def lead_date(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
-    await show_lead_step(message, state, LeadForm.details, work_date=message.text)
+    await advance_lead(message, state, LeadForm.schedule, work_date=message.text)
+
+
+@router.message(LeadForm.map_link)
+async def lead_map_link(message: Message, state: FSMContext) -> None:
+    value = message.text or ""
+    if not re.fullmatch(r"https://[a-zA-Z0-9.-]+(?:[/?#][^\s]*)?", value) or len(value) > 500:
+        await message.answer("Нужна HTTPS-ссылка на карту. Без ссылки нажмите «Пропустить».")
+        return
+    await advance_lead(message, state, LeadForm.date, map_link=value)
+
+
+@router.message(LeadForm.schedule)
+async def lead_schedule(message: Message, state: FSMContext) -> None:
+    if await valid_input(message, 160):
+        await advance_lead(message, state, LeadForm.details, schedule=message.text.strip())
+
+
+@router.callback_query(F.data == "lead_optional_skip")
+async def skip_lead_optional(callback: CallbackQuery, state: FSMContext) -> None:
+    step = FORM_STEPS.get(await state.get_state())
+    data = await state.get_data()
+    if step not in (LeadForm.map_link, LeadForm.schedule) or not is_form_panel(callback, data):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    await callback.answer()
+    if step == LeadForm.map_link:
+        await advance_lead(callback.message, state, LeadForm.date, map_link="")
+    else:
+        await advance_lead(callback.message, state, LeadForm.details, schedule="")
 
 
 @router.callback_query(F.data == "lead_skip_details")
@@ -739,14 +1085,14 @@ async def skip_lead_details(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Этот шаг уже неактуален.")
         return
     await callback.answer()
-    await show_lead_step(callback.message, state, LeadForm.payment, details="")
+    await advance_lead(callback.message, state, LeadForm.payment, details="")
 
 
 @router.message(LeadForm.details)
 async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
-    await show_lead_step(message, state, LeadForm.payment, details=message.text)
+    await advance_lead(message, state, LeadForm.payment, details=message.text)
 
 
 @router.message(LeadForm.payment)
@@ -773,29 +1119,79 @@ async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[
              data["details"], phone, datetime.now(timezone.utc).isoformat()),
         )
         lead_id = cursor.lastrowid
-        await payment_preferences.write_lead(db, lead_id, data.get("payment_method", payment_preferences.ANY))
+        await payment_preferences.write_lead(db, lead_id, data.get("payment_method") or payment_preferences.ANY)
         await lead_routing.write_lead(db, lead_id, data["equipment"], data["region"], data["area"])
+        await lead_journey.write_details(db, lead_id, data, getattr(customer, "username", None))
+        await lead_journey.record_event(db, lead_id, "submitted", actor_id=customer.id)
         if draft_id:
             await db.execute("INSERT INTO lead_draft_submissions VALUES (?,?)", (draft_id, lead_id))
         await db.commit()
         return lead_id, True
 
 
+LEAD_EDIT_FIELDS = {
+    LeadForm.equipment: "Техника", LeadForm.region: "Регион", LeadForm.area: "Район",
+    LeadForm.place: "Адрес", LeadForm.map_link: "Ссылка на карту", LeadForm.date: "Дата и время",
+    LeadForm.schedule: "График смен", LeadForm.details: "Описание",
+    LeadForm.payment: "Оплата", LeadForm.phone: "Телефон",
+}
+
+
+def lead_review_text(data):
+    fields = ("equipment_name", "region", "area", "place", "map_link", "work_date", "schedule", "details",
+              "payment_method", "phone")
+    lines = []
+    for label, field in zip(LEAD_EDIT_FIELDS.values(), fields):
+        value = data.get(field) or (data.get("equipment") if field == "equipment_name" else None)
+        lines.append(f"{label}: {value or 'не указано'}")
+    return "📋 Предпросмотр заявки\n\n" + "\n".join(lines)
+
+
+def is_form_panel(callback, data):
+    return isinstance(callback.message, Message) and callback.message.message_id == data.get("form_keyboard_id")
+
+
 @router.message(LeadForm.phone)
 async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not await valid_input(message, 32, phone=True):
+    try:
+        phone = provider_registry._validate_phone(message.text)
+    except ValueError as exc:
+        await message.answer(str(exc))
         return
+    await advance_lead(message, state, LeadForm.review, phone=phone)
+
+
+@router.callback_query(F.data.startswith("lead_review:"))
+async def lead_review_action(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
-    lead_id, created = await save_lead_from_draft(message.from_user, message.text, data)
+    step = FORM_STEPS.get(await state.get_state())
+    if step not in (LeadForm.review, LeadForm.edit) or not is_form_panel(callback, data):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    action = callback.data.removeprefix("lead_review:")
+    await callback.answer()
+    if step == LeadForm.review and action == "edit":
+        await show_lead_step(callback.message, state, LeadForm.edit)
+    elif step == LeadForm.review and action == "send":
+        await submit_lead(callback.message, callback.from_user, state, bot, data)
+    elif step == LeadForm.edit and action.isascii() and action.isdecimal() and len(action) <= 2:
+        fields = tuple(LEAD_EDIT_FIELDS)
+        if int(action) < len(fields):
+            field = fields[int(action)]
+            await show_lead_step(callback.message, state, field, lead_editing=field.state)
+
+
+async def submit_lead(message, customer, state, bot, data):
+    lead_id, created = await save_lead_from_draft(customer, data["phone"], data)
     if not created:
         await clear_form_keyboard(message, state)
         await state.clear()
-        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu(is_admin(message.from_user.id)))
+        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu(is_admin(customer.id)))
         return
     lead = await get_lead(lead_id)
     # Shadow evaluation only: never changes the manual approval workflow.
     shadow = await lead_shadow_review.evaluate(
-        message.from_user.id, equipment=data["equipment"],
+        customer.id, equipment=data["equipment"],
         region=data["region"], area=data["area"], place=data["place"],
         work_date=data["work_date"], details=data["details"],
         db_path=storage.DB_PATH, enabled=False, exclude_lead_id=lead_id,
@@ -809,7 +1205,7 @@ async def lead_phone(message: Message, state: FSMContext, bot: Bot) -> None:
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
     await clear_form_keyboard(message, state)
     await state.clear()
-    await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu(is_admin(message.from_user.id)))
+    await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu(is_admin(customer.id)))
 
 
 @router.message(F.text == LEGACY_PROVIDER)
@@ -1070,9 +1466,12 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
     for provider_id in recipients:
         if provider_id not in settings.test_notification_provider_ids:
             continue
-        if not await notification_reservations.reserve(lead["id"], provider_id, storage.DB_PATH):
+        still_eligible = await provider_dispatch.recipients_for_lead(**routing, db_path=storage.DB_PATH)
+        if provider_id not in still_eligible or not await notification_reservations.reserve(
+            lead["id"], provider_id, storage.DB_PATH,
+        ):
             continue
-        delivered = await notify(bot, provider_id, text,
+        delivered = await notify(bot, provider_id, public_text(text),
                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead["id"])]]))
         await notification_reservations.record_outcome(
             lead["id"], provider_id, "confirmed" if delivered else "uncertain", storage.DB_PATH,
@@ -1108,6 +1507,7 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
         return
     await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
     await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
+    await notify(bot, lead["customer_id"], f"Ваша заявка №{lead_id} опубликована.")
     await notify_test_providers(bot, lead)
     if callback.message:
         try:

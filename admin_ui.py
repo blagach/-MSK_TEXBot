@@ -5,6 +5,7 @@ from aiogram import F, Router
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import admin_reports as reports
+import support_storage
 
 router = Router()
 router.callback_query.filter(F.message.chat.type == "private")
@@ -22,10 +23,12 @@ HOME = (("⬅️ В админ-панель", "admin:home"),)
 
 
 async def menu(message):
+    totals = await support_storage.counts()
     await message.answer("Админ-панель", reply_markup=keyboard(
         (("👥 Пользователи", "admin:users"), ("🚜 Исполнители и техника", "admin:equipment:0")),
         (("📋 Заявки и отклики", "admin:records"), ("📊 Статистика", "admin:stats")),
-        (("📥 Обращения", "help:queue"), ("📎 Выгрузка XLSX", "admin:export")),
+        ((f"📥 Обращения · {totals.get('new', 0)}", "help:queue"), ("📎 Выгрузка XLSX", "admin:export")),
+        (("📝 Модерация заявок", "lc:admin:0"),),
     ))
 
 
@@ -64,24 +67,15 @@ async def admin_action(callback: CallbackQuery, support_admin_ids):
     elif action == "stats":
         result = await reports.registration_stats()
         lines = [
-            f"{period} · регистраций исполнителей {row['providers']}, первых заявок {row['customers']}"
+            f"{period} · регистраций {row['providers']}, первых заявок {row['customers']}, "
+            f"создано {row['created']}, опубликовано {row['published']}, откликов {row['offers']}"
             for period, row in zip(("День", "Неделя", "Месяц"), result)
         ]
-        await message.answer("Календарные периоды по Москве\n\n" + "\n".join(lines), reply_markup=keyboard(HOME))
+        await message.answer("Календарные периоды по Москве. Публикации учитываются с момента включения журнала.\n\n" + "\n".join(lines), reply_markup=keyboard(HOME))
     elif action == "export":
-        document = BufferedInputFile(await reports.export_xlsx(), filename="msk-texbot-users-equipment.xlsx")
-        await message.answer_document(document, caption="Пользователи и зарегистрированная техника.", reply_markup=keyboard(HOME))
+        document = BufferedInputFile(await reports.export_xlsx(), filename="msk-texbot-admin.xlsx")
+        await message.answer_document(document, caption="Служебная выгрузка MSK TEXBot.", reply_markup=keyboard(HOME))
     elif re.fullmatch(r"equipment:[0-9]{1,7}", action):
-        offset = int(action.split(":")[1])
-        if offset % 8:
-            return
-        items = await reports.equipment_page(offset)
-        lines = [f"{r['equipment_id']} · {r['category'][:80]} · {r['location'][:120]}\n"
-                 f"{(r['owner'] or 'Имя не указано')[:80]} · {r['status']}" for r in items[:8]]
-        navigation = []
-        if offset:
-            navigation.append(("⬅️ Предыдущие", f"admin:equipment:{offset-8}"))
-        if len(items) > 8:
-            navigation.append(("Следующие ➡️", f"admin:equipment:{offset+8}"))
-        markup = keyboard(tuple(navigation), HOME) if navigation else keyboard(HOME)
-        await message.answer("Исполнители и техника\n\n" + "\n\n".join(lines) if lines else "Нет записей.", reply_markup=markup)
+        totals = await reports.equipment_totals()
+        await message.answer(f"Исполнители · {totals['providers']}\nЕдиницы техники · {totals['units']}",
+                             reply_markup=keyboard(HOME))

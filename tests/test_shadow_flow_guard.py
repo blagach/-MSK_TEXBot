@@ -31,7 +31,8 @@ class ShadowFlowGuardTests(unittest.IsolatedAsyncioTestCase):
             cm = AsyncMock()
             cm.__aenter__.return_value = db
             connect.return_value = cm
-            await bot.lead_phone(message,state,fake_bot)
+            await bot.submit_lead(message, message.from_user, state, fake_bot,
+                                  {**await state.get_data(), "phone": message.text})
             self.assertFalse(shadow.await_args.kwargs["enabled"])
             self.assertEqual(shadow.await_args.kwargs["exclude_lead_id"],1)
             self.assertTrue(all(c.args[0] in bot.settings.admin_ids

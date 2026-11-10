@@ -98,8 +98,21 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         callback.data = f"lead_step:{index}"
         await bot.lead_choice(callback, self.state)
 
+    async def submit_lead_review(self):
+        prompt = (await self.state.get_data())["form_keyboard_id"]
+        callback = self.step("send", prompt)
+        callback.data = "lead_review:send"
+        await bot.lead_review_action(callback, self.state, self.telegram)
+
+    async def skip_lead_optional(self):
+        prompt = (await self.state.get_data())["form_keyboard_id"]
+        callback = self.step("skip", prompt)
+        await bot.skip_lead_optional(callback, self.state)
+
     async def test_lead_recovers_all_steps_and_keeps_values_in_main_menu(self):
         await bot.lead_start(self.message, self.state)
+        await self.recover_current_step()
+        await self.pick_lead_option(0)
         await self.recover_current_step()
         await self.pick_lead_option(0)
         await self.recover_current_step()
@@ -118,6 +131,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         ):
             self.message.text = value
             await handler(self.message, self.state)
+            if handler in (bot.lead_place, bot.lead_date):
+                await self.skip_lead_optional()
             await self.recover_current_step()
         await self.pick_lead_option(0)
         await self.recover_current_step()
@@ -135,6 +150,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.state.get_data())["payment_method"], bot.payment_preferences.CASH)
         self.message.text = "+79990000001"
         await bot.lead_phone(self.message, self.state, self.telegram)
+        await self.submit_lead_review()
         async with aiosqlite.connect(storage.DB_PATH) as db:
             rows = await (await db.execute("SELECT place, work_date, details FROM leads WHERE customer_id=20")).fetchall()
         self.assertEqual(rows, [("улица Свободы", "завтра в 9", "Работа на смену")])
@@ -180,6 +196,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.saved_offers(), [("5000", "", "+79990000003")])
 
         await bot.lead_start(self.message, self.state)
+        await self.pick_lead_option(0)
         await self.pick_lead_option(0)
         await self.pick_lead_option(0)
         original_draft_id = (await self.state.get_data())["draft_id"]
@@ -235,6 +252,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.lead_start(self.message, self.state)
         await self.pick_lead_option(0)
         await self.pick_lead_option(0)
+        await self.pick_lead_option(0)
         for handler, value in (
             (bot.lead_area, "СЗАО"),
             (bot.lead_place, "улица Свободы"),
@@ -243,6 +261,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         ):
             self.message.text = value
             await handler(self.message, self.state)
+            if handler in (bot.lead_place, bot.lead_date):
+                await self.skip_lead_optional()
         await self.pick_lead_option(0)
         self.message.text = "+79990000001"
         data = await self.state.get_data()
@@ -252,6 +272,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.state = self.reopen_sqlite_state()
         self.assertEqual(await self.state.get_state(), bot.LeadForm.phone.state)
         await bot.lead_phone(self.message, self.state, self.telegram)
+        await self.submit_lead_review()
         self.telegram.send_message.assert_not_awaited()
         self.assertIn(f"Заявка №{lead_id} уже сохранена", self.message.answer.await_args.args[0])
         async with aiosqlite.connect(storage.DB_PATH) as db:
@@ -304,7 +325,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         before = await self.state.get_data()
         await bot.start_offer(self.message, self.state, CommandObject(args="lead_11"))
         self.assertIn("уже откликнулись на заявку №11", self.message.answer.await_args.args[0])
-        self.assertEqual(await self.state.get_state(), bot.LeadForm.region.state)
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.equipment_type.state)
         self.assertEqual(await self.state.get_data(), before)
 
     async def test_independent_offers_restore_legacy_and_survive_switch_and_restart(self):
@@ -374,9 +395,12 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.lead_start(self.message, self.state)
         await self.pick_lead_option(0)
         await self.pick_lead_option(0)
+        await self.pick_lead_option(0)
         for handler, value in ((bot.lead_area, "ЦАО"), (bot.lead_place, "Тверская"), (bot.lead_date, "завтра")):
             self.message.text = value
             await handler(self.message, self.state)
+            if handler in (bot.lead_place, bot.lead_date):
+                await self.skip_lead_optional()
         prompt = (await self.state.get_data())["form_keyboard_id"]
         skip = self.step("skip", prompt)
         skip.data = "lead_skip_details"
@@ -384,6 +408,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.pick_lead_option(0)
         self.message.text = "+79990000001"
         await bot.lead_phone(self.message, self.state, self.telegram)
+        await self.submit_lead_review()
         lead_id = 2
         self.assertEqual((await bot.get_lead(lead_id))["details"], "")
         self.telegram.send_message.reset_mock()
@@ -399,7 +424,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.publish_lead(callback, self.telegram)
         self.assertEqual((await bot.get_lead(lead_id))["status"], "published")
-        channel, notification = self.telegram.send_message.await_args_list
+        channel, customer_notice, notification = self.telegram.send_message.await_args_list
+        self.assertIn("опубликована", customer_notice.args[1])
         self.assertIn("Детали: не указаны", channel.args[1])
         self.assertNotIn("https://", notification.args[1])
         self.assertNotIn("Описание:", notification.args[1])
@@ -439,7 +465,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.keyboard_rows(), [
             ["📝 Оставить заявку", "📋 Мои заявки"], ["▶️ Продолжить заявку"], ["🏠 Главное меню"],
         ])
-        self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.region.state)
+        self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.equipment_type.state)
         await bot.executor_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows()[3], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
         self.assertEqual((await bot.draft_slot(self.state, "offer_1").get_data())["price"], "28000")
@@ -448,6 +474,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.keyboard_rows()[3][0], "🔔 Уведомления включены")
         for handler in (bot.provider_ui.my_profile, bot.provider_ui.my_machines, bot.provider_ui.my_payment_methods):
             await handler(self.message, self.state)
+            if handler in (bot.lead_place, bot.lead_date):
+                await self.skip_lead_optional()
             self.assertEqual(self.keyboard_rows()[3], ["🔔 Уведомления включены", "▶️ Продолжить отклик"])
 
     async def test_legacy_registration_remains_accessible_with_compact_menu(self):
@@ -477,7 +505,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
         await bot.executor_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows(), [
-            ["🔎 Смотреть заявки", "📋 Мои отклики"],
+            ["🔎 Подходящие заявки", "📋 Мои отклики"],
             ["👤 Мой профиль", "🚜 Моя техника"],
             ["➕ Добавить технику", "💳 Способ оплаты"],
             ["🔔 Уведомления включены"],

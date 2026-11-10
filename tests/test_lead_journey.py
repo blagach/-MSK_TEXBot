@@ -49,7 +49,8 @@ class LeadJourneyTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def create_lead(self):
-        await bot.lead_phone(self.message, self.state, self.fake_bot)
+        await bot.submit_lead(self.message, self.message.from_user, self.state, self.fake_bot,
+                              {**await self.state.get_data(), "phone": self.message.text})
         async with aiosqlite.connect(storage.DB_PATH) as db:
             row = await (await db.execute("SELECT max(id) FROM leads")).fetchone()
             return row[0]

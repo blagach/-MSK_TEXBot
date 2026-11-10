@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+import lead_journey
+
 DB_PATH = "/var/data/bot.db"
 ALLOWED_TRANSITIONS = {("new", "publishing"), ("publishing", "new"), ("new", "rejected")}
 
@@ -46,6 +48,7 @@ async def init_schema():
             message_id INTEGER NOT NULL
         )""")
         await db.commit()
+    await lead_journey.init_schema(DB_PATH)
 
 
 async def transition(lead_id, expected, target):
@@ -56,6 +59,8 @@ async def transition(lead_id, expected, target):
             "UPDATE leads SET status = ? WHERE id = ? AND status = ?",
             (target, lead_id, expected),
         )
+        if cursor.rowcount == 1 and target == "rejected":
+            await lead_journey.record_event(db, lead_id, "rejected")
         await db.commit()
         return cursor.rowcount == 1
 
@@ -69,6 +74,7 @@ async def finish_publication(lead_id, chat_id, message_id):
         if cursor.rowcount != 1:
             raise ValueError("Lead is not awaiting publication")
         await db.execute("INSERT INTO lead_publications VALUES (?, ?, ?)", (lead_id, chat_id, message_id))
+        await lead_journey.record_event(db, lead_id, "published")
         await db.commit()
 
 
