@@ -147,7 +147,7 @@ async def lead_and_offer_counts():
             SELECT {OFFER_RESULT} AS status, COUNT(*) AS n
             FROM offers o LEFT JOIN leads l ON l.id=o.lead_id
             LEFT JOIN lead_lifecycle_events e ON e.lead_id=o.lead_id AND e.action='selected'
-            GROUP BY status ORDER BY status
+            GROUP BY 1 ORDER BY 1
         """)
     return leads, offers, deliveries, results
 
