@@ -104,12 +104,9 @@ def main() -> None:
     else:
         if args.backup is None or args.sha256 is None or args.backup.is_symlink():
             parser.error("restore-candidate requires --backup and --sha256")
-        with args.backup.open("rb") as backup:
-            if hashlib.file_digest(backup, "sha256").hexdigest() != args.sha256:
-                parser.error("Backup checksum mismatch")
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        destination = database.parent / f"restore-candidate-{timestamp}.sqlite"
-        digest = backup_database(args.backup, destination)
+        destination = restore_candidate(args.backup, args.sha256)
+        with destination.open("rb") as restored:
+            digest = hashlib.file_digest(restored, "sha256").hexdigest()
     print(f"{destination} SHA-256 {digest}")
 
 

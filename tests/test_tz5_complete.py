@@ -1,5 +1,7 @@
 """Integration coverage against an isolated copy of SQLite and fake Telegram actors."""
 import os
+from contextlib import redirect_stdout
+from io import StringIO
 import sqlite3
 import tempfile
 import unittest
@@ -121,3 +123,20 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
             db.execute("UPDATE leads SET details='modified' WHERE id=?", (lead_id,))
         with self.assertRaisesRegex(RuntimeError, "pre-existing rows"):
             render_test_backup.verify_preserved_rows(backup, candidate)
+
+
+    async def test_restore_command_checks_digest_and_compares_rows(self):
+        await self.make_lead()
+        backup, digest = render_test_backup.snapshot(self.path)
+        output = StringIO()
+        argv = ["render_test_backup.py", "restore-candidate", "--backup", str(backup), "--sha256"]
+        with patch("render_test_start.test_database_path", return_value=self.path):
+            with patch("sys.argv", argv + ["0" * 64]):
+                with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                    render_test_backup.main()
+            self.assertEqual(list(backup.parent.glob("restore-candidate-*.sqlite")), [])
+            with patch("sys.argv", argv + [digest]), redirect_stdout(output):
+                render_test_backup.main()
+        candidate = next(backup.parent.glob("restore-candidate-*.sqlite"))
+        self.assertIn(f"{candidate} SHA-256 ", output.getvalue())
+        self.assertGreaterEqual(render_test_backup.verify_preserved_rows(self.path, candidate), 19)
