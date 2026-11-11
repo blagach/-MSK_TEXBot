@@ -3,6 +3,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from uuid import uuid4
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from io import BytesIO
@@ -63,7 +64,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         return message, state
 
     def callback(self, message, data):
-        return Record(message=message, from_user=message.from_user, data=data, answer=AsyncMock())
+        return Record(id=uuid4().hex,message=message, from_user=message.from_user, data=data, answer=AsyncMock())
 
     async def help_action(self, message, state, action, group=None):
         callback = self.callback(message, f"help:{action}")
@@ -1034,6 +1035,30 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         # The original fixture and backup still contain exactly the source rows.
         self.assertGreater(backups.verify_preserved_rows(snap,self.database),20)
         self.telegram.send_message.assert_not_awaited()
+
+    async def test_replayed_export_callback_after_timeout_does_not_resend(self):
+        admin,state=self.actor(1)
+        admin.answer_document.side_effect=TimeoutError()
+        callback=self.callback(admin,'admin:export')
+        await admin_ui.admin_action(callback,self.admins,state,service_owner_id=1)
+        await admin_ui.admin_action(callback,self.admins,state,service_owner_id=1)
+        admin.answer_document.assert_awaited_once()
+        self.assertIn('Повторная отправка не выполнялась',admin.answer.await_args.args[0])
+        history=await admin_access.history(limit=100)
+        self.assertEqual(len([r for r in history if r['action']=='export_requested']),1)
+        self.assertFalse(any(r['action']=='export_sent' for r in history))
+
+    async def test_failed_export_generation_is_not_replayed_after_restart(self):
+        admin,state=self.actor(1)
+        callback=self.callback(admin,'admin:export')
+        with patch.object(admin_reports,'export_xlsx',side_effect=RuntimeError('synthetic failure')) as export:
+            await admin_ui.admin_action(callback,self.admins,state,service_owner_id=1)
+            await admin_access.init_schema()
+            await admin_ui.admin_action(callback,self.admins,state,service_owner_id=1)
+            export.assert_awaited_once()
+        admin.answer_document.assert_not_awaited()
+        history=await admin_access.history(limit=100)
+        self.assertEqual([r['result'] for r in history if r['action']=='export_delivery'],['failed'])
 
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):

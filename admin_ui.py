@@ -103,9 +103,9 @@ def audit_line(row):
                "lead_close": "Закрытие заявки", "support_reply": "Сохранение ответа поддержки",
                "support_delivery": "Отправка ответа поддержки", "user_search": "Поиск пользователей",
                "user_profile": "Просмотр профиля", "user_access": "Изменение доступа",
-               "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX", "export_delivery": "Отправка XLSX"}
+               "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX", "export_requested": "Запрос XLSX", "export_delivery": "Отправка XLSX"}
     results = {"success": "Успешно", "denied": "Запрещено", "conflict": "Конфликт версий",
-               "not_changed": "Без изменения", "saved": "Сохранено в истории",
+               "not_changed": "Без изменения", "accepted": "Запрос принят", "saved": "Сохранено в истории",
                "sent": "Отправку подтвердил Telegram", "failed": "Ошибка отправки",
                "uncertain": "Отправка не подтверждена"}
     text = (f"#{row['id']} · {row['created_at']} (UTC) · пользователь {row['actor_id']}\n"
@@ -117,6 +117,8 @@ def audit_line(row):
         return text
     if isinstance(details,dict) and row["action"]=="user_access" and row["result"]=="success":
         text += f"\n{scope_text(details.get('previous',[]))} → {scope_text(details.get('scopes',[]))}\nПричина: {str(details.get('reason','—'))[:120]}"
+    if isinstance(details,dict) and row["action"]=="export_delivery":
+        text += f"\nЭтап: {details.get('stage','sending')} · причина: {details.get('error_code','—')}"
     if isinstance(details, dict) and row['action'] == "support_delivery":
         text += f"\nID ответа: {details.get('message_id')}"
         if details.get("error_code"):
@@ -606,9 +608,25 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         ]
         await message.answer("Календарные периоды по Москве. Публикации учитываются с момента включения журнала.\n\n" + "\n".join(lines), reply_markup=keyboard(HOME))
     elif action == "export":
-        document = BufferedInputFile(await reports.export_xlsx(), filename="msk-texbot-admin.xlsx")
+        request_id=getattr(callback,"id",None)
+        try:
+            fresh=await admin_access.reserve_export(callback.from_user.id,request_id)
+        except ValueError:
+            await message.answer("Не удалось подтвердить запрос выгрузки. Откройте раздел заново.")
+            return
+        if not fresh:
+            await message.answer("Этот запрос уже обрабатывался. Повторная отправка не выполнялась.",reply_markup=keyboard(HOME))
+            return
+        try:
+            content=await reports.export_xlsx()
+        except Exception as error:
+            await admin_access.record(callback.from_user.id,"export_delivery",result="failed",
+                                      details={"request_id":request_id,"stage":"generation","error_code":type(error).__name__})
+            await message.answer("Не удалось подготовить файл. Повторная отправка не выполнялась.",reply_markup=keyboard(HOME))
+            return
+        document = BufferedInputFile(content, filename="msk-texbot-admin.xlsx")
         if not await admin_access.allowed(callback.from_user.id,"export",support_admin_ids,service_owner_id):
-            await admin_access.record(callback.from_user.id,"admin_denied",result="denied",details={"section":"export","stage":"before_send"})
+            await admin_access.record(callback.from_user.id,"admin_denied",result="denied",details={"section":"export","stage":"before_send","request_id":request_id})
             await message.answer("Право на выгрузку изменилось. Файл не отправлен.")
             return
         try:
@@ -617,11 +635,11 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             from aiogram.exceptions import TelegramBadRequest,TelegramForbiddenError,TelegramNotFound,TelegramRetryAfter
             status="failed" if isinstance(error,(TelegramBadRequest,TelegramForbiddenError,TelegramNotFound,TelegramRetryAfter)) else "uncertain"
             await admin_access.record(callback.from_user.id,"export_delivery",result=status,
-                                      details={"error_code":type(error).__name__})
+                                      details={"error_code":type(error).__name__,"request_id":request_id,"stage":"sending"})
             await message.answer("Отправка файла не подтверждена." if status=="uncertain" else "Файл не отправлен: Telegram отклонил запрос.",
                                  reply_markup=keyboard(HOME))
             return
-        await admin_access.record(callback.from_user.id, "export_sent")
+        await admin_access.record(callback.from_user.id, "export_sent",details={"request_id":request_id})
     elif re.fullmatch(r"equipment:[0-9]{1,7}", action):
         totals = await reports.equipment_totals()
         await message.answer(f"Зарегистрированные исполнители · {totals['providers']}\nЕдиницы техники · {totals['units']}",

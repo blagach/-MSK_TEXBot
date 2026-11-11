@@ -187,3 +187,22 @@ async def administrator_page(legacy_admins, owner_id=None, *, after=0, limit=10)
         for (user_id,) in candidates:
             result.append({"id": user_id, **await role_snapshot_in(db, user_id, legacy_admins, owner_id)})
         return result
+
+
+async def reserve_export(actor_id, request_id):
+    """Claim a Telegram callback once using the existing append-only audit."""
+    if not isinstance(request_id,str) or not 1 <= len(request_id) <= 200:
+        raise ValueError('Invalid export callback ID')
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        await db.execute('BEGIN IMMEDIATE')
+        previous=await (await db.execute(
+            "SELECT id FROM admin_action_log WHERE actor_id=? AND action='export_requested' AND "
+            "CASE WHEN json_valid(details) THEN json_extract(details,'$.request_id') END=? LIMIT 1",
+            (actor_id,request_id),
+        )).fetchone()
+        if previous:
+            return False
+        await db.execute('INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at) VALUES (?,?,?,?,?,?)',
+                         (actor_id,'export_requested',None,'accepted',json.dumps({'request_id':request_id}),now()))
+        await db.commit()
+        return True

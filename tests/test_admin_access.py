@@ -103,3 +103,14 @@ class AdminAccessTests(unittest.IsolatedAsyncioTestCase):
         second = await access.administrator_page({1, 2}, 1, after=2)
         self.assertEqual([(r["id"], r["role"]) for r in second], [(3, "support")])
         self.assertEqual(len(await access.administrator_page({1, 2}, 1)), 3)
+
+    async def test_one_export_callback_is_claimed_once_under_concurrency(self):
+        before=None
+        with sqlite3.connect(self.path) as db:
+            before=db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+        result=await asyncio.gather(access.reserve_export(1,'same-callback'),access.reserve_export(1,'same-callback'))
+        self.assertEqual(sorted(result),[False,True])
+        self.assertTrue(await access.reserve_export(2,'same-callback'))
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall(),before)
+            self.assertEqual(db.execute('SELECT * FROM leads').fetchall(),[(11,'published')])
