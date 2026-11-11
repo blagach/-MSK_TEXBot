@@ -883,6 +883,31 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await bot.lead_card_action(self.callback(owner,'lc:open:3:a-new-0'),state,self.telegram)
         self.assertEqual([r['id'] for r in await admin_reports.administrator_leads(1,'new')],[1])
 
+    async def test_export_checks_permission_again_after_generation(self):
+        staff,state=self.actor(2)
+        original=admin_reports.export_xlsx
+        async def generate_then_revoke():
+            result=await original()
+            await admin_access.assign_role(1,2,"none","revoke-export",owner_id=1)
+            return result
+        with patch.object(admin_reports,"export_xlsx",side_effect=generate_then_revoke):
+            await admin_ui.admin_action(self.callback(staff,"admin:export"),self.admins,state,service_owner_id=1)
+        staff.answer_document.assert_not_awaited()
+        self.assertIn("Файл не отправлен",staff.answer.await_args.args[0])
+        audit=await admin_access.history(limit=50)
+        self.assertFalse(any(r["action"]=="export_sent" for r in audit))
+        self.assertTrue(any(r["action"]=="admin_denied" for r in audit))
+
+    async def test_export_timeout_is_not_logged_as_sent_or_automatically_retried(self):
+        owner,state=self.actor(1)
+        owner.answer_document.side_effect=TimeoutError()
+        await admin_ui.admin_action(self.callback(owner,"admin:export"),self.admins,state,service_owner_id=1)
+        owner.answer_document.assert_awaited_once()
+        self.assertEqual(owner.answer.await_args.args[0],"Отправка файла не подтверждена.")
+        audit=await admin_access.history(limit=50)
+        self.assertFalse(any(r["action"]=="export_sent" for r in audit))
+        self.assertEqual([r["result"] for r in audit if r["action"]=="export_delivery"],["uncertain"])
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)

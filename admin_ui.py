@@ -99,7 +99,7 @@ def audit_line(row):
                "lead_close": "Закрытие заявки", "support_reply": "Сохранение ответа поддержки",
                "support_delivery": "Отправка ответа поддержки", "user_search": "Поиск пользователей",
                "user_profile": "Просмотр профиля", "user_access": "Изменение доступа",
-               "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX"}
+               "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX", "export_delivery": "Отправка XLSX"}
     results = {"success": "Успешно", "denied": "Запрещено", "conflict": "Конфликт версий",
                "not_changed": "Без изменения", "saved": "Сохранено в истории",
                "sent": "Отправку подтвердил Telegram", "failed": "Ошибка отправки",
@@ -564,7 +564,20 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         await message.answer("Календарные периоды по Москве. Публикации учитываются с момента включения журнала.\n\n" + "\n".join(lines), reply_markup=keyboard(HOME))
     elif action == "export":
         document = BufferedInputFile(await reports.export_xlsx(), filename="msk-texbot-admin.xlsx")
-        await message.answer_document(document, caption="Служебная выгрузка MSK TEXBot.", reply_markup=keyboard(HOME))
+        if not await admin_access.allowed(callback.from_user.id,"export",support_admin_ids,service_owner_id):
+            await admin_access.record(callback.from_user.id,"admin_denied",result="denied",details={"section":"export","stage":"before_send"})
+            await message.answer("Право на выгрузку изменилось. Файл не отправлен.")
+            return
+        try:
+            await message.answer_document(document, caption="Служебная выгрузка MSK TEXBot.", reply_markup=keyboard(HOME))
+        except (TelegramAPIError,TimeoutError) as error:
+            from aiogram.exceptions import TelegramBadRequest,TelegramForbiddenError,TelegramNotFound,TelegramRetryAfter
+            status="failed" if isinstance(error,(TelegramBadRequest,TelegramForbiddenError,TelegramNotFound,TelegramRetryAfter)) else "uncertain"
+            await admin_access.record(callback.from_user.id,"export_delivery",result=status,
+                                      details={"error_code":type(error).__name__})
+            await message.answer("Отправка файла не подтверждена." if status=="uncertain" else "Файл не отправлен: Telegram отклонил запрос.",
+                                 reply_markup=keyboard(HOME))
+            return
         await admin_access.record(callback.from_user.id, "export_sent")
     elif re.fullmatch(r"equipment:[0-9]{1,7}", action):
         totals = await reports.equipment_totals()
