@@ -14,6 +14,7 @@ import admin_reports as reports
 import support_storage
 import admin_access
 import user_access
+import equipment_catalog
 
 router = Router()
 router.callback_query.filter(F.message.chat.type == "private")
@@ -47,7 +48,7 @@ class ManageAdmins(StatesGroup):
 
 
 ROLE_LABELS = {"administrator": "Администратор", "moderator": "Модератор", "support": "Поддержка",
-               "none": "Без административных прав"}
+               "finance": "Финансы", "marketer": "Маркетолог", "none": "Без административных прав"}
 
 
 async def retire_panel(message):
@@ -60,7 +61,7 @@ async def retire_panel(message):
 async def menu(message, user_id=None, admin_ids=(), owner_id=None):
     user_id = message.chat.id if user_id is None else user_id
     permissions = {key: await admin_access.allowed(user_id, key, admin_ids, owner_id)
-                   for key in ("users", "catalog", "moderate", "stats", "support", "export", "roles", "audit")}
+                   for key in ("users", "catalog", "moderate", "stats", "support", "export", "roles", "audit", "finance", "marketing")}
     totals = await support_storage.counts()
     async with reports.read_db() as db:
         counts = (await reports.rows(db, """SELECT
@@ -70,17 +71,24 @@ async def menu(message, user_id=None, admin_ids=(), owner_id=None):
             (SELECT count(*) FROM offers WHERE delivery_status='unconfirmed')
              + (SELECT count(*) FROM support_reply_deliveries WHERE status IN ('failed','uncertain')) AS attention
         """, (user_id,)))[0]
+    users = await reports.user_totals()
+    equipment = await reports.equipment_totals()
+    today = (await reports.registration_stats())[0]
     pairs = [
-        (("👥 Пользователи", "admin:users", "users"), ("🚜 Исполнители и техника", "admin:equipment:0", "catalog")),
-        ((f"📋 Заявки и отклики · активных {counts['active']}", "admin:records", "moderate"),
-         ("📊 Статистика", "admin:stats", "stats")),
-        ((f"📥 Обращения · {totals.get('new', 0)}", "help:queue", "support"), ("📎 Выгрузка XLSX", "admin:export", "export")),
-        ((f"📝 Модерация заявок · новых {counts['pending']}", "lc:admin:0", "moderate"),),
-        ((f"⚙️ Настройки · внимания {counts['attention']}", "admin:settings", "roles"),),
+        ((f"📊 Статистика · +{today['providers']}", "admin:stats", "stats"),
+         (f"📋 Заявки · {counts['active']} / {counts['pending']}", "admin:records", "moderate")),
+        ((f"👥 Пользователи · {users['total']}", "admin:users", "users"),
+         (f"🛟 Поддержка · {totals.get('new',0)}", "help:queue", "support")),
+        ((f"🚜 Каталог техники · {equipment['units']}", "admin:equipment:0", "catalog"),
+         ("💰 Финансы · бесплатно", "admin:finance", "finance")),
+        (("📣 Рассылки · выключены", "admin:marketing", "marketing"),
+         (f"⚙️ Настройки · {counts['attention']}", "admin:settings", "roles")),
     ]
     rows = [tuple((label, callback) for label, callback, permission in pair if permissions[permission]) for pair in pairs]
     rows = [row for row in rows if row]
-    await message.answer("Админ-панель", reply_markup=keyboard(*rows))
+    await message.answer("Админ-панель\nЗаявки: активные / непросмотренные. Поддержка: новые.\n"
+                         "Статистика: регистрации исполнителей сегодня (Москва). Настройки: проблемные доставки.",
+                         reply_markup=keyboard(*rows))
 
 
 def audit_line(row):
@@ -257,12 +265,13 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         return
     action = callback.data.removeprefix("admin:")
     permission = {"home": "panel", "users": "users", "records": "moderate", "stats": "stats",
-                  "export": "export", "settings": "roles", "audit": "audit"}.get(action)
+                  "export": "export", "settings": "roles", "audit": "audit", "finance": "finance",
+                  "marketing": "marketing", "notification_settings": "roles", "service_settings": "roles"}.get(action)
     if action.startswith(("access:", "access_pick:", "access_next:", "access_cancel:", "access_confirm:")):
         permission = "access"
     if action.startswith(("people:", "user:", "users_filter:")) or action == "find":
         permission = "users"
-    if action.startswith("equipment:"):
+    if action.startswith(("equipment:", "catalog:")):
         permission = "catalog"
     if re.fullmatch(r"audit:[1-9][0-9]{0,18}", action):
         permission = "audit"
@@ -285,8 +294,28 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         await menu(message, callback.from_user.id, support_admin_ids, service_owner_id)
     elif action == "settings":
         await message.answer("Настройки", reply_markup=keyboard(
-            (("Администраторы", "admin:admins:0"), ("Журнал действий", "admin:audit")), HOME,
+            (("Администраторы", "admin:admins:0"), ("Уведомления", "admin:notification_settings")),
+            (("Параметры сервиса", "admin:service_settings"), ("Журнал действий", "admin:audit")), HOME,
         ))
+    elif action == "notification_settings":
+        moderation = await admin_access.staff("moderate",support_admin_ids,service_owner_id)
+        support = await admin_access.staff("support",support_admin_ids,service_owner_id)
+        await message.answer(f"Служебные уведомления\nМодерация: получателей {len(moderation)}\n"
+                             f"Поддержка: получателей {len(support)}\n"
+                             "Получатели определяются актуальными правами. Настройки исполнителей сохраняются отдельно.",
+                             reply_markup=keyboard(HOME))
+    elif action == "service_settings":
+        await message.answer("Параметры сервиса\nБесплатный режим. Реальные платежи не подключены.\n"
+                             f"Общий каталог: {len(equipment_catalog.GROUPS)} групп, {len(equipment_catalog.TYPES)} позиций.\n"
+                             "Смена платного режима и отправка рассылок здесь пока недоступны.",reply_markup=keyboard(HOME))
+    elif action == "finance":
+        await message.answer("Финансы\nСервис бесплатный. Реальные платежи не подключены.\n"
+                             "Финансовый учёт, тарифы, платёжная песочница и возвраты ещё требуют реализации; "
+                             "этот экран не принимает оплату и не изменяет доступ пользователей.",reply_markup=keyboard(HOME))
+    elif action == "marketing":
+        await message.answer("Рассылки\nОтправка отключена. Сообщения пользователям не отправляются.\n"
+                             "Кампании, согласия, расписание и подтверждение владельцем требуют отдельной реализации "
+                             "после сверки полного маркетингового ТЗ-6.",reply_markup=keyboard(HOME))
     elif action.startswith("admins:"):
         after = min(int(action.split(":")[1]), 2**63 - 1)
         page = await admin_access.administrator_page(support_admin_ids, service_owner_id, after=after, limit=11)
@@ -374,7 +403,9 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             "Заказчики учитываются по заявкам, исполнители по регистрации или отклику.",
             reply_markup=keyboard((("🔎 Поиск", "admin:find"), ("Все", "admin:users_filter:all")),
                                   (("Заказчики", "admin:users_filter:customers"), ("Исполнители", "admin:users_filter:providers")),
-                                  (("Ограниченные", "admin:users_filter:restricted"),), HOME),
+                                  (("Ограниченные", "admin:users_filter:restricted"),),
+                                  *([(("📎 Выгрузка XLSX", "admin:export"),)] if await admin_access.allowed(
+                                      callback.from_user.id,"export",support_admin_ids,service_owner_id) else []), HOME),
         )
     elif action.startswith("access:") and state is not None:
         target = action.split(":",1)[1]
@@ -500,7 +531,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         await message.answer(
             f"Заявки\n{lead_counts}\n\nОтклики по статусу связанной заявки\n{offer_counts}\n\n"
             f"Результаты откликов\n{outcomes or 'Нет записей'}\n\n"
-            f"Доставка откликов\n{deliveries or 'Нет записей'}", reply_markup=keyboard(HOME),
+            f"Доставка откликов\n{deliveries or 'Нет записей'}",
+            reply_markup=keyboard((("Просмотреть заявки", "lc:admin:0"),), HOME),
         )
     elif action == "stats":
         result = await reports.registration_stats()
@@ -517,4 +549,12 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     elif re.fullmatch(r"equipment:[0-9]{1,7}", action):
         totals = await reports.equipment_totals()
         await message.answer(f"Зарегистрированные исполнители · {totals['providers']}\nЕдиницы техники · {totals['units']}",
-                             reply_markup=keyboard(HOME))
+                             reply_markup=keyboard((("Справочник техники", "admin:catalog:groups"),), HOME))
+    elif action == "catalog:groups":
+        buttons = [(title, f"admin:catalog:{index}") for index,(title,_) in enumerate(equipment_catalog.GROUPS)]
+        await message.answer("Единый каталог заказчика и исполнителя",reply_markup=keyboard(
+            *(tuple(buttons[i:i+2]) for i in range(0,len(buttons),2)),HOME))
+    elif re.fullmatch(r"catalog:[0-9]",action):
+        title,items=equipment_catalog.GROUPS[int(action.split(":")[1])]
+        await message.answer(title+"\n\n"+"\n".join(items),
+                             reply_markup=keyboard((("К категориям", "admin:catalog:groups"),),HOME))

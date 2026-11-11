@@ -106,7 +106,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
 
         async def assert_totals(new, in_progress, closed):
             await admin_ui.admin_action(self.callback(admin, "admin:home"), self.admins)
-            self.assertEqual(buttons(admin)["help:queue"], f"📥 Обращения · {new}")
+            self.assertEqual(buttons(admin)["help:queue"], f"🛟 Поддержка · {new}")
             await self.help_action(admin, admin_state, "home")
             self.assertEqual(len(buttons(admin)), 3)
             self.assertEqual(buttons(admin)["help:resources"], "📖 Как пользоваться сервисом")
@@ -584,15 +584,15 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         other, _ = self.actor(2)
         await admin_ui.menu(owner, 1, self.admins, 1)
         labels = [button.text for row in owner.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
-        self.assertIn("📋 Заявки и отклики · активных 2", labels)
-        self.assertIn("📝 Модерация заявок · новых 2", labels)
+        self.assertIn("📋 Заявки · 2 / 2", labels)
+        self.assertIn("📋 Заявки · 2 / 2", labels)
         await admin_access.mark_lead_view(1, 1)
         await admin_ui.menu(owner, 1, self.admins, 1)
         labels = [button.text for row in owner.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
-        self.assertIn("📝 Модерация заявок · новых 1", labels)
+        self.assertIn("📋 Заявки · 2 / 1", labels)
         await admin_ui.menu(other, 2, self.admins, 1)
         labels = [button.text for row in other.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
-        self.assertIn("📝 Модерация заявок · новых 2", labels)
+        self.assertIn("📋 Заявки · 2 / 2", labels)
         await admin_access.assign_role(1, 2, "support", "support-only", owner_id=1)
         await admin_ui.menu(other, 2, self.admins, 1)
         buttons = [button.callback_data for row in other.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
@@ -794,6 +794,36 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.send_message.assert_not_awaited()
         self.assertEqual((await state.get_data())["equipment"],"автокран")
 
+    async def test_owner_panel_has_eight_sections_in_agreed_order_and_safe_finance_marketing(self):
+        owner,state=self.actor(1)
+        await admin_ui.menu(owner,1,self.admins,1)
+        rows=owner.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual([len(row) for row in rows],[2,2,2,2])
+        self.assertEqual([[b.callback_data for b in row] for row in rows],[
+            ["admin:stats","admin:records"],["admin:users","help:queue"],
+            ["admin:equipment:0","admin:finance"],["admin:marketing","admin:settings"]])
+        for action,expected in (("admin:finance","Реальные платежи не подключены"),("admin:marketing","Отправка отключена")):
+            await admin_ui.admin_action(self.callback(owner,action),self.admins,state,service_owner_id=1)
+            self.assertIn(expected,owner.answer.await_args.args[0])
+        self.telegram.send_message.assert_not_awaited()
+        for role,expected in (("finance","admin:finance"),("marketer","admin:marketing")):
+            await admin_access.assign_role(1,42,role,"role-"+role,owner_id=1)
+            staff,_=self.actor(42)
+            await admin_ui.menu(staff,42,self.admins,1)
+            buttons=[b.callback_data for row in staff.answer.await_args.kwargs["reply_markup"].inline_keyboard for b in row]
+            self.assertEqual(buttons,[expected])
+
+    async def test_admin_catalog_uses_existing_ten_groups_and_43_types_without_changes(self):
+        import equipment_catalog
+        owner,state=self.actor(1)
+        await admin_ui.admin_action(self.callback(owner,"admin:catalog:groups"),self.admins,state,service_owner_id=1)
+        buttons=owner.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual([b.text for row in buttons[:-1] for b in row],[name for name,_ in equipment_catalog.GROUPS])
+        for index,(name,items) in enumerate(equipment_catalog.GROUPS):
+            await admin_ui.admin_action(self.callback(owner,f"admin:catalog:{index}"),self.admins,state,service_owner_id=1)
+            self.assertEqual(owner.answer.await_args.args[0],name+"\n\n"+"\n".join(items))
+        self.assertEqual(sum(len(items) for _,items in equipment_catalog.GROUPS),43)
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)
@@ -923,7 +953,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         admin.answer.assert_awaited_once()
         self.assertEqual(admin.answer.await_args.args[0], "Зарегистрированные исполнители · 2\nЕдиницы техники · 2")
         buttons = admin.answer.await_args.kwargs["reply_markup"].inline_keyboard
-        self.assertEqual([button.callback_data for row in buttons for button in row], ["admin:home"])
+        self.assertEqual([button.callback_data for row in buttons for button in row], ["admin:catalog:groups", "admin:home"])
         self.assertEqual((await admin_reports.user_totals())["providers"], 3)
 
     async def test_report_counts_and_excel_use_existing_records(self):
