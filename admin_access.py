@@ -60,6 +60,23 @@ async def role_in(db, user_id, legacy_admins, owner_id):
     return row[0] if row else ("administrator" if user_id in legacy_admins else "none")
 
 
+class RoleConflict(RuntimeError):
+    """The role was changed after the owner reviewed it."""
+
+
+async def role_snapshot_in(db, user_id, legacy_admins, owner_id):
+    row = await (await db.execute(
+        "SELECT id,role FROM admin_role_events WHERE target_id=? ORDER BY id DESC LIMIT 1", (user_id,),
+    )).fetchone()
+    role = "owner" if user_id == owner_id else (row[1] if row else ("administrator" if user_id in legacy_admins else "none"))
+    return {"role": role, "revision": row[0] if row else 0}
+
+
+async def role_snapshot(user_id, legacy_admins=(), owner_id=None):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        return await role_snapshot_in(db, user_id, legacy_admins, owner_id)
+
+
 async def allowed(user_id, permission, legacy_admins, owner_id=None):
     if permission != "panel" and permission not in ALL_PERMISSIONS:
         return False
@@ -93,7 +110,7 @@ async def record(actor_id, action, *, target_id=None, result="success", details=
         await db.commit()
 
 
-async def assign_role(actor_id, target_id, role, request_id, *, owner_id):
+async def assign_role(actor_id, target_id, role, request_id, *, owner_id, expected_revision=None, legacy_admins=()):
     if owner_id is None or actor_id != owner_id:
         raise PermissionError("Только владелец может назначать права")
     if type(target_id) is not int or target_id <= 0 or target_id == owner_id:
@@ -109,12 +126,25 @@ async def assign_role(actor_id, target_id, role, request_id, *, owner_id):
             if previous != (actor_id, target_id, role):
                 raise ValueError("Повторный запрос содержит другие данные")
             return False
+        previous_role = await role_snapshot_in(db, target_id, legacy_admins, owner_id)
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision != previous_role["revision"]
+        ):
+            await db.execute(
+                "INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at) VALUES (?,?,?,?,?,?)",
+                (actor_id, "role_changed", target_id, "conflict", json.dumps({
+                    "expected_revision": expected_revision, "actual_revision": previous_role["revision"],
+                }), now()),
+            )
+            await db.commit()
+            raise RoleConflict("Права изменились после просмотра. Проверьте текущую роль заново")
         stamp = now()
         await db.execute("INSERT INTO admin_role_events(target_id,role,actor_id,request_id,created_at) VALUES (?,?,?,?,?)",
                          (target_id, role, actor_id, request_id, stamp))
         await db.execute(
             "INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at) VALUES (?,?,?,?,?,?)",
-            (actor_id, "role_changed", target_id, "success", json.dumps({"role": role}), stamp),
+            (actor_id, "role_changed", target_id, "success", json.dumps({"role": role, "previous_role": previous_role["role"],
+                                                  "previous_revision": previous_role["revision"]}), stamp),
         )
         await db.commit()
         return True

@@ -538,6 +538,32 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await state.get_state())
         self.assertFalse(await admin_access.allowed(42, "moderate", self.admins, 1))
 
+    async def test_old_role_confirmation_cannot_override_later_revocation(self):
+        owner, state = self.actor(1)
+        owner.answer.return_value = Record(message_id=500)
+        await admin_ui.admin_action(self.callback(owner, "admin:role:administrator"), self.admins,
+                                    state, service_owner_id=1)
+        owner.text = "2"
+        await admin_ui.admin_target(owner, state, self.admins, service_owner_id=1)
+        nonce = (await state.get_data())["admin_nonce"]
+        self.assertIn("Текущая роль: Администратор", owner.answer.await_args.args[0])
+        await admin_access.assign_role(1, 2, "none", "later-revocation", owner_id=1)
+        owner.message_id = 500
+        await admin_ui.admin_action(self.callback(owner, f"admin:confirm:{nonce}"), self.admins,
+                                    state, service_owner_id=1)
+        self.assertFalse(await admin_access.allowed(2, "export", self.admins, 1))
+        self.assertEqual(await state.get_state(), admin_ui.ManageAdmins.target.state)
+        self.assertIn("Права уже изменились", owner.answer.await_args.args[0])
+
+    async def test_legacy_role_draft_requires_new_review_without_losing_target(self):
+        owner, state = self.actor(1)
+        await state.set_state(admin_ui.ManageAdmins.confirm)
+        await state.set_data({"admin_target": 42, "admin_role": "support", "admin_nonce": "legacy"})
+        await admin_ui.resume_admin_step(owner, state)
+        self.assertEqual(await state.get_state(), admin_ui.ManageAdmins.target.state)
+        self.assertEqual((await state.get_data())["admin_target"], 42)
+        self.assertFalse(await admin_access.allowed(42, "support", self.admins, 1))
+
     async def test_admin_counters_are_personal_and_support_role_sees_only_support(self):
         async with aiosqlite.connect(self.database) as db:
             await db.executemany(

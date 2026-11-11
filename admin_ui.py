@@ -66,10 +66,17 @@ async def resume_admin_step(message, state):
     if await state.get_state() == ManageAdmins.target.state:
         await message.answer("Введите числовой Telegram ID пользователя.", reply_markup=keyboard(HOME))
         return
+    if "admin_expected_revision" not in data:
+        await state.set_state(ManageAdmins.target)
+        await message.answer("Для безопасности проверьте права заново: введите Telegram ID пользователя.",
+                             reply_markup=keyboard(HOME))
+        return
     nonce = uuid4().hex
     await state.update_data(admin_nonce=nonce)
     sent = await message.answer(
-        f"Изменить права пользователя {data['admin_target']}?\nРоль: {ROLE_LABELS[data['admin_role']]}",
+        f"Изменить права пользователя {data['admin_target']}?\n"
+        f"Текущая роль: {ROLE_LABELS.get(data.get('admin_previous_role'), data.get('admin_previous_role', '—'))}\n"
+        f"Новая роль: {ROLE_LABELS[data['admin_role']]}",
         reply_markup=keyboard((("Подтвердить", f"admin:confirm:{nonce}"), ("Отмена", f"admin:role_cancel:{nonce}"))),
     )
     await state.update_data(form_keyboard_id=sent.message_id)
@@ -88,7 +95,9 @@ async def admin_target(message: Message, state: FSMContext, support_admin_ids, s
     if int(message.text) == service_owner_id:
         await message.answer("Роль владельца задаётся конфигурацией и здесь не изменяется.")
         return
-    await state.update_data(admin_target=int(message.text))
+    snapshot = await admin_access.role_snapshot(int(message.text), support_admin_ids, service_owner_id)
+    await state.update_data(admin_target=int(message.text), admin_expected_revision=snapshot["revision"],
+                            admin_previous_role=snapshot["role"])
     await state.set_state(ManageAdmins.confirm)
     await resume_admin_step(message, state)
 
@@ -154,11 +163,31 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
                 or message.message_id != data.get("form_keyboard_id")):
             await message.answer("Этот экран устарел. Откройте назначение прав снова.")
             return
-        await admin_access.assign_role(callback.from_user.id, data["admin_target"], data["admin_role"],
-                                       data["admin_nonce"], owner_id=service_owner_id)
+        if "admin_expected_revision" not in data:
+            await state.set_state(ManageAdmins.target)
+            await message.edit_reply_markup(reply_markup=None)
+            await message.answer("Введите Telegram ID заново для проверки актуальных прав.", reply_markup=keyboard(HOME))
+            return
+        try:
+            changed = await admin_access.assign_role(
+                callback.from_user.id, data["admin_target"], data["admin_role"], data["admin_nonce"],
+                owner_id=service_owner_id, expected_revision=data["admin_expected_revision"],
+                legacy_admins=support_admin_ids,
+            )
+        except admin_access.RoleConflict:
+            await state.set_state(ManageAdmins.target)
+            await message.edit_reply_markup(reply_markup=None)
+            await message.answer("Права уже изменились. Введите Telegram ID заново и проверьте текущую роль.",
+                                 reply_markup=keyboard(HOME))
+            return
         await state.clear()
         await message.edit_reply_markup(reply_markup=None)
-        await message.answer("Права сохранены.", reply_markup=keyboard(HOME))
+        if changed:
+            text = "Права сохранены."
+        else:
+            snapshot = await admin_access.role_snapshot(data["admin_target"], support_admin_ids, service_owner_id)
+            text = f"Изменение уже обработано. Текущая роль: {ROLE_LABELS.get(snapshot['role'], snapshot['role'])}"
+        await message.answer(text, reply_markup=keyboard(HOME))
     elif action == "audit" or action.startswith("audit:"):
         before = min(int(action.split(":")[1]), 2**63 - 1) if ":" in action else 2**63 - 1
         page = await admin_access.history(before, 11)

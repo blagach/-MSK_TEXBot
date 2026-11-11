@@ -73,3 +73,24 @@ class AdminAccessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(backups.verify_preserved_rows(snapshot, restored), 4)
             self.assertFalse(await access.allowed(2, "roles", {1, 2}))
         self.assertEqual(backups.verify_preserved_rows(snapshot, self.path), 4)
+
+    async def test_stale_review_cannot_restore_revoked_rights_and_audit_has_old_role(self):
+        snapshot = await access.role_snapshot(2, {1, 2}, 1)
+        self.assertEqual(snapshot, {"role": "administrator", "revision": 0})
+        await access.assign_role(1, 2, "none", "revoke", owner_id=1, expected_revision=0, legacy_admins={1, 2})
+        with self.assertRaises(access.RoleConflict):
+            await access.assign_role(1, 2, "administrator", "old-review", owner_id=1,
+                                     expected_revision=snapshot["revision"], legacy_admins={1, 2})
+        self.assertFalse(await access.allowed(2, "export", {1, 2}, 1))
+        history = await access.history()
+        self.assertEqual(history[0]["result"], "conflict")
+        self.assertIn('"previous_role": "administrator"', history[1]["details"])
+        self.assertEqual((await access.role_snapshot(2, {1, 2}, 1))["role"], "none")
+
+    async def test_two_distinct_confirmations_of_same_revision_only_change_once(self):
+        results = await asyncio.gather(*(
+            access.assign_role(1, 3, role, request, owner_id=1, expected_revision=0)
+            for role, request in (("support", "first"), ("moderator", "second"))
+        ), return_exceptions=True)
+        self.assertEqual(sum(item is True for item in results), 1)
+        self.assertEqual(sum(isinstance(item, access.RoleConflict) for item in results), 1)
