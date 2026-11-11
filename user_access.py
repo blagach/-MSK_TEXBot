@@ -7,6 +7,10 @@ import storage
 SCOPES = frozenset({'requests', 'offers', 'notifications', 'full'})
 
 
+class AccessDenied(PermissionError):
+    pass
+
+
 class AccessConflict(RuntimeError):
     pass
 
@@ -49,11 +53,16 @@ async def snapshot(user_id, db_path=None):
         return await snapshot_in(db, user_id)
 
 
-async def allowed(user_id, scope, db_path=None):
+async def allowed_in(db, user_id, scope):
     if scope not in SCOPES:
         return False
-    saved = await snapshot(user_id, db_path)
+    saved = await snapshot_in(db,user_id)
     return 'full' not in saved['scopes'] and scope not in saved['scopes']
+
+
+async def allowed(user_id, scope, db_path=None):
+    async with aiosqlite.connect(db_path or storage.DB_PATH) as db:
+        return await allowed_in(db,user_id,scope)
 
 
 async def change(actor_id, user_id, scopes, reason, request_id, *, expected_revision, owner_id, legacy_admins=()):

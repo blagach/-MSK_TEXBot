@@ -79,3 +79,14 @@ class UserAccessTests(unittest.IsolatedAsyncioTestCase):
             await user_access.init_schema(str(candidate))
             self.assertEqual(await user_access.snapshot(30,str(candidate)),original)
             self.assertGreater(backups.verify_preserved_rows(snap,candidate),4)
+
+    async def test_restricted_user_cannot_be_promoted_until_owner_clears_restrictions(self):
+        await self.change(['offers'])
+        with self.assertRaises(ValueError):
+            await admin_access.assign_role(1,30,'moderator','promote',owner_id=1)
+        self.assertFalse(await admin_access.allowed(30,'moderate',{1,2},1))
+        saved=await user_access.snapshot(30)
+        await self.change([],request='clear-promote',revision=saved['revision'])
+        self.assertTrue(await admin_access.assign_role(1,30,'moderator','promote',owner_id=1))
+        with self.assertRaises(ValueError):
+            await self.change(['full'],request='block-staff',revision=(await user_access.snapshot(30))['revision'])

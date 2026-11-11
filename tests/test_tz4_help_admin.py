@@ -824,6 +824,34 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(owner.answer.await_args.args[0],name+"\n\n"+"\n".join(items))
         self.assertEqual(sum(len(items) for _,items in equipment_catalog.GROUPS),43)
 
+    async def test_transaction_rechecks_access_after_stale_precheck_without_losing_forms(self):
+        await bot.SQLiteDraftStorage(str(self.database)).init_schema()
+        person,state=self.actor(42)
+        person.from_user.full_name="Тест"
+        person.from_user.username=None
+        await bot.user_access.change(1,42,["full"],"Позднее ограничение","atomic-restriction",expected_revision=0,owner_id=1)
+        lead_data={"phone":"+79991234567","draft_id":"restricted-lead","equipment":"автокран"}
+        await state.set_state(bot.LeadForm.review)
+        await state.set_data(lead_data)
+        with patch.object(bot.user_access,"allowed",new_callable=AsyncMock,return_value=True):
+            await bot.submit_lead(person,person.from_user,state,self.telegram,lead_data)
+        self.assertEqual(await state.get_state(),bot.LeadForm.review.state)
+        async with aiosqlite.connect(self.database) as db:
+            self.assertEqual((await (await db.execute("SELECT count(*) FROM leads")).fetchone())[0],0)
+            await db.execute("INSERT INTO leads(customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                             "VALUES (20,'Заказчик','автокран','Москва','завтра','','+79991234567','published','2026-11-11')")
+            await db.commit()
+        offer_data={"lead_id":1,"price":"28000","comment":"Без комментария","phone":"+79991234567"}
+        await state.set_state(bot.OfferForm.review)
+        await state.set_data(offer_data)
+        with patch.object(bot.user_access,"allowed",new_callable=AsyncMock,return_value=True):
+            await bot.send_offer(person,person.from_user,state,self.telegram)
+        self.assertEqual(await state.get_state(),bot.OfferForm.review.state)
+        self.assertEqual((await state.get_data())["price"],"28000")
+        async with aiosqlite.connect(self.database) as db:
+            self.assertEqual((await (await db.execute("SELECT count(*) FROM offers")).fetchone())[0],0)
+        self.telegram.send_message.assert_not_awaited()
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)

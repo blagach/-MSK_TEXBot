@@ -138,6 +138,11 @@ async def assign_role(actor_id, target_id, role, request_id, *, owner_id, expect
             )
             await db.commit()
             raise RoleConflict("Права изменились после просмотра. Проверьте текущую роль заново")
+        has_access = await (await db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_access_events'")).fetchone()
+        if role != "none" and has_access:
+            import user_access
+            if (await user_access.snapshot_in(db,target_id))["scopes"]:
+                raise ValueError("Сначала снимите ограничения пользователя, затем назначайте административную роль")
         stamp = now()
         await db.execute("INSERT INTO admin_role_events(target_id,role,actor_id,request_id,created_at) VALUES (?,?,?,?,?)",
                          (target_id, role, actor_id, request_id, stamp))

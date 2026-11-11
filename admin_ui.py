@@ -369,6 +369,9 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
                 owner_id=service_owner_id, expected_revision=data["admin_expected_revision"],
                 legacy_admins=support_admin_ids,
             )
+        except ValueError as error:
+            await message.answer(str(error),reply_markup=keyboard(HOME))
+            return
         except admin_access.RoleConflict:
             await state.set_state(ManageAdmins.target)
             await retire_panel(message)

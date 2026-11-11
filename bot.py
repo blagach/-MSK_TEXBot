@@ -1287,6 +1287,8 @@ async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[
                 previous = await cursor.fetchone()
             if previous:
                 return previous[0], False
+        if not await user_access.allowed_in(db,customer.id,"requests"):
+            raise user_access.AccessDenied("Создание заявок ограничено")
         cursor = await db.execute(
             """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1364,7 +1366,11 @@ async def submit_lead(message, customer, state, bot, data):
     if not await user_access.allowed(customer.id, "requests"):
         await message.answer("Создание заявок ограничено. Черновик сохранён; обратитесь в поддержку.")
         return
-    lead_id, created = await save_lead_from_draft(customer, data["phone"], data)
+    try:
+        lead_id, created = await save_lead_from_draft(customer, data["phone"], data)
+    except user_access.AccessDenied:
+        await message.answer("Создание заявок ограничено. Черновик сохранён; обратитесь в поддержку.")
+        return
     if not created:
         await clear_form_keyboard(message, state)
         await state.clear()
@@ -1590,10 +1596,14 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
         f"Цена: {data['price']}\n"
         f"{offer_terms_text(data['comment'], data.get('note'))}"
     )
-    offer_id = await storage.save_offer(
-        lead["id"], provider.id, provider_name, username,
-        data["price"], data["comment"], phone, note=data.get("note"),
-    )
+    try:
+        offer_id = await storage.save_offer(
+            lead["id"], provider.id, provider_name, username,
+            data["price"], data["comment"], phone, note=data.get("note"),
+        )
+    except user_access.AccessDenied:
+        await message.answer("Отправка откликов ограничена. Черновик сохранён; обратитесь в поддержку.")
+        return
     await clear_form_keyboard(message, state)
     await state.clear()
     if offer_id is None:

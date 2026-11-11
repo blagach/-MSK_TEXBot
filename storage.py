@@ -28,6 +28,8 @@ def valid_text(value, limit, phone=False):
 
 
 async def init_schema():
+    import user_access
+    await user_access.init_schema()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS offers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,8 +92,11 @@ async def finish_publication(lead_id, chat_id, message_id):
 
 
 async def save_offer(lead_id, provider_id, name, username, price, comment, phone, *, note=None):
+    import user_access
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
+        if not await user_access.allowed_in(db,provider_id,"offers"):
+            raise user_access.AccessDenied("Отправка откликов ограничена")
         cursor = await db.execute("SELECT status FROM leads WHERE id = ?", (lead_id,))
         lead = await cursor.fetchone()
         if not lead or lead[0] != "published":
