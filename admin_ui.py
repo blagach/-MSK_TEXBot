@@ -107,6 +107,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
                   "export": "export", "settings": "roles", "audit": "audit"}.get(action)
     if action.startswith("equipment:"):
         permission = "catalog"
+    if re.fullmatch(r"audit:[1-9][0-9]{0,18}", action):
+        permission = "audit"
     if action.startswith(("role:", "confirm:", "role_cancel:")):
         permission = "roles"
     if permission is None or not await admin_access.allowed(
@@ -118,6 +120,9 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     await callback.answer()
     await admin_access.record(callback.from_user.id, "admin_view", details={"section": permission})
     if action == "home":
+        if state is not None and await state.get_state() in ManageAdmins.__all_states_names__:
+            from bot import pause_form
+            await pause_form(message, state)
         await menu(message, callback.from_user.id, support_admin_ids, service_owner_id)
     elif action == "settings":
         await message.answer("Настройки", reply_markup=keyboard(
@@ -154,14 +159,20 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         await state.clear()
         await message.edit_reply_markup(reply_markup=None)
         await message.answer("Права сохранены.", reply_markup=keyboard(HOME))
-    elif action == "audit":
-        rows = await admin_access.history()
+    elif action == "audit" or action.startswith("audit:"):
+        before = min(int(action.split(":")[1]), 2**63 - 1) if ":" in action else 2**63 - 1
+        page = await admin_access.history(before, 11)
+        rows = page[:10]
         text = "\n".join(
             f"#{row['id']} · {row['created_at']} · пользователь {row['actor_id']} · "
             f"{row['action']} · объект {row['target_id'] or '—'} · {row['result']}"
             for row in rows
         )
-        await message.answer(text or "Журнал пока пуст.", reply_markup=keyboard(HOME))
+        navigation = []
+        if len(page) > 10:
+            navigation.append((("Ранее", f"admin:audit:{rows[-1]['id']}"),))
+        navigation.append(HOME)
+        await message.answer(text or "Журнал пока пуст.", reply_markup=keyboard(*navigation))
     elif action == "users":
         data = await reports.user_totals()
         await message.answer(

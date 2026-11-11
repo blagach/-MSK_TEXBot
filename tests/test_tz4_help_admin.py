@@ -517,7 +517,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         owner.text = "42"
         await admin_ui.admin_target(owner, state, self.admins, service_owner_id=1)
         old_nonce = (await state.get_data())["admin_nonce"]
-        await bot.pause_form(owner, state)
+        await admin_ui.admin_action(self.callback(owner, "admin:home"), self.admins,
+                                    state, service_owner_id=1)
         draft = bot.draft_slot(state, "admin_action")
         self.assertEqual(await draft.get_state(), admin_ui.ManageAdmins.confirm.state)
         with patch.object(bot, "admin_allowed", new_callable=AsyncMock, return_value=True):
@@ -574,6 +575,24 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await bot.open_support(staff, state)
         rows = staff.answer.await_args_list[0].kwargs["reply_markup"].keyboard
         self.assertNotIn(admin_ui.ADMIN_LABEL, [button.text for row in rows for button in row])
+
+    async def test_audit_pages_keep_older_events_and_require_owner(self):
+        for n in range(14):
+            await admin_access.record(1, f"event_{n}")
+        owner, state = self.actor(1)
+        await admin_ui.admin_action(self.callback(owner, "admin:audit"), self.admins,
+                                    state, service_owner_id=1)
+        markup = owner.answer.await_args.kwargs["reply_markup"]
+        earlier = markup.inline_keyboard[0][0].callback_data
+        self.assertTrue(earlier.startswith("admin:audit:"))
+        await admin_ui.admin_action(self.callback(owner, earlier), self.admins,
+                                    state, service_owner_id=1)
+        self.assertIn("event_0", owner.answer.await_args.args[0])
+        ordinary, other_state = self.actor(2)
+        denied = self.callback(ordinary, earlier)
+        await admin_ui.admin_action(denied, self.admins, other_state, service_owner_id=1)
+        denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
+        ordinary.answer.assert_not_awaited()
 
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
