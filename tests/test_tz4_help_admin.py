@@ -563,6 +563,18 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         buttons = [button.callback_data for row in other.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
         self.assertEqual(buttons, ["help:queue"])
 
+    async def test_role_menu_updates_after_grant_and_revocation_outside_admin_panel(self):
+        await admin_access.assign_role(1, 42, "support", "grant-new-staff", owner_id=1)
+        staff, state = self.actor(42)
+        await bot.open_support(staff, state)
+        rows = staff.answer.await_args_list[0].kwargs["reply_markup"].keyboard
+        self.assertIn(admin_ui.ADMIN_LABEL, [button.text for row in rows for button in row])
+        await admin_access.assign_role(1, 42, "none", "revoke-new-staff", owner_id=1)
+        staff.answer.reset_mock()
+        await bot.open_support(staff, state)
+        rows = staff.answer.await_args_list[0].kwargs["reply_markup"].keyboard
+        self.assertNotIn(admin_ui.ADMIN_LABEL, [button.text for row in rows for button in row])
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)

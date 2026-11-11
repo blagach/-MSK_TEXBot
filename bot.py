@@ -684,7 +684,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
         return
     await clear_form_keyboard(message, state)
     await state.clear()
-    await message.answer("Заполнение отменено.", reply_markup=main_menu(is_admin(state.key.user_id)))
+    await message.answer("Заполнение отменено.", reply_markup=main_menu(await admin_allowed(state.key.user_id, "panel")))
 
 
 @router.message(CommandStart(deep_link=True))
@@ -734,7 +734,7 @@ async def show_main_menu(message: Message, state: FSMContext) -> None:
 async def open_support(message: Message, state: FSMContext, command: CommandObject | None = None) -> None:
     user_id = message.from_user.id
     await pause_form(message, state)
-    await message.answer("Выберите раздел ниже.", reply_markup=main_menu(is_admin(user_id)))
+    await message.answer("Выберите раздел ниже.", reply_markup=main_menu(await admin_allowed(user_id, "panel")))
     if command and command.args and await admin_allowed(user_id, "support") and support_ui.positive_id(command.args):
         await support_ui.show_ticket(message, int(command.args), user_id, True)
     else:
@@ -1008,7 +1008,7 @@ async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bo
     user_id = callback.from_user.id
     if action == "cancel":
         await state.clear()
-        await message.answer("Закрытие отменено.", reply_markup=main_menu(is_admin(user_id)))
+        await message.answer("Закрытие отменено.", reply_markup=main_menu(await admin_allowed(user_id, "panel")))
         return
     changed = await lead_journey.change_lifecycle(
         storage.DB_PATH, lead_id, user_id, admin=await admin_allowed(user_id, "moderate"), reason=data["closing_reason"],
@@ -1025,7 +1025,7 @@ async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bo
             notice = "\nУведомление принято Telegram." if delivered else "\nУведомление заказчику не отправлено."
     await message.answer(
         (f"Заявка №{lead_id} закрыта. Причина сохранена." + notice) if changed
-        else "Заявка недоступна или уже закрыта.", reply_markup=main_menu(is_admin(user_id)),
+        else "Заявка недоступна или уже закрыта.", reply_markup=main_menu(await admin_allowed(user_id, "panel")),
     )
 
 
@@ -1345,7 +1345,7 @@ async def submit_lead(message, customer, state, bot, data):
     if not created:
         await clear_form_keyboard(message, state)
         await state.clear()
-        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu(is_admin(customer.id)))
+        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
         return
     lead = await get_lead(lead_id)
     # Shadow evaluation only: never changes the manual approval workflow.
@@ -1364,7 +1364,7 @@ async def submit_lead(message, customer, state, bot, data):
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
     await clear_form_keyboard(message, state)
     await state.clear()
-    await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu(is_admin(customer.id)))
+    await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
 
 
 @router.message(F.text == LEGACY_PROVIDER)
@@ -1418,7 +1418,7 @@ async def provider_phone(message: Message, state: FSMContext) -> None:
         )
         await db.commit()
     await state.clear()
-    await message.answer("Готово. Вы зарегистрированы как исполнитель. Когда появится подходящая заявка, она будет опубликована в канале.", reply_markup=main_menu(is_admin(state.key.user_id)))
+    await message.answer("Готово. Вы зарегистрированы как исполнитель. Когда появится подходящая заявка, она будет опубликована в канале.", reply_markup=main_menu(await admin_allowed(state.key.user_id, "panel")))
 
 
 @router.message(OfferForm.price)
@@ -1474,7 +1474,7 @@ async def cancel_unsent_offer(message: Message, user_id: int, state: FSMContext)
         await archive.set_data(await state.get_data())
         await archive.set_state(OfferForm.cancel_confirmation)
         await state.clear()
-    await message.answer("Незавершённый отклик отменён.", reply_markup=main_menu(is_admin(state.key.user_id)))
+    await message.answer("Незавершённый отклик отменён.", reply_markup=main_menu(await admin_allowed(state.key.user_id, "panel")))
 
 
 @router.callback_query(F.data.startswith("offer_step:"))
@@ -1554,7 +1554,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
     if not lead or lead["status"] != "published":
         await clear_form_keyboard(message, state)
         await state.clear()
-        await message.answer("Заявка уже недоступна.", reply_markup=main_menu(is_admin(provider.id)))
+        await message.answer("Заявка уже недоступна.", reply_markup=main_menu(await admin_allowed(provider.id, "panel")))
         return
     provider_name = provider.full_name
     username = f"@{provider.username}" if provider.username else "без username"
@@ -1571,7 +1571,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
     await clear_form_keyboard(message, state)
     await state.clear()
     if offer_id is None:
-        await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu(is_admin(provider.id)))
+        await message.answer("Заявка закрыта или ваш отклик уже сохранён.", reply_markup=main_menu(await admin_allowed(provider.id, "panel")))
         return
     handle = provider.username or ""
     chat_url = (
@@ -1594,7 +1594,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
     await message.answer(
         "✅ Отклик сохранён и отправлен заказчику." if delivered else
         "Отклик сохранён. Доставка заказчику не подтверждена, требуется проверка диспетчера.",
-        reply_markup=main_menu(is_admin(provider.id)),
+        reply_markup=main_menu(await admin_allowed(provider.id, "panel")),
     )
 
 
