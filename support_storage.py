@@ -1,6 +1,7 @@
 """Additive storage for support requests, separate from the order workflow."""
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 
 import aiosqlite
 
@@ -231,6 +232,24 @@ async def queued_deliveries():
 
 async def recover_deliveries():
     async with connection() as db:
+        # Serialize recovery and commit the delivery state together with its audit.
+        # A second startup must neither resend the reply nor duplicate the event.
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            """SELECT d.message_id, m.ticket_id, m.actor_id
+               FROM support_reply_deliveries d JOIN support_messages m ON m.id=d.message_id
+               WHERE d.status='sending' ORDER BY d.message_id""",
+        ) as cursor:
+            interrupted = await cursor.fetchall()
+        for reply in interrupted:
+            await db.execute(
+                """INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at)
+                   VALUES (?,'support_delivery',?,'uncertain',?,?)""",
+                (reply["actor_id"], reply["ticket_id"], json.dumps({
+                    "message_id": reply["message_id"], "error_code": "interrupted",
+                    "telegram_message_id": None,
+                }), now()),
+            )
         await db.execute(
             """UPDATE support_reply_deliveries SET status='uncertain', error_code='interrupted'
                WHERE status='sending'""",

@@ -1,5 +1,6 @@
 """Help and administrator workflows with isolated SQLite and fake Telegram."""
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -459,6 +460,42 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.send_message.assert_awaited_once()
         rows = await support_storage.history(ticket_id)
         self.assertEqual((rows[1]["delivery_status"], rows[1]["delivery_error"]), ("uncertain", "interrupted"))
+
+    async def test_interrupted_support_delivery_is_audited_once_without_resend(self):
+        ticket, _ = await support_storage.create_ticket(20, "help", "audit-ticket", "Question", None)
+        interrupted = await support_storage.add_reply(ticket, 1, "audit-reply", "Private answer")
+        queued = await support_storage.add_reply(ticket, 1, "audit-queued", "Queued answer")
+        await support_storage.claim_delivery(interrupted)
+        await asyncio.gather(*(support_storage.recover_deliveries() for _ in range(3)))
+        await support_storage.recover_deliveries()
+        rows = [row for row in await admin_access.history(kind="errors")
+                if row["action"] == "support_delivery"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["actor_id"], rows[0]["target_id"], rows[0]["result"]), (1, ticket, "uncertain"))
+        self.assertEqual(json.loads(rows[0]["details"]), {
+            "message_id": interrupted, "error_code": "interrupted", "telegram_message_id": None,
+        })
+        self.assertIn("interrupted", admin_ui.audit_line(rows[0]))
+        self.assertNotIn("Private answer", rows[0]["details"])
+        self.assertEqual(await support_storage.queued_deliveries(), [queued])
+        self.assertIsNone(await support_ui.deliver_reply(self.telegram, interrupted))
+        self.telegram.send_message.assert_not_awaited()
+        self.assertEqual(len(await support_storage.history(ticket)), 3)
+
+    async def test_support_recovery_audit_failure_keeps_pending_state(self):
+        ticket, _ = await support_storage.create_ticket(20, "help", "atomic-ticket", "Question", None)
+        reply = await support_storage.add_reply(ticket, 1, "atomic-reply", "Answer")
+        await support_storage.claim_delivery(reply)
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute("""CREATE TRIGGER reject_recovery_audit BEFORE INSERT ON admin_action_log
+                WHEN NEW.action='support_delivery' BEGIN SELECT RAISE(ABORT,'test audit failure'); END""")
+            await db.commit()
+        with self.assertRaises(aiosqlite.IntegrityError):
+            await support_storage.recover_deliveries()
+        row = (await support_storage.history(ticket))[0]
+        self.assertEqual(row["delivery_status"], "sending")
+        self.assertEqual(await admin_access.history(), [])
+        self.telegram.send_message.assert_not_awaited()
 
     async def test_edit_invalidates_old_send_and_ticket_returns_to_filtered_page(self):
         user, state = self.actor(20)
