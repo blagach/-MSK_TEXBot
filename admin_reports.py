@@ -343,3 +343,18 @@ async def user_profile(user_id):
             (SELECT count(*) FROM support_tickets WHERE requester_id=?) AS tickets
         """, (user_id,)*4))[0]
     return {**dict(people[0]), **dict(counts)}
+
+
+async def administrator_leads(admin_id, kind='all', before=2**63-1, limit=10):
+    filters = {
+        'new': "l.status IN ('new','publishing','published') AND NOT EXISTS(SELECT 1 FROM admin_lead_views v WHERE v.admin_id=? AND v.lead_id=l.id)",
+        'active': "l.status IN ('new','publishing','published')",
+        'closed': "l.status IN ('closed','completed','rejected','cancelled')",
+        'all': '1=1',
+    }
+    if kind not in filters:
+        raise ValueError('Unknown lead filter')
+    params=(before,admin_id,limit) if kind=='new' else (before,limit)
+    async with read_db() as db:
+        return await rows(db,'SELECT l.id,l.equipment,l.status,l.created_at FROM leads l WHERE l.id<? AND '+
+                          filters[kind]+' ORDER BY l.id DESC LIMIT ?',params)

@@ -895,10 +895,14 @@ async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot)
     owner = user_id == lead["customer_id"]
     await callback.answer()
     if action == "open":
+        admin_back = None
+        if admin and len(parts)==4 and re.fullmatch(r"a-(?:new|active|closed|all)-[0-9]{1,18}",parts[3]):
+            _,kind,before=parts[3].split("-")
+            admin_back=f"admin:leads:{kind}:{before}"
+        await show_customer_lead(message, lead, owner, admin, admin_back=admin_back)
         if admin:
             await admin_access.mark_lead_view(user_id, lead_id)
             await admin_access.record(user_id, "lead_view", target_id=lead_id)
-        await show_customer_lead(message, lead, owner, admin)
     elif action == "offers" and owner:
         before = storage.parse_id(parts[3], "") if len(parts) == 4 else 2**63 - 1
         if before:
@@ -929,7 +933,7 @@ async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot)
         await show_lead_step(message, state, step, **data, draft_id=uuid4().hex)
 
 
-async def show_customer_lead(message, lead, owner, admin):
+async def show_customer_lead(message, lead, owner, admin, admin_back=None):
     lead_id = lead["id"]
     status = lead["status"]
     rows = []
@@ -940,7 +944,8 @@ async def show_customer_lead(message, lead, owner, admin):
     if admin and status == "new":
         rows.append([InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
                      InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}")])
-    rows.append([lead_key("К заявкам", "list:0" if owner else "admin:0")])
+    rows.append([InlineKeyboardButton(text="К заявкам",callback_data=admin_back)] if admin_back
+                else [lead_key("К заявкам", "list:0" if owner else "admin:0")])
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute("SELECT reason FROM lead_lifecycle_events WHERE lead_id=? AND action='closed'",
                               (lead_id,)) as cursor:

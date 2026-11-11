@@ -41,3 +41,66 @@
 - E01: обычный аккаунт создаёт обращение; администратор отвечает. Проверить отдельное уведомление пользователя, тот же ответ по кнопке и после повторного открытия истории. В журнале отличать saved от sent/failed/uncertain. Успех API не доказывает чтение человеком.
 - Пользователи/права: владелец ищет разрешённый тестовый аккаунт. Проверить отсутствие доступа у роли поддержки, отмену ограничения до подтверждения, сохранение причины и черновиков. После назначения ограничения проверить отказ только соответствующей функции и доступность поддержки; отмену делать новым подтверждённым событием.
 - Панель: четыре строки по две кнопки у владельца; остальные роли видят только свои разделы. Данные каталога — прежние 10 групп/43 позиции. Финансы и рассылки ничего не отправляют и не списывают.
+
+## Точные действия владельца для проверки копии без обновления
+
+Эти команды выполнять только в Shell **msk-texbot-test**. Не открывать Shell рабочего сервиса. Они не запускают polling, не делают deploy и не мигрируют действующую базу. Сейчас их выполнение на фактическом Worker не подтверждено.
+
+1. Проверить сервис и путь без вывода токенов:
+
+```bash
+python -c 'import os; from render_test_start import TEST_WORKER_ID,test_database_path; assert os.environ.get("RENDER_SERVICE_ID")==TEST_WORKER_ID,"Wrong Worker"; print("Test Worker:", TEST_WORKER_ID); print("Test SQLite:",test_database_path())'
+```
+
+При несовпадении/ошибке остановиться. Ожидается тестовый Worker `srv-dboqc51srm7s73cppi00` и его `/var/data/bot.db` на отдельном диске.
+
+2. Создать новый снимок стандартным SQLite backup API:
+
+```bash
+python render_test_backup.py snapshot
+```
+
+Сохранить точный путь `/var/data/backups/...sqlite` и SHA-256 из вывода. Если проверки не прошли, не удалять получившийся файл и не продолжать.
+
+3. Независимо проверить хеш. Вместо `ПУТЬ_КОПИИ` подставить точный путь из шага 2:
+
+```bash
+python -c 'import hashlib,sys; from pathlib import Path; p=Path(sys.argv[1]); print(hashlib.file_digest(p.open("rb"),"sha256").hexdigest())' 'ПУТЬ_КОПИИ'
+```
+
+Хеш должен полностью совпасть. При несовпадении остановиться, ничего не восстанавливать поверх действующей базы.
+
+4. Восстановить исключительно в новый файл. Подставить точный путь и хеш:
+
+```bash
+python render_test_backup.py restore-candidate --backup 'ПУТЬ_КОПИИ' --sha256 'SHA256_ИЗ_ШАГА_2'
+```
+
+Команда сама проверяет контрольную сумму, целостность, внешние ключи и совпадение исходных строк. Вывод должен содержать новый путь `restore-candidate-...sqlite`. Это не замена `/var/data/bot.db`.
+
+5. Дополнительно зафиксировать сравнение всех таблиц:
+
+```bash
+python - 'ПУТЬ_КОПИИ' 'ПУТЬ_RESTORE_CANDIDATE' <<'PY'
+from pathlib import Path
+from contextlib import closing
+from render_test_backup import verify_preserved_rows, open_read_only
+import sys
+source, candidate = map(Path, sys.argv[1:])
+print('Verified source tables:', verify_preserved_rows(source,candidate))
+with closing(open_read_only(source)) as db:
+    names={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for name in ('leads','offers','providers','provider_profiles','provider_equipment','form_drafts',
+                 'support_tickets','support_messages','support_status_events'):
+        if name in names:
+            print(name, db.execute('SELECT count(*) FROM "'+name+'"').fetchone()[0])
+    for lead_id in (8,9,11,14):
+        print('Lead',lead_id,'present:',bool(db.execute('SELECT 1 FROM leads WHERE id=?',(lead_id,)).fetchone()))
+PY
+```
+
+Отсутствие отдельного ID не исправлять созданием вымышленной записи: сверить с фактической историей. Команда не выводит содержимое контактов или обращений.
+
+Для отчёта нужны только: ID тестового Worker, пути двух файлов, совпавший SHA-256, число проверенных таблиц, количества записей и результат наличия контрольных ID. Токены, телефоны и тексты переписки не присылать.
+
+После этой проверки ещё остаются испытание миграции кандидата на отдельной копии, проверка точного совместимого отката и отдельное разрешение на тестовый deploy. Никакая команда выше не является разрешением на обновление.

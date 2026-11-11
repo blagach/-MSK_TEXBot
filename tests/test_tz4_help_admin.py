@@ -852,6 +852,37 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await (await db.execute("SELECT count(*) FROM offers")).fetchone())[0],0)
         self.telegram.send_message.assert_not_awaited()
 
+    async def test_administrator_lead_filters_are_personal_and_keep_publishing_active(self):
+        async with aiosqlite.connect(self.database) as db:
+            for status in ('new','publishing','published','closed','rejected','archived'):
+                await db.execute("INSERT INTO leads(customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                                 "VALUES (20,'Заказчик','автокран','Москва','завтра','','+79991234567',?,'2026-11-11')",(status,))
+            await db.commit()
+        self.assertEqual([r["id"] for r in await admin_reports.administrator_leads(1,'active')],[3,2,1])
+        self.assertEqual([r["id"] for r in await admin_reports.administrator_leads(1,'closed')],[5,4])
+        self.assertEqual(len(await admin_reports.administrator_leads(1,'all')),6)
+        await admin_access.mark_lead_view(1,2)
+        self.assertEqual([r["id"] for r in await admin_reports.administrator_leads(1,'new')],[3,1])
+        self.assertEqual([r["id"] for r in await admin_reports.administrator_leads(2,'new')],[3,2,1])
+        self.assertEqual([r["id"] for r in await admin_reports.administrator_leads(1,'all',before=4)],[3,2,1])
+        owner,state=self.actor(1)
+        await admin_ui.admin_action(self.callback(owner,'admin:leads:new:0'),self.admins,state,service_owner_id=1)
+        markup=owner.answer.await_args.kwargs['reply_markup']
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data,'lc:open:3:a-new-0')
+        lead=await bot.get_lead(3)
+        await bot.show_customer_lead(owner,lead,False,True,admin_back='admin:leads:new:0')
+        self.assertEqual(owner.answer.await_args.kwargs['reply_markup'].inline_keyboard[-1][0].callback_data,'admin:leads:new:0')
+        await admin_ui.menu(owner,1,self.admins,1)
+        labels=[b.text for row in owner.answer.await_args.kwargs['reply_markup'].inline_keyboard for b in row]
+        self.assertIn('📋 Заявки · 3 / 2',labels)
+        owner.answer.side_effect=TelegramNetworkError(None,'timeout')
+        with self.assertRaises(TelegramNetworkError):
+            await bot.lead_card_action(self.callback(owner,'lc:open:3:a-new-0'),state,self.telegram)
+        self.assertEqual([r['id'] for r in await admin_reports.administrator_leads(1,'new')],[3,1])
+        owner.answer.side_effect=None
+        await bot.lead_card_action(self.callback(owner,'lc:open:3:a-new-0'),state,self.telegram)
+        self.assertEqual([r['id'] for r in await admin_reports.administrator_leads(1,'new')],[1])
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)

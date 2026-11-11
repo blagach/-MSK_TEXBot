@@ -65,10 +65,11 @@ async def menu(message, user_id=None, admin_ids=(), owner_id=None):
     totals = await support_storage.counts()
     async with reports.read_db() as db:
         counts = (await reports.rows(db, """SELECT
-            (SELECT count(*) FROM leads WHERE status IN ('new','published')) AS active,
-            (SELECT count(*) FROM leads l WHERE status IN ('new','published')
+            (SELECT count(*) FROM leads WHERE status IN ('new','publishing','published')) AS active,
+            (SELECT count(*) FROM leads l WHERE status IN ('new','publishing','published')
              AND NOT EXISTS(SELECT 1 FROM admin_lead_views v WHERE v.admin_id=? AND v.lead_id=l.id)) AS pending,
-            (SELECT count(*) FROM offers WHERE delivery_status='unconfirmed')
+            (SELECT count(*) FROM leads WHERE status='publishing')
+             + (SELECT count(*) FROM offers WHERE delivery_status='unconfirmed')
              + (SELECT count(*) FROM support_reply_deliveries WHERE status IN ('failed','uncertain')) AS attention
         """, (user_id,)))[0]
     users = await reports.user_totals()
@@ -269,6 +270,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
                   "marketing": "marketing", "notification_settings": "roles", "service_settings": "roles"}.get(action)
     if action.startswith(("access:", "access_pick:", "access_next:", "access_cancel:", "access_confirm:")):
         permission = "access"
+    if action.startswith("leads:"):
+        permission = "moderate"
     if action.startswith(("people:", "user:", "users_filter:")) or action == "find":
         permission = "users"
     if action.startswith(("equipment:", "catalog:")):
@@ -522,6 +525,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         )
         saved = await user_access.snapshot(profile["id"])
         await message.answer("Ограничения: " + scope_text(saved["scopes"]) +
+                             ("\nПричина последнего изменения: " + saved["reason"] if saved["reason"] else "") +
                              ("\nТакже действует прежняя блокировка профиля исполнителя; она здесь не снимается."
                               if profile["legacy_blocked"] else ""))
     elif action == "records":
@@ -535,8 +539,21 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             f"Заявки\n{lead_counts}\n\nОтклики по статусу связанной заявки\n{offer_counts}\n\n"
             f"Результаты откликов\n{outcomes or 'Нет записей'}\n\n"
             f"Доставка откликов\n{deliveries or 'Нет записей'}",
-            reply_markup=keyboard((("Просмотреть заявки", "lc:admin:0"),), HOME),
+            reply_markup=keyboard((("Новые", "admin:leads:new:0"), ("Активные", "admin:leads:active:0")),
+                                  (("Закрытые", "admin:leads:closed:0"), ("Все", "admin:leads:all:0")), HOME),
         )
+    elif action.startswith("leads:"):
+        parts=action.split(":")
+        if len(parts)!=3 or parts[1] not in {'new','active','closed','all'} or not re.fullmatch(r"[0-9]{1,18}",parts[2]):
+            return
+        kind,before=parts[1],int(parts[2])
+        rows=await reports.administrator_leads(callback.from_user.id,kind,before or 2**63-1,11)
+        titles={'new':'Новые для вас','active':'Активные','closed':'Закрытые','all':'Все'}
+        buttons=[((f"№{row['id']} · {(row['equipment'] or 'Техника не указана')[:35]}",f"lc:open:{row['id']}:a-{kind}-{before}"),) for row in rows[:10]]
+        if len(rows)>10:
+            buttons.append((("Далее",f"admin:leads:{kind}:{rows[9]['id']}"),))
+        buttons.extend([(("К спискам заявок","admin:records"),),HOME])
+        await message.answer(titles[kind]+("\nЗаписей нет." if not rows else ""),reply_markup=keyboard(*buttons))
     elif action == "stats":
         result = await reports.registration_stats()
         lines = [
