@@ -374,7 +374,8 @@ def form_kind(current: str | None) -> str | None:
 async def pause_form(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
     kind = form_kind(current)
-    if current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__):
+    if current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__,
+                   *provider_ui.AlertPreferences.__all_states_names__):
         kind = "provider_action"
     elif current in CloseLead.__all_states_names__:
         kind = "lead_closing"
@@ -387,6 +388,8 @@ async def pause_form(message: Message, state: FSMContext) -> None:
         if current == provider_ui.Register.payment.state:
             await provider_ui.retire_payment_panel(message, state)
             data.pop("payment_panel", None)
+        if current == provider_ui.AlertPreferences.select.state:
+            await provider_ui.retire_inline_panel(message, state, "alert_panel")
         if data.get("machine_panel"):
             await remove_form_keyboard(message, data["machine_panel"])
         lead_id = storage.parse_id(f"lead_{data.get('lead_id')}", "lead_")

@@ -586,14 +586,14 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.message.text = "28000"
         await bot.offer_price(self.message, self.state)
         await bot.executor_menu(self.message, self.state)
-        self.assertEqual(self.keyboard_rows()[3:], [
+        self.assertEqual(self.keyboard_rows()[1:], [
             ["🔔 Уведомления включены", "▶️ Продолжить отклик"], ["🏠 Главное меню"],
         ])
         self.message.text = "🔔 Уведомления включены"
         await bot.provider_ui.notifications(self.message, self.state)
-        self.assertEqual(self.keyboard_rows()[3], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
+        self.assertEqual(self.keyboard_rows()[1], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
         await bot.provider_ui.notifications(self.message, self.state)
-        self.assertEqual(self.keyboard_rows()[3][0], "🔕 Уведомления выключены")
+        self.assertEqual(self.keyboard_rows()[1][0], "🔕 Уведомления выключены")
 
         self.state = self.reopen_sqlite_state()
         await bot.customer_menu(self.message, self.state)
@@ -602,16 +602,16 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.equipment_type.state)
         await bot.executor_menu(self.message, self.state)
-        self.assertEqual(self.keyboard_rows()[3], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
+        self.assertEqual(self.keyboard_rows()[1], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
         self.assertEqual((await bot.draft_slot(self.state, "offer_1").get_data())["price"], "28000")
         self.message.text = "🔕 Уведомления выключены"
         await bot.provider_ui.notifications(self.message, self.state)
-        self.assertEqual(self.keyboard_rows()[3][0], "🔔 Уведомления включены")
+        self.assertEqual(self.keyboard_rows()[1][0], "🔔 Уведомления включены")
         for handler in (bot.provider_ui.my_profile, bot.provider_ui.my_machines, bot.provider_ui.my_payment_methods):
             await handler(self.message, self.state)
             if handler in (bot.lead_place, bot.lead_date):
                 await self.skip_lead_optional()
-            self.assertEqual(self.keyboard_rows()[3], ["🔔 Уведомления включены", "▶️ Продолжить отклик"])
+            self.assertEqual(self.keyboard_rows()[1], ["🔔 Уведомления включены", "▶️ Продолжить отклик"])
 
     async def test_legacy_registration_remains_accessible_with_compact_menu(self):
         async with aiosqlite.connect(storage.DB_PATH) as db:
@@ -640,9 +640,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
         await bot.executor_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows(), [
-            ["🔎 Подходящие заявки", "📋 Мои отклики"],
-            ["👤 Мой профиль", "🚜 Моя техника"],
-            ["➕ Добавить технику", "💳 Способ оплаты"],
+            ["🚜 Моя техника", "📍 Мои регионы"],
             ["🔔 Уведомления включены"],
             ["🏠 Главное меню"],
         ])
@@ -655,6 +653,60 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.my_offers(self.message, self.state)
         self.assertIn("28000", self.message.answer.await_args.args[0])
         self.assertNotIn("Скрытая цена", self.message.answer.await_args.args[0])
+
+    async def preference_action(self, action, panel=None):
+        current = (await self.state.get_data()).get("alert_panel")
+        callback = self.step(action, panel or current)
+        callback.data = f"provider_alert:{action}"
+        await bot.provider_ui.alert_preference_action(callback, self.state)
+        return callback
+
+    async def test_alert_type_selection_regions_restart_cancel_and_legacy_tools(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
+        self.message.text = bot.provider_ui.MY_TECH
+        await bot.provider_ui.begin_alert_preferences(self.message, self.state)
+        self.assertIn("На какую технику получать заявки?", self.message.answer.await_args.args[0])
+        await self.preference_action("group:0")
+        old_panel = (await self.state.get_data())["alert_panel"]
+        await self.preference_action("type:0")
+        await self.preference_action("back")
+        await self.preference_action("group:2")
+        await self.preference_action("type:0")
+        stale = await self.preference_action("type:0", old_panel)
+        stale.answer.assert_awaited_once_with("Этот экран устарел. Откройте настройки снова.")
+        await self.preference_action("save")
+        self.assertEqual((await self.state.get_data())["alert_kind"], "regions")
+        self.assertIn("В каких регионах получать заявки?", self.message.answer.await_args.args[0])
+        await self.preference_action("both")
+        await self.preference_action("save")
+        preferences = await bot.provider_registry.alert_preferences(20, storage.DB_PATH)
+        self.assertEqual(preferences["categories"], ["мини-экскаватор", "автокран"])
+        self.assertEqual(set(preferences["regions"]), {"Москва", "Московская область"})
+        self.assertEqual(self.keyboard_rows()[0], [bot.provider_ui.MY_TECH, bot.provider_ui.MY_REGIONS])
+        self.assertFalse(any("Новые заявки" in button or "Открытые контакты" in button
+                             for row in self.keyboard_rows() for button in row))
+
+        self.message.text = bot.provider_ui.MY_REGIONS
+        await bot.provider_ui.begin_alert_preferences(self.message, self.state)
+        await self.preference_action("region:0")
+        await bot.show_main_menu(self.message, self.state)
+        self.state = self.reopen_sqlite_state()
+        self.message.text = bot.PROVIDER_ACTION_DRAFT
+        await bot.resume_auxiliary_action(self.message, self.state)
+        self.assertEqual((await self.state.get_data())["alert_regions"], ["Московская область"])
+        await self.preference_action("cancel")
+        self.assertEqual(await bot.provider_registry.alert_preferences(20, storage.DB_PATH), preferences)
+
+        self.message.text = bot.provider_ui.MY_TECH
+        await bot.provider_ui.begin_alert_preferences(self.message, self.state)
+        await self.preference_action("tools")
+        tools = [button for row in self.keyboard_rows() for button in row]
+        for label in (bot.provider_ui.INVENTORY, "👤 Мой профиль", "➕ Добавить технику",
+                      bot.provider_ui.PAYMENT_METHOD, bot.MY_OFFERS):
+            self.assertIn(label, tools)
+        self.assertIsNotNone(await bot.draft_slot(self.state, "provider_action").get_state())
 
     async def test_keyboard_replacement_back_and_home(self):
         comment_markup = await self.enter_comment()

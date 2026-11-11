@@ -24,6 +24,8 @@ HOME = "🏠 Главное меню"
 REGISTER_PROVIDER = "🚜 Зарегистрироваться как исполнитель"
 LEGACY_PROVIDER = "🛠 Обновить быструю регистрацию"
 MY_TECH = "🚜 Моя техника"
+MY_REGIONS = "📍 Мои регионы"
+INVENTORY = "🚜 Карточки техники"
 PAYMENT_METHOD = "💳 Способ оплаты"
 PAYMENT_OPTIONS = (payments.CASH, payments.VAT, payments.NO_VAT)
 NOTIFICATIONS_ON = "🔔 Уведомления включены"
@@ -54,14 +56,10 @@ async def executor_keyboard(user_id: int, state: FSMContext) -> ReplyKeyboardMar
     draft = (OFFER_DRAFT,) if await offer_draft_ids(state) else ()
     if notifications_enabled is not None:
         notifications = NOTIFICATIONS_ON if notifications_enabled else NOTIFICATIONS_OFF
-        rows = [
-            (AVAILABLE_LEADS, MY_OFFERS),
-            ("👤 Мой профиль", MY_TECH),
-            ("➕ Добавить технику", PAYMENT_METHOD),
-            (notifications, *draft),
-        ]
+        rows = [(MY_TECH, MY_REGIONS), (notifications, *draft)]
+
     else:
-        rows = [(AVAILABLE_LEADS, MY_OFFERS)] if legacy else []
+        rows = [(MY_OFFERS,)] if legacy else []
         rows.append((REGISTER_PROVIDER,))
         if legacy:
             rows.append((LEGACY_PROVIDER,))
@@ -77,6 +75,10 @@ class Register(StatesGroup):
     payment = State()
 
 
+class AlertPreferences(StatesGroup):
+    select = State()
+
+
 class AddMachine(StatesGroup):
     category = State()
     equipment_type = State()
@@ -84,6 +86,157 @@ class AddMachine(StatesGroup):
     description = State()
     region = State()
     area = State()
+
+
+def provider_tools_keyboard():
+    return section_keyboard(
+        (INVENTORY, "👤 Мой профиль"), ("➕ Добавить технику", PAYMENT_METHOD),
+        (MY_OFFERS,), (HOME,),
+    )
+
+
+@router.message(F.text.in_({MY_TECH, MY_REGIONS}))
+async def begin_alert_preferences(message: Message, state: FSMContext):
+    if await state.get_state() is not None:
+        await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
+        return
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        profile = await (await db.execute(
+            "SELECT blocked FROM provider_profiles WHERE telegram_id=?", (message.from_user.id,),
+        )).fetchone()
+    if not profile or profile[0]:
+        await message.answer("Сначала зарегистрируйтесь; заблокированный профиль недоступен.",
+                             reply_markup=await executor_keyboard(message.from_user.id, state))
+        return
+    current = await registry.alert_preferences(message.from_user.id, storage.DB_PATH)
+    await state.set_data({
+        "alert_categories": current["categories"], "alert_regions": current["regions"],
+        "alert_revision": current["revision"],
+    })
+    await state.set_state(AlertPreferences.select)
+    kind = "regions" if message.text == MY_REGIONS else "categories"
+    await message.answer("Настройки получения заявок. Сохранённые карточки техники доступны ниже.",
+                         reply_markup=section_keyboard((HOME,)))
+    await show_alert_preferences(message, state, kind)
+
+
+async def show_alert_preferences(message, state, kind, group=None):
+    await retire_inline_panel(message, state, "alert_panel")
+    data = await state.update_data(alert_kind=kind, alert_group=group)
+    if kind == "regions":
+        labels = ("Москва", "Московская область")
+        selected = data.get("alert_regions", [])
+        rows = [[InlineKeyboardButton(text=f"{'✅' if value in selected else '⬜'} {value}",
+                                      callback_data=f"provider_alert:region:{index}")]
+                for index, value in enumerate(labels)]
+        rows.append([InlineKeyboardButton(text="Оба региона", callback_data="provider_alert:both")])
+        prompt = "📍 В каких регионах получать заявки?\nВыберите Москву, Московскую область или оба региона."
+    elif group is None:
+        rows = equipment_catalog.button_rows(
+            tuple(name for name, _ in equipment_catalog.GROUPS),
+            lambda index, label: InlineKeyboardButton(text=label, callback_data=f"provider_alert:group:{index}"),
+        )
+        prompt = "🚜 На какую технику получать заявки?\nВыберите один или несколько видов техники."
+    else:
+        labels = equipment_catalog.GROUPS[group][1]
+        selected = data.get("alert_categories", [])
+        rows = equipment_catalog.button_rows(
+            labels, lambda index, label: InlineKeyboardButton(
+                text=f"{'✅' if labels[index] in selected else '⬜'} {label}",
+                callback_data=f"provider_alert:type:{index}",
+            ),
+        )
+        rows.append([InlineKeyboardButton(text="⬅️ К категориям", callback_data="provider_alert:back")])
+        prompt = "🚜 На какую технику получать заявки?\nВыберите один или несколько видов техники."
+    rows.append([InlineKeyboardButton(text="⚙️ Карточки и профиль", callback_data="provider_alert:tools")])
+    rows.append([InlineKeyboardButton(text="Сохранить", callback_data="provider_alert:save"),
+                 InlineKeyboardButton(text="Отмена", callback_data="provider_alert:cancel")])
+    prompt += ("\n\nВыбрано видов: " + str(len(data.get("alert_categories", [])))
+               + ". Регионов: " + str(len(data.get("alert_regions", [])))
+               + ". Новые настройки применяются после сохранения.")
+    sent = await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await state.update_data(alert_panel=sent.message_id)
+
+
+@router.callback_query(F.data.startswith("provider_alert:"))
+async def alert_preference_action(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if (await state.get_state() != AlertPreferences.select.state or not isinstance(callback.message, Message)
+            or callback.message.message_id != data.get("alert_panel")
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Этот экран устарел. Откройте настройки снова.")
+        return
+    action = callback.data.removeprefix("provider_alert:")
+    kind = data["alert_kind"]
+    group = data.get("alert_group")
+    await callback.answer()
+    if action == "tools":
+        import bot as app
+        await app.pause_form(callback.message, state)
+        await callback.message.answer("Карточки техники и профиль. Выбор уведомлений сохранён в черновике.",
+                                      reply_markup=provider_tools_keyboard())
+        return
+    if action == "cancel":
+        await retire_inline_panel(callback.message, state, "alert_panel")
+        await state.clear()
+        await callback.message.answer("Настройки оставлены без изменений.",
+                                      reply_markup=await executor_keyboard(callback.from_user.id, state))
+        return
+    if action == "save":
+        if not data["alert_categories"]:
+            await callback.message.answer("Выберите хотя бы один вид техники.")
+            await show_alert_preferences(callback.message, state, "categories")
+            return
+        if not data["alert_regions"]:
+            await callback.message.answer("Выберите хотя бы один регион.")
+            await show_alert_preferences(callback.message, state, "regions")
+            return
+        try:
+            saved = await registry.save_alert_preferences(
+                callback.from_user.id, data["alert_categories"], data["alert_regions"],
+                data["alert_revision"], storage.DB_PATH,
+            )
+        except ValueError as error:
+            await callback.message.answer(str(error))
+            return
+        if not saved:
+            await callback.message.answer("Настройки уже изменились в другом сеансе. Ваш выбор остался в черновике. "
+                                          "Отмените изменение и откройте настройки снова для сверки.")
+            return
+        await retire_inline_panel(callback.message, state, "alert_panel")
+        await state.clear()
+        await callback.message.answer(
+            "Настройки сохранены. Подходящие заявки будут приходить отдельными сообщениями. "
+            "Уведомления зависят от сохранённого переключателя. Приостановленные карточки учитываются.",
+            reply_markup=await executor_keyboard(callback.from_user.id, state),
+        )
+        return
+    if kind == "categories" and action.startswith("group:") and action[6:].isdecimal():
+        index = int(action[6:])
+        if index < len(equipment_catalog.GROUPS):
+            await show_alert_preferences(callback.message, state, kind, index)
+        return
+    if kind == "categories" and group is not None and action.startswith("type:") and action[5:].isdecimal():
+        index = int(action[5:])
+        labels = equipment_catalog.GROUPS[group][1]
+        if index >= len(labels):
+            return
+        selected = set(data["alert_categories"]) ^ {labels[index]}
+        ordered = [value for _, values in equipment_catalog.GROUPS for value in values if value in selected]
+        await state.update_data(alert_categories=ordered)
+    elif kind == "categories" and action == "back":
+        group = None
+    elif kind == "regions" and action in {"region:0", "region:1", "both"}:
+        selected = set(data["alert_regions"])
+        if action == "both":
+            selected = set(registry.REGIONS)
+        else:
+            value = ("Москва", "Московская область")[int(action[-1])]
+            selected ^= {value}
+        await state.update_data(alert_regions=sorted(selected))
+    else:
+        return
+    await show_alert_preferences(callback.message, state, kind, group)
 
 
 @router.message(F.text == REGISTER_PROVIDER)
@@ -384,7 +537,7 @@ async def machine_review(callback: CallbackQuery, state: FSMContext):
                                       reply_markup=await executor_keyboard(callback.from_user.id, state))
 
 
-@router.message(F.text.in_({MY_TECH, "📋 Моя техника"}))
+@router.message(F.text.in_({INVENTORY, "📋 Моя техника"}))
 async def my_machines(message: Message, state: FSMContext):
     items = await registry.list_equipment(message.from_user.id, storage.DB_PATH)
     for item in items:
@@ -570,7 +723,9 @@ async def edit_payment_methods(callback: CallbackQuery, state: FSMContext):
 
 async def resume_provider_step(message, state, current):
     data = await state.get_data()
-    if current in (AddMachine.category.state, AddMachine.equipment_type.state):
+    if current == AlertPreferences.select.state:
+        await show_alert_preferences(message, state, data["alert_kind"], data.get("alert_group"))
+    elif current in (AddMachine.category.state, AddMachine.equipment_type.state):
         await machine_catalog(message, state, data.get("machine_group"))
     elif current == AddMachine.review.state:
         if data.get("machine_choosing_field"):
