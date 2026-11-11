@@ -153,7 +153,9 @@ async def show_alert_preferences(message, state, kind, group=None):
                  InlineKeyboardButton(text="Отмена", callback_data="provider_alert:cancel")])
     prompt += ("\n\nВыбрано видов: " + str(len(data.get("alert_categories", [])))
                + ". Регионов: " + str(len(data.get("alert_regions", [])))
-               + ". Новые настройки применяются после сохранения.")
+               + ". Новые настройки применяются после сохранения."
+               + "\nРегионы: " + (", ".join(data.get("alert_regions", [])) or "не выбраны")
+               + "\nПосле сохранения заявки подбираются по всему выбранному региону.")
     sent = await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await state.update_data(alert_panel=sent.message_id)
 
