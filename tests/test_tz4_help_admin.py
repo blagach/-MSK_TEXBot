@@ -948,6 +948,93 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Последний номер: 11',admin.answer.await_args.args[0])
         self.assertNotIn('Статус:',admin.answer.await_args.args[0])
 
+    async def test_lead_search_dispatcher_restores_state_and_honors_revoked_rights(self):
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute("INSERT INTO leads(id,customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                             "VALUES (11,20,'Заказчик','автокран','Москва','завтра','','+79991234567','published','2026-11-11')")
+            await db.commit()
+        stamp=int(datetime(2026,11,11,tzinfo=timezone.utc).timestamp())
+        user={'id':2,'is_bot':False,'first_name':'Тест'}
+        chat={'id':2,'type':'private'}
+        messages=[]
+        async def transport(_bot,method,**_kwargs):
+            if isinstance(method,SendMessage):
+                messages.append(method)
+                return Message(message_id=500+len(messages),date=stamp,chat=chat)
+            self.assertEqual(method.__api_method__,'answerCallbackQuery')
+            return True
+        backing=bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        key=StorageKey(bot_id=99,chat_id=2,user_id=2)
+        async with Bot('99:TEST') as telegram:
+            with ExitStack() as stack:
+                for item in (bot.router,provider_ui.router,support_ui.router,admin_ui.router):
+                    stack.enter_context(patch.object(item,'_parent_router',None))
+                stack.enter_context(patch.object(telegram.session,'make_request',side_effect=transport))
+                dispatcher=bot.create_dispatcher(backing)
+                await dispatcher.feed_update(telegram,Update.model_validate({'update_id':900,'callback_query':{
+                    'id':'900','from':user,'chat_instance':'search','data':'admin:lead_find',
+                    'message':{'message_id':400,'date':stamp,'chat':chat}}}))
+                self.assertEqual(await backing.get_state(key),admin_ui.FindLead.query.state)
+                # A fresh SQLite storage object reads the persisted query state.
+                self.assertEqual(await bot.SQLiteDraftStorage(str(self.database)).get_state(key),admin_ui.FindLead.query.state)
+                def request(number):
+                    return Update.model_validate({'update_id':number,'message':{
+                        'message_id':number,'date':stamp,'chat':chat,'from':user,'text':'№11'}})
+                await dispatcher.feed_update(telegram,request(901))
+                self.assertIn('№11',messages[-1].text)
+                self.assertIn('Статус:',messages[-1].text)
+                self.assertEqual((await backing.get_data(key))['lead_search_id'],11)
+                await admin_access.assign_role(1,2,'none','dispatcher-revoke-search',owner_id=1)
+                before=len(messages)
+                await dispatcher.feed_update(telegram,request(902))
+                self.assertEqual(len(messages),before+1)
+                self.assertEqual(messages[-1].text,'Нет доступа.')
+                self.assertEqual((await backing.get_data(key))['lead_search_id'],11)
+
+    async def test_backup_restore_keeps_all_administrator_drafts_without_applying_changes(self):
+        from dataclasses import replace
+        import render_test_backup as backups
+        await provider_registry.register_provider(42,'Тест','+79991234567',True,str(self.database))
+        backing=bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        key=StorageKey(bot_id=99,chat_id=1,user_id=1)
+        state=FSMContext(backing,key)
+        cases=[
+            ('admin_search',admin_ui.FindUser.results,{'user_query':'Тест','user_kind':'all','user_after':0,'user_nonce':'old'},bot.ADMIN_SEARCH_DRAFT),
+            ('admin_lead_search',admin_ui.FindLead.query,{'lead_search_id':11},bot.ADMIN_LEAD_SEARCH_DRAFT),
+            ('admin_action',admin_ui.ManageAdmins.confirm,{'admin_target':42,'admin_role':'support',
+                'admin_expected_revision':0,'admin_previous_role':'none','admin_nonce':'old'},bot.ADMIN_ACTION_DRAFT),
+            ('admin_access',admin_ui.ManageAccess.confirm,{'access_target':42,'access_scopes':['requests'],
+                'access_previous':[],'access_revision':0,'access_reason':'Тест','access_nonce':'old'},bot.ADMIN_ACCESS_DRAFT),
+        ]
+        for kind,step,data,_ in cases:
+            paused=bot.draft_slot(state,kind)
+            await paused.set_state(step)
+            await paused.set_data(data)
+        snap,digest=backups.snapshot(self.database)
+        restored=backups.restore_candidate(snap,digest)
+        self.assertGreater(backups.verify_preserved_rows(snap,restored),20)
+        restored_storage=bot.SQLiteDraftStorage(str(restored))
+        await restored_storage.init_schema()
+        current=FSMContext(restored_storage,key)
+        owner,_=self.actor(1)
+        owner.answer.return_value=Record(message_id=500)
+        with patch.object(storage,'DB_PATH',str(restored)),patch.object(bot,'settings',replace(bot.settings,owner_id=1)):
+            for kind,step,expected,label in cases:
+                owner.text=label
+                await bot.resume_auxiliary_action(owner,current)
+                self.assertEqual(await current.get_state(),step.state)
+                data=await current.get_data()
+                for name,value in expected.items():
+                    if not name.endswith('nonce'):
+                        self.assertEqual(data[name],value)
+                self.assertFalse(await admin_access.allowed(42,'support',self.admins,1))
+                self.assertEqual((await bot.user_access.snapshot(42))['revision'],0)
+        # The original fixture and backup still contain exactly the source rows.
+        self.assertGreater(backups.verify_preserved_rows(snap,self.database),20)
+        self.telegram.send_message.assert_not_awaited()
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)
