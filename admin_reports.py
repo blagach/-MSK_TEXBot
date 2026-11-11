@@ -83,11 +83,16 @@ async def rows(db, sql, parameters=()):
 
 async def user_totals():
     async with read_db() as db:
-        return (await rows(db, USERS + """
-            SELECT COUNT(*) AS total, COUNT(c.id) AS customers, COUNT(p.id) AS providers,
-                   COUNT(CASE WHEN c.id IS NOT NULL AND p.id IS NOT NULL THEN 1 END) AS both
-            FROM users u LEFT JOIN customers c ON c.id=u.id LEFT JOIN performers p ON p.id=u.id
-        """))[0]
+        return await _user_totals_in(db)
+
+
+async def _user_totals_in(db):
+    return (await rows(db, USERS + """
+        SELECT COUNT(*) AS total, COUNT(c.id) AS customers, COUNT(p.id) AS providers,
+               COUNT(CASE WHEN c.id IS NOT NULL AND p.id IS NOT NULL THEN 1 END) AS both
+        FROM users u LEFT JOIN customers c ON c.id=u.id LEFT JOIN performers p ON p.id=u.id
+    """))[0]
+
 
 
 def registration_periods(at=None):
@@ -110,42 +115,52 @@ def utc_report_timestamp(value):
 
 
 async def registration_stats(at=None):
-    boundaries, current = registration_periods(at)
     async with read_db() as db:
-        # SQLite julianday rounds sub-millisecond values at period boundaries.
-        result = []
-        for start in boundaries:
-            result.append((await rows(db, """
-                WITH period(start_at, end_at) AS (VALUES (report_utc(?), report_utc(?))),
-                created AS (
-                    SELECT customer_id, report_utc(created_at) AS at FROM leads
-                ),
-                first_requests AS (
-                    SELECT MIN(at) AS at FROM created GROUP BY customer_id
-                ),
-                registrations AS (
-                    SELECT MIN(report_utc(registered_at)) AS at FROM (
-                        SELECT telegram_id, consent_at AS registered_at FROM provider_profiles
-                        UNION ALL SELECT telegram_id, created_at FROM providers
-                    ) GROUP BY telegram_id
-                )
-                SELECT (SELECT COUNT(*) FROM registrations WHERE at BETWEEN start_at AND end_at) AS providers,
-                       (SELECT COUNT(*) FROM first_requests WHERE at BETWEEN start_at AND end_at) AS customers,
-                       (SELECT COUNT(*) FROM created WHERE at BETWEEN start_at AND end_at) AS created,
-                       (SELECT COUNT(DISTINCT lead_id) FROM lead_lifecycle_events WHERE action='published'
-                            AND report_utc(created_at) BETWEEN start_at AND end_at) AS published,
-                       (SELECT COUNT(*) FROM offers WHERE report_utc(created_at) BETWEEN start_at AND end_at) AS offers
-                FROM period
-            """, (start.isoformat(), current.isoformat())))[0])
-        return result
+        return await _registration_stats_in(db,at)
+
+
+async def _registration_stats_in(db,at=None):
+    boundaries,current=registration_periods(at)
+    # SQLite julianday rounds sub-millisecond values at period boundaries.
+    result = []
+    for start in boundaries:
+        result.append((await rows(db, """
+            WITH period(start_at, end_at) AS (VALUES (report_utc(?), report_utc(?))),
+            created AS (
+                SELECT customer_id, report_utc(created_at) AS at FROM leads
+            ),
+            first_requests AS (
+                SELECT MIN(at) AS at FROM created GROUP BY customer_id
+            ),
+            registrations AS (
+                SELECT MIN(report_utc(registered_at)) AS at FROM (
+                    SELECT telegram_id, consent_at AS registered_at FROM provider_profiles
+                    UNION ALL SELECT telegram_id, created_at FROM providers
+                ) GROUP BY telegram_id
+            )
+            SELECT (SELECT COUNT(*) FROM registrations WHERE at BETWEEN start_at AND end_at) AS providers,
+                   (SELECT COUNT(*) FROM first_requests WHERE at BETWEEN start_at AND end_at) AS customers,
+                   (SELECT COUNT(*) FROM created WHERE at BETWEEN start_at AND end_at) AS created,
+                   (SELECT COUNT(DISTINCT lead_id) FROM lead_lifecycle_events WHERE action='published'
+                        AND report_utc(created_at) BETWEEN start_at AND end_at) AS published,
+                   (SELECT COUNT(*) FROM offers WHERE report_utc(created_at) BETWEEN start_at AND end_at) AS offers
+            FROM period
+        """, (start.isoformat(), current.isoformat())))[0])
+    return result
+
 
 
 async def equipment_totals():
     async with read_db() as db:
-        return (await rows(db, USERS + """
-            SELECT (SELECT count(*) FROM registrations) AS providers,
-                   (SELECT count(*) FROM provider_equipment) AS units
-        """))[0]
+        return await _equipment_totals_in(db)
+
+
+async def _equipment_totals_in(db):
+    return (await rows(db, USERS + """
+        SELECT (SELECT count(*) FROM registrations) AS providers,
+               (SELECT count(*) FROM provider_equipment) AS units
+    """))[0]
+
 
 
 async def equipment_page(offset):
@@ -358,3 +373,22 @@ async def administrator_leads(admin_id, kind='all', before=2**63-1, limit=10):
     async with read_db() as db:
         return await rows(db,'SELECT l.id,l.equipment,l.status,l.created_at FROM leads l WHERE l.id<? AND '+
                           filters[kind]+' ORDER BY l.id DESC LIMIT ?',params)
+
+
+async def dashboard_totals(admin_id,at=None):
+    """Read every panel counter from one consistent, read-only SQLite snapshot."""
+    async with read_db() as db:
+        counts=(await rows(db,"""SELECT
+            (SELECT count(*) FROM leads WHERE status IN ('new','publishing','published')) AS active,
+            (SELECT count(*) FROM leads l WHERE status IN ('new','publishing','published')
+             AND NOT EXISTS(SELECT 1 FROM admin_lead_views v WHERE v.admin_id=? AND v.lead_id=l.id)) AS pending,
+            (SELECT count(*) FROM leads WHERE status='publishing')
+             + (SELECT count(*) FROM offers WHERE delivery_status='unconfirmed')
+             + (SELECT count(*) FROM support_reply_deliveries WHERE status IN ('failed','uncertain')) AS attention
+        """,(admin_id,)))[0]
+        users=await _user_totals_in(db)
+        equipment=await _equipment_totals_in(db)
+        today=(await _registration_stats_in(db,at))[0]
+        support=(await rows(db,"SELECT count(*) AS n FROM support_tickets WHERE status='new'"))[0]['n']
+        return {**dict(counts),'users':users['total'],'equipment':equipment['units'],
+                'registrations_today':today['providers'],'support_new':support}

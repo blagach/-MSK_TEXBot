@@ -64,27 +64,18 @@ async def retire_panel(message):
 
 async def menu(message, user_id=None, admin_ids=(), owner_id=None):
     user_id = message.chat.id if user_id is None else user_id
-    permissions = {key: await admin_access.allowed(user_id, key, admin_ids, owner_id)
-                   for key in ("users", "catalog", "moderate", "stats", "support", "export", "roles", "audit", "finance", "marketing")}
-    totals = await support_storage.counts()
-    async with reports.read_db() as db:
-        counts = (await reports.rows(db, """SELECT
-            (SELECT count(*) FROM leads WHERE status IN ('new','publishing','published')) AS active,
-            (SELECT count(*) FROM leads l WHERE status IN ('new','publishing','published')
-             AND NOT EXISTS(SELECT 1 FROM admin_lead_views v WHERE v.admin_id=? AND v.lead_id=l.id)) AS pending,
-            (SELECT count(*) FROM leads WHERE status='publishing')
-             + (SELECT count(*) FROM offers WHERE delivery_status='unconfirmed')
-             + (SELECT count(*) FROM support_reply_deliveries WHERE status IN ('failed','uncertain')) AS attention
-        """, (user_id,)))[0]
-    users = await reports.user_totals()
-    equipment = await reports.equipment_totals()
-    today = (await reports.registration_stats())[0]
+    counts=await reports.dashboard_totals(user_id)
+    permissions = {key: await admin_access.allowed(user_id,key,admin_ids,owner_id)
+                   for key in ("users","catalog","moderate","stats","support","export","roles","audit","finance","marketing")}
+    if not any(permissions.values()):
+        await message.answer("Нет доступа.")
+        return
     pairs = [
-        ((f"📊 Статистика · +{today['providers']}", "admin:stats", "stats"),
+        ((f"📊 Статистика · +{counts['registrations_today']}", "admin:stats", "stats"),
          (f"📋 Заявки · {counts['active']} / {counts['pending']}", "admin:records", "moderate")),
-        ((f"👥 Пользователи · {users['total']}", "admin:users", "users"),
-         (f"🛟 Поддержка · {totals.get('new',0)}", "help:queue", "support")),
-        ((f"🚜 Каталог техники · {equipment['units']}", "admin:equipment:0", "catalog"),
+        ((f"👥 Пользователи · {counts['users']}", "admin:users", "users"),
+         (f"🛟 Поддержка · {counts['support_new']}", "help:queue", "support")),
+        ((f"🚜 Каталог техники · {counts['equipment']}", "admin:equipment:0", "catalog"),
          ("💰 Финансы · бесплатно", "admin:finance", "finance")),
         (("📣 Рассылки · выключены", "admin:marketing", "marketing"),
          (f"⚙️ Настройки · {counts['attention']}", "admin:settings", "roles")),
@@ -92,7 +83,7 @@ async def menu(message, user_id=None, admin_ids=(), owner_id=None):
     rows = [tuple((label, callback) for label, callback, permission in pair if permissions[permission]) for pair in pairs]
     rows = [row for row in rows if row]
     await message.answer("Админ-панель\nЗаявки: активные / непросмотренные. Поддержка: новые.\n"
-                         "Статистика: регистрации исполнителей сегодня (Москва). Настройки: проблемные доставки.",
+                         "Статистика: регистрации исполнителей сегодня (Москва). Настройки: публикации и доставки, требующие внимания.",
                          reply_markup=keyboard(*rows))
 
 

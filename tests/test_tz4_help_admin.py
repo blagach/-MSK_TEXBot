@@ -1087,6 +1087,41 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Повторная отправка не выполнялась',admin.answer.await_args.args[0])
         self.assertFalse(any(r['action']=='export_sent' for r in await admin_access.history(limit=100)))
 
+    async def test_dashboard_counters_use_one_snapshot_during_concurrent_insert(self):
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute('PRAGMA journal_mode=WAL')
+            await db.execute("INSERT INTO leads(id,customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                             "VALUES (11,20,'Заказчик','автокран','Москва','завтра','','+79991234567','published','2026-11-11')")
+            await db.commit()
+        original=admin_reports.rows
+        inserted=False
+        async def rows_and_insert(db,sql,parameters=()):
+            nonlocal inserted
+            result=await original(db,sql,parameters)
+            if 'AS active' in sql and not inserted:
+                inserted=True
+                async with aiosqlite.connect(self.database) as writer:
+                    await writer.execute("INSERT INTO leads(id,customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                                         "VALUES (12,30,'Новый','самосвал','Москва','завтра','','+79991234568','published','2026-11-11')")
+                    await writer.commit()
+            return result
+        with patch.object(admin_reports,'rows',side_effect=rows_and_insert):
+            before=await admin_reports.dashboard_totals(1)
+        after=await admin_reports.dashboard_totals(1)
+        self.assertEqual((before['active'],before['users'],before['pending']),(1,1,1))
+        self.assertEqual((after['active'],after['users'],after['pending']),(2,2,2))
+
+    async def test_dashboard_does_not_send_counters_after_role_is_revoked_during_read(self):
+        staff,_=self.actor(2)
+        original=admin_reports.dashboard_totals
+        async def read_then_revoke(*args,**kwargs):
+            result=await original(*args,**kwargs)
+            await admin_access.assign_role(1,2,'none','revoke-during-dashboard',owner_id=1)
+            return result
+        with patch.object(admin_reports,'dashboard_totals',side_effect=read_then_revoke):
+            await admin_ui.menu(staff,2,self.admins,1)
+        staff.answer.assert_awaited_once_with('Нет доступа.')
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)
