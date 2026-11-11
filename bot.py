@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -96,6 +97,7 @@ class LeadForm(StatesGroup):
     schedule = State()
     map_link = State()
     details = State()
+    attachments = State()
     payment = State()
     phone = State()
     review = State()
@@ -145,12 +147,15 @@ LEAD_PROMPTS = {
     LeadForm.place: "Укажите точный адрес, ориентир или ближайшее метро.",
     LeadForm.date: "На какую дату и время нужна техника?",
     LeadForm.details: "Опишите работу: объём, срок, груз, навесное оборудование, важные условия.",
+    LeadForm.attachments: "Выберите дополнительное оборудование. Можно отметить несколько вариантов или написать свой. Затем нажмите «Готово».",
     LeadForm.payment: "Выберите форму оплаты:",
     LeadForm.phone: (
         "Введите номер телефона для связи без пробелов, скобок и дефисов. "
         "Например, +79123456789 или 89123456789."
     ),
 }
+ATTACHMENT_OPTIONS = ("Гидромолот", "Вилы", "Ковш", "Бур", "Стропы", "Захват")
+
 LEAD_CHOICES = {
     LeadForm.region: (("Москва", "Московская область"), "region", LeadForm.area),
     LeadForm.payment: (
@@ -239,6 +244,7 @@ def lead_text(lead: aiosqlite.Row, with_phone: bool = False) -> str:
         ("Адрес", lead["place"]), ("Карта", values.get("map_link")),
         ("Когда", lead["work_date"]), ("График смен", values.get("schedule")),
         ("Детали", lead["details"] or "не указаны"),
+        ("Допоборудование", lead_journey.attachments_text(values)),
         ("Форма оплаты", values.get("payment_method") or "Не указана"),
     ]
     text = f"📌 Заявка №{lead['id']}\n" + "\n".join(f"{label}: {value}" for label, value in fields if value)
@@ -249,10 +255,12 @@ async def get_lead(lead_id: int):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            """SELECT l.*, r.region, r.area, p.method AS payment_method, d.equipment_name, d.map_link, d.schedule
+            """SELECT l.*, r.region, r.area, p.method AS payment_method, d.equipment_name, d.map_link, d.schedule,
+                      a.selected_json AS attachments_json, a.custom_text AS attachments_custom
                FROM leads l LEFT JOIN lead_routing r ON r.lead_id=l.id
                LEFT JOIN lead_payment_preferences p ON p.lead_id=l.id
-               LEFT JOIN lead_work_details d ON d.lead_id=l.id WHERE l.id=?""", (lead_id,),
+               LEFT JOIN lead_work_details d ON d.lead_id=l.id
+               LEFT JOIN lead_attachments a ON a.lead_id=l.id WHERE l.id=?""", (lead_id,),
         ) as cursor:
             return await cursor.fetchone()
 
@@ -313,6 +321,18 @@ async def show_lead_step(message: Message, state: FSMContext, step: State, **fie
     rows = equipment_catalog.button_rows(
         options, lambda index, label: InlineKeyboardButton(text=label, callback_data=f"lead_step:{index}"),
     )
+    if step == LeadForm.attachments:
+        selected = data.get("attachments", [])
+        buttons = [
+            InlineKeyboardButton(
+                text=f"{'✅' if value in selected else '⬜'} {value}",
+                callback_data=f"lead_attachment:pick:{index}",
+            )
+            for index, value in enumerate(ATTACHMENT_OPTIONS)
+        ]
+        rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+        rows.append([InlineKeyboardButton(text="Готово", callback_data="lead_attachment:done"),
+                     InlineKeyboardButton(text="Не требуется", callback_data="lead_attachment:none")])
     if step == LeadForm.review:
         rows = [[InlineKeyboardButton(text="✅ Отправить на модерацию", callback_data="lead_review:send")],
                 [InlineKeyboardButton(text="✏️ Изменить данные", callback_data="lead_review:edit")]]
@@ -336,6 +356,8 @@ async def show_lead_step(message: Message, state: FSMContext, step: State, **fie
         else "Что изменить?" if step == LeadForm.edit
         else LEAD_PROMPTS[step]
     )
+    if step == LeadForm.attachments:
+        prompt += "\n\nВыбрано: " + (lead_journey.attachments_text(data) or "ничего")
     await send_form_panel(message, state, prompt, rows)
 
 
@@ -453,7 +475,7 @@ async def back_in_form(message: Message, state: FSMContext, current: str) -> Non
         else:
             steps = (LeadForm.equipment, LeadForm.equipment_type, LeadForm.equipment_other, LeadForm.region,
                      LeadForm.area, LeadForm.place, LeadForm.map_link, LeadForm.date, LeadForm.schedule,
-                     LeadForm.details, LeadForm.payment, LeadForm.phone, LeadForm.review)
+                     LeadForm.details, LeadForm.attachments, LeadForm.payment, LeadForm.phone, LeadForm.review)
             previous = steps[max(0, steps.index(step) - 1)]
         await show_lead_step(message, state, previous)
     elif current == OfferForm.phone.state:
@@ -843,6 +865,8 @@ async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot)
             "equipment", "equipment_name", "region", "area", "place", "map_link", "work_date",
             "schedule", "details", "payment_method", "phone",
         )}
+        data["attachments"] = json.loads(lead["attachments_json"] or "[]")
+        data["attachments_custom"] = lead["attachments_custom"] or ""
         step = LeadForm.review if data["region"] and data["area"] else LeadForm.region
         await show_lead_step(message, state, step, **data, draft_id=uuid4().hex)
 
@@ -1093,14 +1117,43 @@ async def skip_lead_details(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Этот шаг уже неактуален.")
         return
     await callback.answer()
-    await advance_lead(callback.message, state, LeadForm.payment, details="")
+    await advance_lead(callback.message, state, LeadForm.attachments, details="")
 
 
 @router.message(LeadForm.details)
 async def lead_details(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 1500, phone=False):
         return
-    await advance_lead(message, state, LeadForm.payment, details=message.text)
+    await advance_lead(message, state, LeadForm.attachments, details=message.text)
+
+
+@router.callback_query(F.data.startswith("lead_attachment:"))
+async def lead_attachment_action(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if await state.get_state() != LeadForm.attachments.state or not is_form_panel(callback, data):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    action = callback.data.removeprefix("lead_attachment:")
+    if action == "done":
+        await callback.answer()
+        await advance_lead(callback.message, state, LeadForm.payment)
+    elif action == "none":
+        await callback.answer()
+        await advance_lead(callback.message, state, LeadForm.payment, attachments=[], attachments_custom="")
+    elif re.fullmatch(r"pick:[0-5]", action):
+        await callback.answer()
+        value = ATTACHMENT_OPTIONS[int(action[-1])]
+        selected = set(data.get("attachments", [])) ^ {value}
+        await show_lead_step(callback.message, state, LeadForm.attachments,
+                             attachments=[item for item in ATTACHMENT_OPTIONS if item in selected])
+    else:
+        await callback.answer("Неизвестное действие.")
+
+
+@router.message(LeadForm.attachments)
+async def lead_attachment_custom(message: Message, state: FSMContext):
+    if await valid_input(message, 300):
+        await show_lead_step(message, state, LeadForm.attachments, attachments_custom=message.text.strip())
 
 
 @router.message(LeadForm.payment)
@@ -1130,6 +1183,7 @@ async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[
         await payment_preferences.write_lead(db, lead_id, data.get("payment_method") or payment_preferences.ANY)
         await lead_routing.write_lead(db, lead_id, data["equipment"], data["region"], data["area"])
         await lead_journey.write_details(db, lead_id, data, getattr(customer, "username", None))
+        await lead_journey.write_attachments(db, lead_id, data)
         await lead_journey.record_event(db, lead_id, "submitted", actor_id=customer.id)
         if draft_id:
             await db.execute("INSERT INTO lead_draft_submissions VALUES (?,?)", (draft_id, lead_id))
@@ -1141,16 +1195,19 @@ LEAD_EDIT_FIELDS = {
     LeadForm.equipment: "Техника", LeadForm.region: "Регион", LeadForm.area: "Район",
     LeadForm.place: "Адрес", LeadForm.map_link: "Ссылка на карту", LeadForm.date: "Дата и время",
     LeadForm.schedule: "График смен", LeadForm.details: "Описание",
+    LeadForm.attachments: "Допоборудование",
     LeadForm.payment: "Оплата", LeadForm.phone: "Телефон",
 }
 
 
 def lead_review_text(data):
     fields = ("equipment_name", "region", "area", "place", "map_link", "work_date", "schedule", "details",
-              "payment_method", "phone")
+              "attachments", "payment_method", "phone")
     lines = []
     for label, field in zip(LEAD_EDIT_FIELDS.values(), fields):
-        value = data.get(field) or (data.get("equipment") if field == "equipment_name" else None)
+        value = lead_journey.attachments_text(data) if field == "attachments" else data.get(field)
+        if field == "equipment_name" and not value:
+            value = data.get("equipment")
         lines.append(f"{label}: {value or 'не указано'}")
     return "📋 Предпросмотр заявки\n\n" + "\n".join(lines)
 

@@ -1,5 +1,6 @@
 """Additive fields and lifecycle history for customer requests."""
 import aiosqlite
+import json
 
 
 OFFER_RESULT = """CASE WHEN e.offer_id=o.id THEN 'Выбран'
@@ -18,6 +19,11 @@ async def init_schema(db_path):
                 schedule TEXT,
                 customer_username TEXT
             );
+            CREATE TABLE IF NOT EXISTS lead_attachments (
+                lead_id INTEGER PRIMARY KEY REFERENCES leads(id),
+                selected_json TEXT NOT NULL,
+                custom_text TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS lead_lifecycle_events (
                 id INTEGER PRIMARY KEY,
                 lead_id INTEGER NOT NULL REFERENCES leads(id),
@@ -33,9 +39,28 @@ async def init_schema(db_path):
         await db.commit()
 
 
+def attachments_text(data):
+    selected = data.get("attachments")
+    if selected is None:
+        selected = json.loads(data.get("attachments_json") or "[]")
+    custom = data.get("attachments_custom") or ""
+    return ", ".join([*selected, *([custom] if custom else [])])
+
+
 async def write_details(db, lead_id, data, username):
     await db.execute("INSERT INTO lead_work_details VALUES (?, ?, ?, ?, ?)",
                      (lead_id, data.get("equipment_name"), data.get("map_link"), data.get("schedule"), username))
+
+
+async def write_attachments(db, lead_id, data):
+    selected = data.get("attachments", [])
+    custom = data.get("attachments_custom", "")
+    if not isinstance(selected, list) or any(not isinstance(value, str) or not 1 <= len(value) <= 120 for value in selected):
+        raise ValueError("Invalid attachments")
+    if not isinstance(custom, str) or len(custom) > 300:
+        raise ValueError("Invalid attachment description")
+    await db.execute("INSERT INTO lead_attachments VALUES (?,?,?)",
+                     (lead_id, json.dumps(list(dict.fromkeys(selected)), ensure_ascii=False), custom))
 
 
 async def record_event(db, lead_id, action, *, actor_id=None, reason=None, offer_id=None):

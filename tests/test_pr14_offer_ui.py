@@ -109,6 +109,11 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         callback = self.step("skip", prompt)
         await bot.skip_lead_optional(callback, self.state)
 
+    async def finish_attachments(self):
+        callback = self.step("done", (await self.state.get_data())["form_keyboard_id"])
+        callback.data = "lead_attachment:done"
+        await bot.lead_attachment_action(callback, self.state)
+
     async def test_lead_recovers_all_steps_and_keeps_values_in_main_menu(self):
         await bot.lead_start(self.message, self.state)
         await self.recover_current_step()
@@ -134,6 +139,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             if handler in (bot.lead_place, bot.lead_date):
                 await self.skip_lead_optional()
             await self.recover_current_step()
+        await self.finish_attachments()
         await self.pick_lead_option(0)
         await self.recover_current_step()
         await bot.open_navigation(self.message, self.state)
@@ -154,6 +160,73 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         async with aiosqlite.connect(storage.DB_PATH) as db:
             rows = await (await db.execute("SELECT place, work_date, details FROM leads WHERE customer_id=20")).fetchall()
         self.assertEqual(rows, [("улица Свободы", "завтра в 9", "Работа на смену")])
+
+    async def test_attachments_multiselect_custom_resume_edit_and_publication(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        await bot.show_lead_step(self.message, self.state, bot.LeadForm.attachments,
+                                 equipment="КДМ", details="Работа", region="Москва", area="ЦАО",
+                                 place="Адрес", work_date="завтра", phone="+79990000001",
+                                 payment_method=bot.payment_preferences.CASH, draft_id="attachments-draft")
+
+        async def choose(action):
+            panel = (await self.state.get_data())["form_keyboard_id"]
+            callback = self.step(action, panel)
+            callback.data = f"lead_attachment:{action}"
+            await bot.lead_attachment_action(callback, self.state)
+            return callback
+
+        old = await choose("pick:0")
+        await choose("pick:1")
+        await bot.lead_attachment_action(old, self.state)
+        self.assertEqual((await self.state.get_data())["attachments"], ["Гидромолот", "Вилы"])
+        self.message.text = "Особая оснастка"
+        await bot.lead_attachment_custom(self.message, self.state)
+        await bot.show_main_menu(self.message, self.state)
+        self.state = self.reopen_sqlite_state()
+        self.message.text = bot.LEAD_DRAFT
+        await bot.resume_form_from_menu(self.message, self.state)
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.attachments.state)
+        await self.nav("back")
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.details.state)
+        await bot.show_lead_step(self.message, self.state, bot.LeadForm.attachments)
+        await choose("done")
+        await self.pick_lead_option(0)
+        self.message.text = "+79990000001"
+        await bot.lead_phone(self.message, self.state, self.telegram)
+        self.assertIn("Допоборудование: Гидромолот, Вилы, Особая оснастка",
+                      self.message.answer.await_args.args[0])
+
+        edit = self.step("edit", (await self.state.get_data())["form_keyboard_id"])
+        edit.data = "lead_review:edit"
+        await bot.lead_review_action(edit, self.state, self.telegram)
+        field = self.step("field", (await self.state.get_data())["form_keyboard_id"])
+        field.data = f"lead_review:{tuple(bot.LEAD_EDIT_FIELDS).index(bot.LeadForm.attachments)}"
+        await bot.lead_review_action(field, self.state, self.telegram)
+        await choose("pick:0")
+        await choose("done")
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.review.state)
+        await self.submit_lead_review()
+        lead = await bot.get_lead(2)
+        self.assertIn("Допоборудование: Вилы, Особая оснастка", bot.lead_text(lead))
+        self.assertNotIn("Гидромолот", bot.lead_text(lead))
+        self.assertNotIn("+79990000001", bot.lead_text(lead))
+        await bot.lead_card_action(SimpleNamespace(
+            message=self.message, from_user=self.message.from_user, data="lc:repeat:2", answer=AsyncMock(),
+        ), self.state, self.telegram)
+        self.assertEqual((await self.state.get_data())["attachments"], ["Вилы"])
+        self.assertEqual((await self.state.get_data())["attachments_custom"], "Особая оснастка")
+
+    async def test_attachments_can_be_cleared_without_clearing_other_fields(self):
+        await bot.show_lead_step(self.message, self.state, bot.LeadForm.attachments,
+                                 attachments=["Бур"], attachments_custom="Особая", details="Работа")
+        panel = (await self.state.get_data())["form_keyboard_id"]
+        action = self.step("none", panel)
+        action.data = "lead_attachment:none"
+        await bot.lead_attachment_action(action, self.state)
+        data = await self.state.get_data()
+        self.assertEqual((data["attachments"], data["attachments_custom"], data["details"]), ([], "", "Работа"))
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.payment.state)
 
     async def test_offer_recovers_all_steps_and_resumes_unsubmitted_review(self):
         await bot.start_offer(self.message, self.state, CommandObject(args="lead_1"))
@@ -263,6 +336,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             await handler(self.message, self.state)
             if handler in (bot.lead_place, bot.lead_date):
                 await self.skip_lead_optional()
+        await self.finish_attachments()
         await self.pick_lead_option(0)
         self.message.text = "+79990000001"
         data = await self.state.get_data()
@@ -405,6 +479,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         skip = self.step("skip", prompt)
         skip.data = "lead_skip_details"
         await bot.skip_lead_details(skip, self.state)
+        await self.finish_attachments()
         await self.pick_lead_option(0)
         self.message.text = "+79990000001"
         await bot.lead_phone(self.message, self.state, self.telegram)

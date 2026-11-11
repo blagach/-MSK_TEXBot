@@ -178,3 +178,31 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
         candidate = next(backup.parent.glob("restore-candidate-*.sqlite"))
         self.assertIn(f"{candidate} SHA-256 ", output.getvalue())
         self.assertGreaterEqual(render_test_backup.verify_preserved_rows(self.path, candidate), 19)
+
+
+    async def test_additive_attachments_schema_preserves_legacy_rows_and_excel(self):
+        legacy = self.path.with_name("legacy.sqlite")
+        with sqlite3.connect(legacy) as db:
+            db.executescript("""
+                CREATE TABLE leads(id INTEGER PRIMARY KEY, details TEXT);
+                CREATE TABLE offers(id INTEGER PRIMARY KEY);
+                INSERT INTO leads VALUES (11,'Историческая заявка');
+                INSERT INTO offers VALUES (14);
+            """)
+        snapshot, digest = render_test_backup.snapshot(legacy)
+        candidate = render_test_backup.restore_candidate(snapshot, digest)
+        for _ in range(2):
+            await lead_journey.init_schema(str(candidate))
+            self.assertEqual(render_test_backup.verify_preserved_rows(snapshot, candidate), 2)
+        self.assertEqual(lead_journey.attachments_text({"details": "Старая запись"}), "")
+        lead_id = await self.make_lead()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE lead_attachments SET selected_json=?,custom_text=? WHERE lead_id=?",
+                             ('["Вилы"]', "Особое", lead_id))
+            await db.commit()
+        from openpyxl import load_workbook
+        from io import BytesIO
+        import admin_reports
+        sheet = load_workbook(BytesIO(await admin_reports.export_xlsx()))["Заявки"]
+        header, row = list(sheet.values)
+        self.assertEqual(row[header.index("Допоборудование")], "Вилы, Особое")

@@ -11,7 +11,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 import storage
-from lead_journey import OFFER_RESULT
+from lead_journey import OFFER_RESULT, attachments_text
 from provider_registry import _validate_phone
 
 USERS = """
@@ -201,10 +201,12 @@ async def export_xlsx():
         """)
         equipment = await rows(db, EQUIPMENT)
         leads = await rows(db, """
-            SELECT l.*, r.region, r.area, d.equipment_name, d.map_link, d.schedule, p.method
+            SELECT l.*, r.region, r.area, d.equipment_name, d.map_link, d.schedule, p.method,
+                   a.selected_json AS attachments_json, a.custom_text AS attachments_custom
             FROM leads l LEFT JOIN lead_routing r ON r.lead_id=l.id
             LEFT JOIN lead_work_details d ON d.lead_id=l.id
-            LEFT JOIN lead_payment_preferences p ON p.lead_id=l.id ORDER BY l.id
+            LEFT JOIN lead_payment_preferences p ON p.lead_id=l.id
+            LEFT JOIN lead_attachments a ON a.lead_id=l.id ORDER BY l.id
         """)
         offers = await rows(db, f"""
             SELECT o.*, n.note, {OFFER_RESULT} AS result
@@ -239,12 +241,12 @@ async def export_xlsx():
                                     item["category"], item["description"], item["location"], item["status"]))
     orders = workbook.create_sheet("Заявки")
     orders.append(("№", "Telegram ID заказчика", "Имя", "Техника", "Уточнение техники", "Регион", "Район",
-                   "Адрес", "Карта", "Дата и время работ", "График", "Описание", "Оплата", "Телефон", "Статус", "Создано, МСК"))
+                   "Адрес", "Карта", "Дата и время работ", "График", "Описание", "Оплата", "Телефон", "Статус", "Создано, МСК", "Допоборудование"))
     for lead in leads:
         append_text_safe(orders, (lead["id"], str(lead["customer_id"]), lead["customer_name"], lead["equipment"],
                                   lead["equipment_name"], lead["region"], lead["area"], lead["place"], lead["map_link"],
                                   lead["work_date"], lead["schedule"], lead["details"], lead["method"],
-                                  normalized_phone(lead["phone"]), lead["status"], moscow_time(lead["created_at"])))
+                                  normalized_phone(lead["phone"]), lead["status"], moscow_time(lead["created_at"]), attachments_text(dict(lead))))
     responses = workbook.create_sheet("Отклики")
     responses.append(("№", "№ заявки", "Telegram ID исполнителя", "Исполнитель", "Username", "Профиль",
                       "Телефон", "Стоимость", "Условия", "Результат", "Доставка", "Создано, МСК", "Комментарий"))
