@@ -161,6 +161,66 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             rows = await (await db.execute("SELECT place, work_date, details FROM leads WHERE customer_id=20")).fetchall()
         self.assertEqual(rows, [("улица Свободы", "завтра в 9", "Работа на смену")])
 
+    async def test_admin_closure_requires_confirmation_survives_menu_and_sends_once(self):
+        self.state = self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+
+        def closure(action, panel=None):
+            callback = self.step(action, panel or 1)
+            callback.data = f"lead_close:{action}"
+            return callback
+
+        with patch.object(bot, "settings", replace(bot.settings, admin_ids={20})):
+            start = closure("start")
+            start.data = "lc:close:1"
+            await bot.lead_card_action(start, self.state, self.telegram)
+            self.message.text = "Объект завершён"
+            await bot.close_lead_reason(self.message, self.state)
+            first = (await self.state.get_data())["form_keyboard_id"]
+            self.assertEqual((await bot.get_lead(1))["status"], "published")
+            await bot.close_lead_confirmation(closure("edit", first), self.state, self.telegram)
+            old = closure("send", first)
+            await bot.close_lead_confirmation(old, self.state, self.telegram)
+            old.answer.assert_awaited_once_with("Этот шаг уже неактуален.")
+            self.message.text = "Заказчик подтвердил завершение"
+            await bot.close_lead_reason(self.message, self.state)
+            await bot.show_main_menu(self.message, self.state)
+            self.state = self.reopen_sqlite_state()
+            self.message.text = bot.CLOSING_ACTION_DRAFT
+            await bot.resume_auxiliary_action(self.message, self.state)
+            self.assertEqual(await self.state.get_state(), bot.CloseLead.confirm.state)
+            self.assertEqual((await self.state.get_data())["closing_reason"], "Заказчик подтвердил завершение")
+            panel = (await self.state.get_data())["form_keyboard_id"]
+            send = closure("send", panel)
+            await bot.close_lead_confirmation(send, self.state, self.telegram)
+            await bot.close_lead_confirmation(send, self.state, self.telegram)
+        self.assertEqual((await bot.get_lead(1))["status"], "closed")
+        self.telegram.send_message.assert_awaited_once_with(
+            10, "Заявка №1 закрыта администратором.\nПричина: Заказчик подтвердил завершение",
+        )
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            rows = await (await db.execute(
+                "SELECT actor_id,reason FROM lead_lifecycle_events WHERE action='closed' AND lead_id=1"
+            )).fetchall()
+        self.assertEqual(rows, [(20, "Заказчик подтвердил завершение")])
+        self.assertIsNone(await self.state.get_state())
+
+    async def test_closure_cancel_and_missing_permissions_preserve_published_lead(self):
+        for action in ("cancel", "send"):
+            await self.state.set_data({"closing_lead": 1, "closing_reason": "Причина"})
+            await self.state.set_state(bot.CloseLead.confirm)
+            await bot.show_closing_step(self.message, self.state)
+            panel = (await self.state.get_data())["form_keyboard_id"]
+            callback = self.step(action, panel)
+            callback.data = f"lead_close:{action}"
+            await bot.close_lead_confirmation(callback, self.state, self.telegram)
+            self.assertEqual((await bot.get_lead(1))["status"], "published")
+        self.telegram.send_message.assert_not_awaited()
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            self.assertEqual(await (await db.execute(
+                "SELECT count(*) FROM lead_lifecycle_events WHERE action='closed'"
+            )).fetchone(), (0,))
+
     async def test_attachments_multiselect_custom_resume_edit_and_publication(self):
         self.state = self.reopen_sqlite_state()
         await self.state.storage.init_schema()

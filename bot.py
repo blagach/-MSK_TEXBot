@@ -106,6 +106,7 @@ class LeadForm(StatesGroup):
 
 class CloseLead(StatesGroup):
     reason = State()
+    confirm = State()
 
 
 class ProviderForm(StatesGroup):
@@ -167,6 +168,7 @@ FORM_STEPS = {step.state: step for step in (*LeadForm.__all_states__, *OfferForm
 LEAD_DRAFT = "▶️ Продолжить заявку"
 PROVIDER_ACTION_DRAFT = "▶️ Продолжить настройку исполнителя"
 SUPPORT_ACTION_DRAFT = "▶️ Продолжить обращение"
+CLOSING_ACTION_DRAFT = "▶️ Продолжить закрытие заявки"
 CUSTOMER_ROLE = "📋 Я заказчик"
 PROVIDER_ROLE = "🚜 Я исполнитель"
 MY_LEADS = "📋 Мои заявки"
@@ -374,6 +376,8 @@ async def pause_form(message: Message, state: FSMContext) -> None:
     kind = form_kind(current)
     if current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__):
         kind = "provider_action"
+    elif current in CloseLead.__all_states_names__:
+        kind = "lead_closing"
     elif current in (support_ui.Support.compose.state, support_ui.Support.reply.state,
                      support_ui.Support.requester_reply.state):
         kind = "support_action"
@@ -398,16 +402,19 @@ async def pause_form(message: Message, state: FSMContext) -> None:
 
 async def menu_with_paused_actions(state):
     rows = []
-    for kind, label in (("provider_action", PROVIDER_ACTION_DRAFT), ("support_action", SUPPORT_ACTION_DRAFT)):
+    for kind, label in (("provider_action", PROVIDER_ACTION_DRAFT), ("support_action", SUPPORT_ACTION_DRAFT),
+                        ("lead_closing", CLOSING_ACTION_DRAFT)):
         if await draft_slot(state, kind).get_state():
             rows.append((label,))
     return main_menu(is_admin(state.key.user_id), rows)
 
 
-@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT}))
+@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT}))
 async def resume_auxiliary_action(message: Message, state: FSMContext):
     provider = message.text == PROVIDER_ACTION_DRAFT
-    draft = draft_slot(state, "provider_action" if provider else "support_action")
+    closing = message.text == CLOSING_ACTION_DRAFT
+    kind = "lead_closing" if closing else ("provider_action" if provider else "support_action")
+    draft = draft_slot(state, kind)
     current = await draft.get_state()
     if not current:
         await message.answer("Незавершённого действия нет.")
@@ -419,7 +426,9 @@ async def resume_auxiliary_action(message: Message, state: FSMContext):
         await state.set_data(await draft.get_data())
         await state.set_state(current)
         await draft.clear()
-    if provider:
+    if closing:
+        await show_closing_step(message, state)
+    elif provider:
         await provider_ui.resume_provider_step(message, state, current)
     else:
         await support_ui.resume_support_step(message, state, current)
@@ -854,8 +863,7 @@ async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot)
         await pause_form(message, state)
         await state.set_state(CloseLead.reason)
         await state.update_data(closing_lead=lead_id)
-        await message.answer("Укажите причину закрытия заявки.",
-                             reply_markup=section_keyboard((OFFER_HOME,)))
+        await show_closing_step(message, state)
     elif action == "repeat" and owner:
         if form_kind(await state.get_state()) == "lead" or await draft_slot(state, "lead").get_state():
             await message.answer("Сначала завершите или отмените текущий черновик заявки.")
@@ -919,19 +927,73 @@ async def show_customer_offers(message, lead, before):
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
+async def show_closing_step(message, state):
+    await clear_form_keyboard(message, state)
+    data = await state.get_data()
+    if await state.get_state() == CloseLead.confirm.state:
+        rows = [
+            [InlineKeyboardButton(text="✅ Подтвердить закрытие", callback_data="lead_close:send")],
+            [InlineKeyboardButton(text="✏️ Изменить причину", callback_data="lead_close:edit"),
+             InlineKeyboardButton(text="Отмена", callback_data="lead_close:cancel")],
+            [InlineKeyboardButton(text=OFFER_HOME, callback_data="lead_close:home")],
+        ]
+        await send_form_panel(message, state,
+                              f"Закрыть заявку №{data['closing_lead']}?\nПричина: {data['closing_reason']}", rows)
+    else:
+        await message.answer("Укажите причину закрытия заявки.",
+                             reply_markup=section_keyboard((OFFER_HOME,)))
+
+
 @router.message(CloseLead.reason)
 async def close_lead_reason(message: Message, state: FSMContext):
     if not await valid_input(message, 500):
         return
-    lead_id = (await state.get_data()).get("closing_lead")
-    user_id = message.from_user.id
+    await state.update_data(closing_reason=message.text.strip())
+    await state.set_state(CloseLead.confirm)
+    await show_closing_step(message, state)
+
+
+@router.callback_query(F.data.startswith("lead_close:"))
+async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    message = callback.message
+    if (await state.get_state() != CloseLead.confirm.state or not is_form_panel(callback, data)
+            or message.chat.type != "private" or message.chat.id != callback.from_user.id):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    action = callback.data.removeprefix("lead_close:")
+    if action not in {"send", "edit", "cancel", "home"}:
+        await callback.answer("Неизвестное действие.")
+        return
+    await callback.answer()
+    if action == "home":
+        await show_main_menu(message, state)
+        return
+    await clear_form_keyboard(message, state)
+    if action == "edit":
+        await state.set_state(CloseLead.reason)
+        await show_closing_step(message, state)
+        return
+    lead_id = data["closing_lead"]
+    user_id = callback.from_user.id
+    if action == "cancel":
+        await state.clear()
+        await message.answer("Закрытие отменено.", reply_markup=main_menu(is_admin(user_id)))
+        return
     changed = await lead_journey.change_lifecycle(
-        storage.DB_PATH, lead_id, user_id, admin=is_admin(user_id), reason=message.text.strip(),
+        storage.DB_PATH, lead_id, user_id, admin=is_admin(user_id), reason=data["closing_reason"],
     )
     await state.clear()
+    notice = ""
+    if changed:
+        lead = await get_lead(lead_id)
+        if lead["customer_id"] != user_id:
+            delivered = await notify(bot, lead["customer_id"],
+                                           f"Заявка №{lead_id} закрыта администратором.\nПричина: {data['closing_reason']}")
+            notice = "\nУведомление принято Telegram." if delivered else "\nУведомление заказчику не отправлено."
     await message.answer(
-        f"Заявка №{lead_id} закрыта. Причина сохранена." if changed else "Заявка недоступна или уже закрыта.",
-        reply_markup=main_menu(is_admin(user_id)),
+        (f"Заявка №{lead_id} закрыта. Причина сохранена." + notice) if changed
+        else "Заявка недоступна или уже закрыта.", reply_markup=main_menu(is_admin(user_id)),
     )
 
 
