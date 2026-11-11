@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 from draft_storage import SQLiteDraftStorage, draft_slot, offer_draft_ids, offer_draft_slot
 
 import admin_ui
+import admin_access
 import equipment_catalog
 import support_storage
 import support_ui
@@ -59,6 +60,7 @@ class Settings:
     bot_username: str
     test_notification_provider_ids: frozenset[int] = frozenset()
     support_group_id: int | None = None
+    owner_id: int | None = None
 
 
 def read_settings() -> Settings:
@@ -70,6 +72,9 @@ def read_settings() -> Settings:
     support_group_id = int(os.environ["SUPPORT_GROUP_ID"]) if os.getenv("SUPPORT_GROUP_ID") else None
     if support_group_id is not None and (support_group_id >= 0 or support_group_id == int(channel)):
         raise RuntimeError("SUPPORT_GROUP_ID must identify a separate group")
+    owner_id = int(os.environ["SERVICE_OWNER_ID"]) if os.getenv("SERVICE_OWNER_ID") else None
+    if owner_id is not None and owner_id <= 0:
+        raise RuntimeError("SERVICE_OWNER_ID must be a positive Telegram ID")
     return Settings(
         token,
         admins,
@@ -77,7 +82,7 @@ def read_settings() -> Settings:
         os.getenv("PAYMENT_URL", ""),
         os.getenv("BOT_USERNAME", "MSK_TEXBot").lstrip("@"),
         frozenset(int(value.strip()) for value in os.getenv("TEST_NOTIFICATION_PROVIDER_IDS", "").split(",") if value.strip()),
-        support_group_id,
+        support_group_id, owner_id,
     )
 
 
@@ -169,6 +174,7 @@ LEAD_DRAFT = "▶️ Продолжить заявку"
 PROVIDER_ACTION_DRAFT = "▶️ Продолжить настройку исполнителя"
 SUPPORT_ACTION_DRAFT = "▶️ Продолжить обращение"
 CLOSING_ACTION_DRAFT = "▶️ Продолжить закрытие заявки"
+ADMIN_ACTION_DRAFT = "▶️ Продолжить настройку прав"
 CUSTOMER_ROLE = "📋 Я заказчик"
 PROVIDER_ROLE = "🚜 Я исполнитель"
 MY_LEADS = "📋 Мои заявки"
@@ -181,12 +187,20 @@ OFFER_EDIT_FIELDS = {
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in settings.admin_ids
+    return user_id in settings.admin_ids or user_id == settings.owner_id
 
 
 def main_menu(admin: bool = False, extra=()) -> ReplyKeyboardMarkup:
     actions = (support_ui.HELP_LABEL, admin_ui.ADMIN_LABEL) if admin else (support_ui.HELP_LABEL,)
     return section_keyboard((CUSTOMER_ROLE, PROVIDER_ROLE), actions, *extra)
+
+
+async def admin_allowed(user_id, permission):
+    return await admin_access.allowed(user_id, permission, settings.admin_ids, settings.owner_id)
+
+
+async def admin_recipients(permission):
+    return await admin_access.staff(permission, settings.admin_ids, settings.owner_id)
 
 
 def respond_button(lead_id: int) -> InlineKeyboardButton:
@@ -222,6 +236,7 @@ async def init_db() -> None:
             )
         """)
         await db.commit()
+    await admin_access.init_schema()
     await storage.init_schema()
     await provider_registry.init_schema(storage.DB_PATH)
     await lead_routing.init_schema(storage.DB_PATH)
@@ -377,6 +392,8 @@ async def pause_form(message: Message, state: FSMContext) -> None:
     if current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__,
                    *provider_ui.AlertPreferences.__all_states_names__):
         kind = "provider_action"
+    elif current in admin_ui.ManageAdmins.__all_states_names__:
+        kind = "admin_action"
     elif current in CloseLead.__all_states_names__:
         kind = "lead_closing"
     elif current in (support_ui.Support.compose.state, support_ui.Support.reply.state,
@@ -406,17 +423,21 @@ async def pause_form(message: Message, state: FSMContext) -> None:
 async def menu_with_paused_actions(state):
     rows = []
     for kind, label in (("provider_action", PROVIDER_ACTION_DRAFT), ("support_action", SUPPORT_ACTION_DRAFT),
-                        ("lead_closing", CLOSING_ACTION_DRAFT)):
+                        ("lead_closing", CLOSING_ACTION_DRAFT), ("admin_action", ADMIN_ACTION_DRAFT)):
         if await draft_slot(state, kind).get_state():
             rows.append((label,))
-    return main_menu(is_admin(state.key.user_id), rows)
+    return main_menu(await admin_allowed(state.key.user_id, "panel"), rows)
 
 
-@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT}))
+@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT}))
 async def resume_auxiliary_action(message: Message, state: FSMContext):
     provider = message.text == PROVIDER_ACTION_DRAFT
     closing = message.text == CLOSING_ACTION_DRAFT
-    kind = "lead_closing" if closing else ("provider_action" if provider else "support_action")
+    admin_action = message.text == ADMIN_ACTION_DRAFT
+    kind = "admin_action" if admin_action else ("lead_closing" if closing else ("provider_action" if provider else "support_action"))
+    if admin_action and not await admin_allowed(message.from_user.id, "roles"):
+        await message.answer("Нет доступа.")
+        return
     draft = draft_slot(state, kind)
     current = await draft.get_state()
     if not current:
@@ -429,7 +450,9 @@ async def resume_auxiliary_action(message: Message, state: FSMContext):
         await state.set_data(await draft.get_data())
         await state.set_state(current)
         await draft.clear()
-    if closing:
+    if admin_action:
+        await admin_ui.resume_admin_step(message, state)
+    elif closing:
         await show_closing_step(message, state)
     elif provider:
         await provider_ui.resume_provider_step(message, state, current)
@@ -712,7 +735,7 @@ async def open_support(message: Message, state: FSMContext, command: CommandObje
     user_id = message.from_user.id
     await pause_form(message, state)
     await message.answer("Выберите раздел ниже.", reply_markup=main_menu(is_admin(user_id)))
-    if command and command.args and is_admin(user_id) and support_ui.positive_id(command.args):
+    if command and command.args and await admin_allowed(user_id, "support") and support_ui.positive_id(command.args):
         await support_ui.show_ticket(message, int(command.args), user_id, True)
     else:
         await support_ui.menu(message, user_id, settings.admin_ids)
@@ -721,12 +744,13 @@ async def open_support(message: Message, state: FSMContext, command: CommandObje
 @router.message(Command("admin"), F.chat.type == "private")
 @router.message(F.text == admin_ui.ADMIN_LABEL, F.chat.type == "private")
 async def open_admin_panel(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not await admin_allowed(message.from_user.id, "panel"):
+        await admin_access.record(message.from_user.id, "admin_denied", result="denied")
         await message.answer("Нет доступа.")
         return
     await pause_form(message, state)
     await message.answer("Выберите отчёт ниже.", reply_markup=main_menu(True))
-    await admin_ui.menu(message)
+    await admin_ui.menu(message, message.from_user.id, settings.admin_ids, settings.owner_id)
 
 
 @router.message(F.text.in_({CUSTOMER_ROLE, "🧾 Заказчик"}))
@@ -827,7 +851,7 @@ async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot)
     _, action, value = parts[:3]
     lead_id = storage.parse_id("lead_" + value, "lead_")
     user_id = callback.from_user.id
-    admin = is_admin(user_id)
+    admin = await admin_allowed(user_id, "moderate")
     message = callback.message
     if message.chat.id != user_id:
         await callback.answer("Карточка недоступна.")
@@ -851,6 +875,9 @@ async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot)
     owner = user_id == lead["customer_id"]
     await callback.answer()
     if action == "open":
+        if admin:
+            await admin_access.mark_lead_view(user_id, lead_id)
+            await admin_access.record(user_id, "lead_view", target_id=lead_id)
         await show_customer_lead(message, lead, owner, admin)
     elif action == "offers" and owner:
         before = storage.parse_id(parts[3], "") if len(parts) == 4 else 2**63 - 1
@@ -984,8 +1011,10 @@ async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bo
         await message.answer("Закрытие отменено.", reply_markup=main_menu(is_admin(user_id)))
         return
     changed = await lead_journey.change_lifecycle(
-        storage.DB_PATH, lead_id, user_id, admin=is_admin(user_id), reason=data["closing_reason"],
+        storage.DB_PATH, lead_id, user_id, admin=await admin_allowed(user_id, "moderate"), reason=data["closing_reason"],
     )
+    await admin_access.record(user_id, "lead_close", target_id=lead_id,
+                              result="success" if changed else "not_changed")
     await state.clear()
     notice = ""
     if changed:
@@ -1331,7 +1360,7 @@ async def submit_lead(message, customer, state, bot, data):
         InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}"),
     ]])
-    for admin_id in settings.admin_ids:
+    for admin_id in await admin_recipients("moderate"):
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
     await clear_form_keyboard(message, state)
     await state.clear()
@@ -1558,7 +1587,7 @@ async def send_offer(message: Message, provider: User, state: FSMContext, bot: B
         reply_markup=contacts,
     )
     await storage.mark_offer(offer_id, "sent" if delivered else "unconfirmed")
-    for admin_id in settings.admin_ids:
+    for admin_id in await admin_recipients("moderate"):
         await notify(bot, admin_id, offer + f"\nТелефон: {phone}" + (
             "" if delivered else "\n⚠️ Доставка заказчику не подтверждена. Отклик сохранён."
         ))
@@ -1584,7 +1613,7 @@ async def show_provider_phone(callback: CallbackQuery, bot: Bot) -> None:
 
 
 async def admin_lead_id(callback: CallbackQuery, prefix: str):
-    if not is_admin(callback.from_user.id):
+    if not await admin_allowed(callback.from_user.id, "moderate"):
         await callback.answer("Нет доступа", show_alert=True)
         return None
     lead_id = storage.parse_id(callback.data, prefix)
@@ -1649,6 +1678,7 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
                      "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
         return
     await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
+    await admin_access.record(callback.from_user.id, "lead_publish", target_id=lead_id)
     await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
     await notify(bot, lead["customer_id"], f"Ваша заявка №{lead_id} опубликована.")
     await notify_test_providers(bot, lead)
@@ -1671,6 +1701,7 @@ async def reject_lead(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Заявка отклонена")
     except TelegramAPIError:
         logging.warning("Cannot acknowledge rejection callback for lead %s", lead_id)
+    await admin_access.record(callback.from_user.id, "lead_reject", target_id=lead_id)
     lead = await get_lead(lead_id)
     await notify(bot, lead["customer_id"], "К сожалению, сейчас не сможем подобрать исполнителя по этой заявке.")
     if callback.message:
@@ -1695,6 +1726,7 @@ def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatch
     dispatcher = Dispatcher(
         storage=fsm_storage or MemoryStorage(), events_isolation=SimpleEventIsolation(),
         support_admin_ids=settings.admin_ids, support_group_id=settings.support_group_id,
+        service_owner_id=settings.owner_id,
     )
     dispatcher.message.outer_middleware(track_private_visitor)
     dispatcher.callback_query.outer_middleware(track_private_visitor)

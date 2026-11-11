@@ -33,7 +33,7 @@ class TestConfiguration:
 def read_test_configuration(env: Mapping[str, str]) -> TestConfiguration:
     if any(env.get(name) for name in (
         "BOT_TOKEN", "BOT_USERNAME", "ADMIN_IDS", "LEADS_CHANNEL_ID", "PAYMENT_URL",
-        "TEST_NOTIFICATION_PROVIDER_IDS", "DATABASE_URL", "SUPPORT_GROUP_ID",
+        "TEST_NOTIFICATION_PROVIDER_IDS", "DATABASE_URL", "SUPPORT_GROUP_ID", "SERVICE_OWNER_ID",
     )):
         raise IsolationError("Shared bot settings must be absent from the test worker")
     token = env.get("TEST_BOT_TOKEN", "").strip()
@@ -93,7 +93,7 @@ async def start() -> None:
 
         os.environ.update(
             BOT_TOKEN=config.token, BOT_USERNAME=TEST_BOT, ADMIN_IDS=str(config.admin_id),
-            LEADS_CHANNEL_ID=str(config.channel_id), PAYMENT_URL="",
+            LEADS_CHANNEL_ID=str(config.channel_id), PAYMENT_URL="", SERVICE_OWNER_ID=str(config.admin_id),
             TEST_NOTIFICATION_PROVIDER_IDS=",".join(map(str, sorted(config.testers))),
         )
         if config.support_group_id is not None:

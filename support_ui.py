@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from render_test_guard import IsolationError
 
 import support_storage as store
+import admin_access
 from support_content import FAQ, GUIDES, TRAINING
 from support_group import is_private_admin_group
 
@@ -180,7 +181,8 @@ async def show_ticket(message, ticket_id, user_id, admin, offset=0, origin=""):
     )
 
 
-async def notify_admins(bot, admin_ids, group_id, ticket_id, kind):
+async def notify_admins(bot, admin_ids, group_id, ticket_id, kind, service_owner_id=None):
+    admin_ids = set(await admin_access.staff("support", admin_ids, service_owner_id))
     text = f"Новое обращение №{ticket_id} · {KINDS[kind]}"
     if group_id is not None:
         try:
@@ -199,7 +201,7 @@ async def notify_admins(bot, admin_ids, group_id, ticket_id, kind):
 
 
 @router.callback_query(F.data.startswith("help:"))
-async def support_action(callback: CallbackQuery, state: FSMContext, bot, support_admin_ids, support_group_id=None):
+async def support_action(callback: CallbackQuery, state: FSMContext, bot, support_admin_ids, support_group_id=None, service_owner_id=None):
     message = callback.message
     user_id = callback.from_user.id
     if not isinstance(message, Message) or message.chat.type != "private" or message.chat.id != user_id:
@@ -207,7 +209,7 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         return
     parts = callback.data.split(":")[1:]
     action = parts[0]
-    admin = user_id in support_admin_ids
+    admin = await admin_access.allowed(user_id, "support", support_admin_ids, service_owner_id)
     if action in {"queue", "list", "status", "reply", "close"} and not admin:
         await callback.answer("Нет доступа.", show_alert=True)
         return
@@ -279,13 +281,13 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         )
         await state.clear()
         if created:
-            await notify_admins(bot, support_admin_ids, support_group_id, ticket_id, data["support_kind"])
+            await notify_admins(bot, support_admin_ids, support_group_id, ticket_id, data["support_kind"], service_owner_id)
         await message.answer(f"Обращение №{ticket_id} принято.", reply_markup=keys(
             (("Открыть обращение", f"ticket:{ticket_id}:0"),), BACK,
         ))
     elif parts == ["panel"] and admin:
         import admin_ui
-        await admin_ui.menu(message)
+        await admin_ui.menu(message, user_id, support_admin_ids, service_owner_id)
     elif parts == ["queue"]:
         totals = await store.counts()
         await message.answer("Очередь поддержки", reply_markup=keys(
@@ -315,7 +317,7 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         target = "closed" if action == "owner_confirm" else "new"
         changed = await store.requester_status(ticket["id"], user_id, target, int(parts[2]))
         if changed and target == "new":
-            await notify_admins(bot, support_admin_ids, support_group_id, ticket["id"], ticket["kind"])
+            await notify_admins(bot, support_admin_ids, support_group_id, ticket["id"], ticket["kind"], service_owner_id)
         await message.answer("Статус обновлён." if changed else "Статус уже изменён.")
         await show_ticket(message, ticket["id"], user_id, admin)
     elif action == "close" and len(parts) >= 2 and positive_id(parts[1]):
@@ -327,6 +329,8 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         ))
     elif action == "status" and len(parts) >= 3 and positive_id(parts[1]) and parts[2] in {"in_progress", "closed"}:
         changed = await store.change_status(int(parts[1]), parts[2], user_id)
+        if changed:
+            await admin_access.record(user_id, "support_status", target_id=int(parts[1]), details={"status": parts[2]})
         await message.answer(f"Статус обновлён: {STATUSES[parts[2]]}." if changed else "Статус уже изменён или обращение недоступно.")
         await show_ticket(message, int(parts[1]), user_id, admin, origin=ticket_list_origin(parts[3:], admin))
     elif action == "follow" and len(parts) == 2 and positive_id(parts[1]):
@@ -408,7 +412,7 @@ async def show_ticket_preview(message, data):
 
 
 @router.message(Support.requester_reply)
-async def requester_reply(message: Message, state: FSMContext, bot, support_admin_ids, support_group_id=None):
+async def requester_reply(message: Message, state: FSMContext, bot, support_admin_ids, support_group_id=None, service_owner_id=None):
     text = (message.text or "").strip()
     if not 1 <= len(text) <= 1200:
         await message.answer("Введите сообщение длиной до 1200 символов.", reply_markup=keys(BACK))
@@ -422,15 +426,16 @@ async def requester_reply(message: Message, state: FSMContext, bot, support_admi
         await state.clear()
         return
     await state.clear()
-    await notify_admins(bot, support_admin_ids, support_group_id, ticket_id, ticket["kind"])
+    await notify_admins(bot, support_admin_ids, support_group_id, ticket_id, ticket["kind"], service_owner_id)
     await message.answer("Сообщение сохранено в обращении.", reply_markup=keys(
         (("Открыть обращение", f"ticket:{ticket_id}:0"),), BACK,
     ))
 
 
 @router.message(Support.reply)
-async def reply_to_ticket(message: Message, state: FSMContext, bot, support_admin_ids):
-    if message.from_user.id not in support_admin_ids or message.chat.id != message.from_user.id:
+async def reply_to_ticket(message: Message, state: FSMContext, bot, support_admin_ids, service_owner_id=None):
+    if (message.chat.id != message.from_user.id
+            or not await admin_access.allowed(message.from_user.id, "support", support_admin_ids, service_owner_id)):
         await message.answer("Нет доступа.")
         return
     text = (message.text or "").strip()
@@ -444,6 +449,7 @@ async def reply_to_ticket(message: Message, state: FSMContext, bot, support_admi
     if not reply_id:
         await message.answer("Обращение закрыто или ответ уже сохранён.", reply_markup=keys(BACK))
         return
+    await admin_access.record(message.from_user.id, "support_reply", target_id=ticket_id)
     status = await deliver_reply(bot, reply_id)
     origin = data.get("support_origin")
     suffix = f":{origin}" if origin else ""

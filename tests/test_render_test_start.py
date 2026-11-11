@@ -53,6 +53,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(worker.importlib, "import_module", return_value=app if app is not None else self.app),
         ):
             await worker.start()
+            self.assertEqual(os.environ["SERVICE_OWNER_ID"], CONFIG["TEST_ADMIN_ID"])
             check_channel.assert_awaited_once_with(self.telegram)
 
     async def test_worker_wires_guard_and_test_database(self):
@@ -96,6 +97,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             {**CONFIG, "BOT_TOKEN": "unexpected"},
             {**CONFIG, "TEST_ADMIN_ID": "999"},
             {**CONFIG, "RENDER_SERVICE_ID": "another-worker"},
+            {**CONFIG, "SERVICE_OWNER_ID": "999"},
         ):
             with self.subTest(env=env), self.assertRaises(IsolationError):
                 await self.launch(env)

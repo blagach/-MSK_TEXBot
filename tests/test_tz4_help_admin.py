@@ -23,6 +23,7 @@ from openpyxl import load_workbook
 os.environ.update(BOT_TOKEN="123456:TEST", ADMIN_IDS="1,2", LEADS_CHANNEL_ID="-100123")
 
 import admin_reports
+import admin_access
 import admin_ui
 import bot
 import payment_preferences as payments
@@ -479,6 +480,88 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(results[0][0], results[1][0])
         self.assertEqual(sum(created for _, created in results), 1)
+
+    async def test_owner_confirms_roles_and_revoked_admin_cannot_export_or_moderate(self):
+        owner, state = self.actor(1)
+        owner.answer.return_value = Record(message_id=500)
+        await admin_ui.admin_action(self.callback(owner, "admin:role:support"), self.admins,
+                                    state, service_owner_id=1)
+        owner.text = "42"
+        await admin_ui.admin_target(owner, state, self.admins, service_owner_id=1)
+        self.assertFalse(await admin_access.allowed(42, "support", self.admins, 1))
+        nonce = (await state.get_data())["admin_nonce"]
+        owner.message_id = 500
+        confirm = self.callback(owner, f"admin:confirm:{nonce}")
+        await admin_ui.admin_action(confirm, self.admins, state, service_owner_id=1)
+        self.assertTrue(await admin_access.allowed(42, "support", self.admins, 1))
+        await admin_ui.admin_action(confirm, self.admins, state, service_owner_id=1)
+        role_events = [row for row in await admin_access.history(2**63 - 1, 100) if row["action"] == "role_changed"]
+        self.assertEqual(len(role_events), 1)
+
+        admin, admin_state = self.actor(2)
+        await admin_access.assign_role(1, 2, "support", "restrict-legacy", owner_id=1)
+        denied = self.callback(admin, "admin:export")
+        await admin_ui.admin_action(denied, self.admins, admin_state, service_owner_id=1)
+        denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
+        admin.answer_document.assert_not_awaited()
+        publish = self.callback(admin, "publish:1")
+        await bot.publish_lead(publish, self.telegram)
+        publish.answer.assert_awaited_once_with("Нет доступа", show_alert=True)
+        self.telegram.send_message.assert_not_awaited()
+
+    async def test_admin_confirmation_survives_menu_and_old_controls_cannot_cancel_it(self):
+        owner, state = self.actor(1)
+        owner.answer.return_value = Record(message_id=500)
+        await admin_ui.admin_action(self.callback(owner, "admin:role:moderator"), self.admins,
+                                    state, service_owner_id=1)
+        owner.text = "42"
+        await admin_ui.admin_target(owner, state, self.admins, service_owner_id=1)
+        old_nonce = (await state.get_data())["admin_nonce"]
+        await bot.pause_form(owner, state)
+        draft = bot.draft_slot(state, "admin_action")
+        self.assertEqual(await draft.get_state(), admin_ui.ManageAdmins.confirm.state)
+        with patch.object(bot, "admin_allowed", new_callable=AsyncMock, return_value=True):
+            owner.text = bot.ADMIN_ACTION_DRAFT
+            await bot.resume_auxiliary_action(owner, state)
+        new_nonce = (await state.get_data())["admin_nonce"]
+        self.assertNotEqual(new_nonce, old_nonce)
+        owner.message_id = 500
+        await admin_ui.admin_action(self.callback(owner, f"admin:role_cancel:{old_nonce}"),
+                                    self.admins, state, service_owner_id=1)
+        self.assertEqual(await state.get_state(), admin_ui.ManageAdmins.confirm.state)
+        await admin_ui.admin_action(self.callback(owner, f"admin:confirm:{old_nonce}"),
+                                    self.admins, state, service_owner_id=1)
+        self.assertFalse(await admin_access.allowed(42, "moderate", self.admins, 1))
+        await admin_ui.admin_action(self.callback(owner, f"admin:role_cancel:{new_nonce}"),
+                                    self.admins, state, service_owner_id=1)
+        self.assertIsNone(await state.get_state())
+        self.assertFalse(await admin_access.allowed(42, "moderate", self.admins, 1))
+
+    async def test_admin_counters_are_personal_and_support_role_sees_only_support(self):
+        async with aiosqlite.connect(self.database) as db:
+            await db.executemany(
+                """INSERT INTO leads(customer_id,equipment,place,work_date,details,phone,status,created_at)
+                   VALUES (20,'автокран','Москва','завтра','','+79990000001',?,'2026-11-11')""",
+                [("new",), ("published",), ("closed",)],
+            )
+            await db.commit()
+        owner, _ = self.actor(1)
+        other, _ = self.actor(2)
+        await admin_ui.menu(owner, 1, self.admins, 1)
+        labels = [button.text for row in owner.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
+        self.assertIn("📋 Заявки и отклики · активных 2", labels)
+        self.assertIn("📝 Модерация заявок · новых 2", labels)
+        await admin_access.mark_lead_view(1, 1)
+        await admin_ui.menu(owner, 1, self.admins, 1)
+        labels = [button.text for row in owner.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
+        self.assertIn("📝 Модерация заявок · новых 1", labels)
+        await admin_ui.menu(other, 2, self.admins, 1)
+        labels = [button.text for row in other.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
+        self.assertIn("📝 Модерация заявок · новых 2", labels)
+        await admin_access.assign_role(1, 2, "support", "support-only", owner_id=1)
+        await admin_ui.menu(other, 2, self.admins, 1)
+        buttons = [button.callback_data for row in other.answer.await_args.kwargs["reply_markup"].inline_keyboard for button in row]
+        self.assertEqual(buttons, ["help:queue"])
 
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):

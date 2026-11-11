@@ -15,7 +15,8 @@ class ShadowFlowGuardTests(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(id=501, full_name="Тест"),
             answer=AsyncMock())
         fake_bot = SimpleNamespace(send_message=AsyncMock())
-        with patch.object(bot.lead_shadow_review, "evaluate",
+        with patch.object(bot, "admin_recipients", new_callable=AsyncMock, return_value=bot.settings.admin_ids), \
+             patch.object(bot.lead_shadow_review, "evaluate",
                           new_callable=AsyncMock) as shadow, \
              patch.object(bot, "get_lead", new_callable=AsyncMock) as get_lead, \
              patch.object(bot.lead_routing, "save", new_callable=AsyncMock), \
