@@ -114,3 +114,17 @@ class AdminAccessTests(unittest.IsolatedAsyncioTestCase):
         with sqlite3.connect(self.path) as db:
             self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall(),before)
             self.assertEqual(db.execute('SELECT * FROM leads').fetchall(),[(11,'published')])
+
+    async def test_audit_filters_keep_pagination_and_do_not_change_history(self):
+        for action,result in (('admin_view','success'),('role_changed','success'),('user_access','conflict'),
+                              ('export_requested','accepted'),('export_delivery','uncertain'),('export_sent','success')):
+            await access.record(1,action,result=result)
+        all_rows=await access.history(limit=100)
+        self.assertEqual(len(await access.history(kind='permissions')),2)
+        self.assertEqual(len(await access.history(kind='errors')),2)
+        exports=await access.history(kind='exports')
+        self.assertEqual(len(exports),3)
+        self.assertEqual(len(await access.history(exports[0]['id'],kind='exports')),2)
+        with self.assertRaises(ValueError):
+            await access.history(kind="exports OR 1=1")
+        self.assertEqual([dict(r) for r in await access.history(limit=100)],[dict(r) for r in all_rows])

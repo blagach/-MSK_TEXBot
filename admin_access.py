@@ -155,11 +155,20 @@ async def assign_role(actor_id, target_id, role, request_id, *, owner_id, expect
         return True
 
 
-async def history(before=2**63 - 1, limit=10):
+async def history(before=2**63 - 1, limit=10, *, kind="all"):
+    filters={
+        "all":"1=1",
+        "permissions":"action IN ('role_changed','user_access')",
+        "errors":"result IN ('denied','failed','uncertain','conflict')",
+        "exports":"action IN ('export_requested','export_delivery','export_sent')",
+    }
+    if kind not in filters:
+        raise ValueError("Unknown audit filter")
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         return await (await db.execute(
-            "SELECT * FROM admin_action_log WHERE id<? ORDER BY id DESC LIMIT ?", (before, limit),
+            "SELECT * FROM admin_action_log WHERE id<? AND "+filters[kind]+" ORDER BY id DESC LIMIT ?",
+            (before,min(max(limit,1),100)),
         )).fetchall()
 
 

@@ -314,6 +314,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         permission = "users"
     if action.startswith(("equipment:", "catalog:")):
         permission = "catalog"
+    if re.fullmatch(r"audit_filter:(all|permissions|errors|exports):[0-9]{1,19}",action):
+        permission = "audit"
     if re.fullmatch(r"audit:[1-9][0-9]{0,18}", action):
         permission = "audit"
     if re.fullmatch(r"admins:[0-9]{1,19}", action):
@@ -427,15 +429,24 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             snapshot = await admin_access.role_snapshot(data["admin_target"], support_admin_ids, service_owner_id)
             text = f"Изменение уже обработано. Текущая роль: {ROLE_LABELS.get(snapshot['role'], snapshot['role'])}"
         await message.answer(text, reply_markup=keyboard(HOME))
-    elif action == "audit" or action.startswith("audit:"):
-        before = min(int(action.split(":")[1]), 2**63 - 1) if ":" in action else 2**63 - 1
-        page = await admin_access.history(before, 11)
+    elif action == "audit" or action.startswith(("audit:","audit_filter:")):
+        kind="all"
+        if action.startswith("audit_filter:"):
+            _,kind,cursor=action.split(":")
+            before=min(int(cursor),2**63-1) if int(cursor) else 2**63-1
+        else:
+            before=min(int(action.split(":")[1]),2**63-1) if ":" in action else 2**63-1
+        page = await admin_access.history(before,11,kind=kind)
         rows = page[:10]
         text = "\n\n".join(audit_line(row) for row in rows)
         navigation = []
         if len(page) > 10:
-            navigation.append((("Ранее", f"admin:audit:{rows[-1]['id']}"),))
-        navigation.append(HOME)
+            target=f"admin:audit:{rows[-1]['id']}" if kind=="all" else f"admin:audit_filter:{kind}:{rows[-1]['id']}"
+            navigation.append((("Ранее",target),))
+        navigation.extend([
+            (("Все","admin:audit_filter:all:0"),("Права и ограничения","admin:audit_filter:permissions:0")),
+            (("Ошибки","admin:audit_filter:errors:0"),("Выгрузки","admin:audit_filter:exports:0")),HOME,
+        ])
         await message.answer(text or "Журнал пока пуст.", reply_markup=keyboard(*navigation))
     elif action == "users":
         data = await reports.user_totals()

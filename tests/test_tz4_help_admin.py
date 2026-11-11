@@ -1060,6 +1060,21 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         history=await admin_access.history(limit=100)
         self.assertEqual([r['result'] for r in history if r['action']=='export_delivery'],['failed'])
 
+    async def test_filtered_audit_is_owner_only_and_excludes_routine_views(self):
+        await admin_access.record(1,'export_delivery',result='uncertain',details={'stage':'sending','error_code':'TimeoutError'})
+        await admin_access.record(1,'admin_view',details={'section':'stats'})
+        owner,state=self.actor(1)
+        await admin_ui.admin_action(self.callback(owner,'admin:audit_filter:errors:0'),self.admins,state,service_owner_id=1)
+        text=owner.answer.await_args.args[0]
+        self.assertIn('Отправка не подтверждена',text)
+        self.assertIn('TimeoutError',text)
+        self.assertNotIn('Просмотр раздела',text)
+        staff,other=self.actor(2)
+        denied=self.callback(staff,'admin:audit_filter:exports:0')
+        await admin_ui.admin_action(denied,self.admins,other,service_owner_id=1)
+        denied.answer.assert_awaited_once_with('Нет доступа.',show_alert=True)
+        staff.answer.assert_not_awaited()
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)
