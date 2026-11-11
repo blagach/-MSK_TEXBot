@@ -202,7 +202,7 @@ async def claim_delivery(message_id):
         if not cursor.rowcount:
             return None
         async with db.execute(
-            """SELECT m.ticket_id, m.text, t.requester_id
+            """SELECT m.ticket_id, m.text, m.actor_id, t.requester_id
                FROM support_messages m JOIN support_tickets t ON t.id=m.ticket_id WHERE m.id=?""",
             (message_id,),
         ) as cursor:

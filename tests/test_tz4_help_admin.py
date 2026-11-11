@@ -195,6 +195,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reply_markup.inline_keyboard[0][0].callback_data, f"help:ticket:{ticket}:0")
             self.assertEqual((await support_storage.history(ticket))[0]["delivery_status"], "sending")
             admin.answer.assert_not_awaited()
+            entries = await admin_access.history(limit=50)
+            self.assertFalse(any(r["action"] == "support_delivery" and r["result"] == "sent" for r in entries))
             return Record(message_id=100)
 
         self.telegram.send_message.side_effect = telegram_accepts
@@ -204,6 +206,9 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admin.answer.await_args.args[0], "Ответ сохранён и отправлен.")
         response = (await support_storage.history(ticket))[0]
         self.assertEqual(response["delivery_status"], "sent")
+        delivery_audit = [r for r in await admin_access.history(limit=50) if r["action"] == "support_delivery"]
+        self.assertEqual(len(delivery_audit), 1)
+        self.assertEqual(delivery_audit[0]["result"], "sent")
         async with aiosqlite.connect(self.database) as db:
             async with db.execute(
                 "SELECT telegram_message_id FROM support_reply_deliveries WHERE message_id=?",
@@ -350,6 +355,9 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.telegram.send_message.await_args.args[0], 20)
             row = (await support_storage.history(ticket_id))[0]
             self.assertEqual((row["delivery_status"], row["delivery_error"]), (expected, code))
+            audit = [r for r in await admin_access.history(limit=50) if r["action"] == "support_delivery"][0]
+            self.assertEqual(audit["result"], expected)
+            self.assertIn(code, audit["details"])
 
             await self.help_action(admin, state, f"ticket:{ticket_id}:0")
             admin_history = [call.args[0] for call in admin.answer.await_args_list]
@@ -636,6 +644,20 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await admin_ui.admin_action(denied, self.admins, staff_state, service_owner_id=1)
         denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
         staff.answer.assert_not_awaited()
+
+    async def test_support_role_revoked_during_reply_cannot_send_and_keeps_draft(self):
+        ticket, _ = await support_storage.create_ticket(20, "help", "role-check", "Вопрос", None)
+        staff, state = self.actor(2)
+        await state.set_state(support_ui.Support.reply)
+        await state.set_data({"support_ticket": ticket, "support_nonce": "reply-check"})
+        staff.text = "Ответ"
+        before = await support_storage.history(ticket)
+        await admin_access.assign_role(1, 2, "none", "revoke-during-reply", owner_id=1)
+        await support_ui.reply_to_ticket(staff, state, self.telegram, self.admins)
+        staff.answer.assert_awaited_once_with("Нет доступа.")
+        self.telegram.send_message.assert_not_awaited()
+        self.assertEqual(await state.get_state(), support_ui.Support.reply.state)
+        self.assertEqual(len(await support_storage.history(ticket)), len(before))
 
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):

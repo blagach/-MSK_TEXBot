@@ -449,7 +449,8 @@ async def reply_to_ticket(message: Message, state: FSMContext, bot, support_admi
     if not reply_id:
         await message.answer("Обращение закрыто или ответ уже сохранён.", reply_markup=keys(BACK))
         return
-    await admin_access.record(message.from_user.id, "support_reply", target_id=ticket_id)
+    await admin_access.record(message.from_user.id, "support_reply", target_id=ticket_id,
+                              result="saved", details={"message_id": reply_id})
     status = await deliver_reply(bot, reply_id)
     origin = data.get("support_origin")
     suffix = f":{origin}" if origin else ""
@@ -480,6 +481,7 @@ async def deliver_reply(bot, reply_id):
     if reply is None:
         return None
     ticket_id = reply["ticket_id"]
+    error_code = None
     try:
         sent = await bot.send_message(
             reply["requester_id"], f"Ответ поддержки по обращению №{ticket_id}\n\n{reply['text']}",
@@ -487,14 +489,21 @@ async def deliver_reply(bot, reply_id):
         )
     except (IsolationError, TelegramBadRequest, TelegramForbiddenError, TelegramNotFound, TelegramRetryAfter) as error:
         status = "failed"
-        await store.finish_delivery(reply_id, status, error_code=delivery_error_code(error))
+        error_code = delivery_error_code(error)
+        await store.finish_delivery(reply_id, status, error_code=error_code)
     except (TelegramAPIError, TimeoutError) as error:
         # Telegram may have accepted a request whose response never reached us.
         status = "uncertain"
-        await store.finish_delivery(reply_id, status, error_code=delivery_error_code(error))
+        error_code = delivery_error_code(error)
+        await store.finish_delivery(reply_id, status, error_code=error_code)
     else:
         status = "sent"
         await store.finish_delivery(reply_id, status, telegram_message_id=sent.message_id)
+    await admin_access.record(
+        reply["actor_id"], "support_delivery", target_id=ticket_id, result=status,
+        details={"message_id": reply_id, "error_code": error_code,
+                 "telegram_message_id": sent.message_id if status == "sent" else None},
+    )
     if status != "sent":
         logging.warning("Support reply %s for ticket %s: %s", reply_id, ticket_id, status)
     return status

@@ -66,10 +66,13 @@ def audit_line(row):
     actions = {"role_changed": "Изменение прав", "admin_denied": "Отказ в доступе",
                "admin_view": "Просмотр раздела", "lead_view": "Просмотр заявки",
                "lead_publish": "Публикация заявки", "lead_reject": "Отклонение заявки",
-               "lead_close": "Закрытие заявки", "support_reply": "Ответ поддержки",
+               "lead_close": "Закрытие заявки", "support_reply": "Сохранение ответа поддержки",
+               "support_delivery": "Отправка ответа поддержки",
                "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX"}
     results = {"success": "Успешно", "denied": "Запрещено", "conflict": "Конфликт версий",
-               "not_changed": "Без изменения"}
+               "not_changed": "Без изменения", "saved": "Сохранено в истории",
+               "sent": "Отправку подтвердил Telegram", "failed": "Ошибка отправки",
+               "uncertain": "Отправка не подтверждена"}
     text = (f"#{row['id']} · {row['created_at']} (UTC) · пользователь {row['actor_id']}\n"
             f"{actions.get(row['action'], row['action'])} · объект {row['target_id'] or '—'} · "
             f"{results.get(row['result'], row['result'])}")
@@ -77,6 +80,10 @@ def audit_line(row):
         details = json.loads(row['details'])
     except (ValueError, TypeError):
         return text
+    if isinstance(details, dict) and row['action'] == "support_delivery":
+        text += f"\nID ответа: {details.get('message_id')}"
+        if details.get("error_code"):
+            text += f" · причина: {details['error_code']}"
     if isinstance(details, dict) and row['action'] == "role_changed":
         if row['result'] == "success" and "previous_role" in details:
             text += (f"\n{ROLE_LABELS.get(details['previous_role'], details['previous_role'])} → "
