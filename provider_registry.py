@@ -4,6 +4,7 @@ Additive schema: existing providers/leads/offers tables are never altered.
 The Telegram UI and notification dispatcher will call this module.
 """
 import re
+import json
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -58,6 +59,14 @@ async def init_schema(db_path=DEFAULT_DB_PATH):
         )""")
         await db.execute("""CREATE INDEX IF NOT EXISTS idx_provider_equipment_matching
             ON provider_equipment(category, region, active)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS provider_alert_preferences (
+            provider_id INTEGER NOT NULL REFERENCES provider_profiles(telegram_id),
+            revision INTEGER NOT NULL,
+            categories_json TEXT NOT NULL,
+            regions_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(provider_id, revision)
+        )""")
         await db.commit()
 
 
@@ -149,6 +158,83 @@ async def list_equipment(telegram_id, db_path=DEFAULT_DB_PATH):
             (telegram_id,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
+
+async def alert_preferences(telegram_id, db_path=DEFAULT_DB_PATH):
+    async with aiosqlite.connect(db_path) as db:
+        row = await (await db.execute(
+            """SELECT revision,categories_json,regions_json FROM provider_alert_preferences
+               WHERE provider_id=? ORDER BY revision DESC LIMIT 1""", (telegram_id,),
+        )).fetchone()
+        if row:
+            return {"revision": row[0], "categories": json.loads(row[1]), "regions": json.loads(row[2])}
+        equipment = await (await db.execute(
+            "SELECT category,region FROM provider_equipment WHERE provider_id=? ORDER BY id", (telegram_id,),
+        )).fetchall()
+    categories = list(dict.fromkeys(equipment_catalog.LEGACY_ALIASES.get(row[0], row[0]) for row in equipment))
+    regions = set()
+    for _, region in equipment:
+        regions.update(REGIONS if region == BOTH_REGIONS else (region,))
+    return {"revision": 0, "categories": categories, "regions": sorted(regions)}
+
+
+async def save_alert_preferences(telegram_id, categories, regions, expected_revision, db_path=DEFAULT_DB_PATH):
+    if (not isinstance(categories, (list, tuple)) or not categories or any(value not in CATEGORIES for value in categories)
+            or not isinstance(regions, (list, tuple)) or not regions or any(value not in REGIONS for value in regions)):
+        raise ValueError("Выберите виды техники и регионы из списка")
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise ValueError("Некорректная версия настроек")
+    categories = list(dict.fromkeys(equipment_catalog.LEGACY_ALIASES.get(value, value) for value in categories))
+    regions = list(dict.fromkeys(regions))
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA foreign_keys=ON")
+        await db.execute("BEGIN IMMEDIATE")
+        allowed = await (await db.execute(
+            "SELECT 1 FROM provider_profiles WHERE telegram_id=? AND blocked=0", (telegram_id,),
+        )).fetchone()
+        if not allowed:
+            raise ValueError("Сначала зарегистрируйтесь; заблокированный профиль недоступен")
+        current = (await (await db.execute(
+            "SELECT COALESCE(max(revision),0) FROM provider_alert_preferences WHERE provider_id=?", (telegram_id,),
+        )).fetchone())[0]
+        if current != expected_revision:
+            return False
+        await db.execute("INSERT INTO provider_alert_preferences VALUES (?,?,?,?,?)",
+                         (telegram_id, current + 1, json.dumps(categories, ensure_ascii=False),
+                          json.dumps(regions, ensure_ascii=False), _now()))
+        await db.commit()
+        return True
+
+
+def category_match(column, target):
+    return f"({column}={target} OR ({column} IN ('каток','дорожный каток') AND {target} IN ('каток','дорожный каток')))"
+
+
+def alert_match(category, region, area):
+    equipment = equipment_match(category, region, area)
+    preferred = category_match("kind.value", category)
+    existing = category_match("e.category", category)
+    return f"""(
+        EXISTS (
+            SELECT 1 FROM provider_alert_preferences a
+            WHERE a.provider_id=p.telegram_id
+              AND a.revision=(SELECT max(revision) FROM provider_alert_preferences WHERE provider_id=p.telegram_id)
+              AND EXISTS(SELECT 1 FROM json_each(a.categories_json) kind WHERE {preferred})
+              AND EXISTS(SELECT 1 FROM json_each(a.regions_json) zone WHERE zone.value={region})
+              AND (
+                  NOT EXISTS(SELECT 1 FROM provider_equipment e
+                             WHERE e.provider_id=p.telegram_id AND {existing})
+                  OR EXISTS(SELECT 1 FROM provider_equipment e
+                            WHERE e.provider_id=p.telegram_id AND {existing} AND e.active=1)
+              )
+        )
+        OR (
+            NOT EXISTS(SELECT 1 FROM provider_alert_preferences WHERE provider_id=p.telegram_id)
+            AND EXISTS(SELECT 1 FROM provider_equipment e WHERE e.provider_id=p.telegram_id
+                       AND e.active=1 AND {equipment})
+        )
+    )"""
+
+
 def normalize_area(value):
     return " ".join((value or "").casefold().replace("ё", "е").split())
 
@@ -173,12 +259,11 @@ async def matching_providers(category, region, area, db_path=DEFAULT_DB_PATH, *,
         return []
     async with aiosqlite.connect(db_path) as db:
         await register_area_key(db)
-        predicate = equipment_match("target.category", "target.region", "target.area")
+        predicate = alert_match("target.category", "target.region", "target.area")
         async with db.execute(f"""WITH target(category, region, area) AS (VALUES (?, ?, ?))
-            SELECT DISTINCT p.telegram_id FROM provider_profiles p
-            JOIN provider_equipment e ON e.provider_id=p.telegram_id CROSS JOIN target
+            SELECT p.telegram_id FROM provider_profiles p CROSS JOIN target
             WHERE p.blocked=0 AND (p.notifications_enabled=1 OR ?=0)
-              AND e.active=1 AND {predicate} ORDER BY p.telegram_id""",
+              AND {predicate} ORDER BY p.telegram_id""",
             (category, region, area, notifications),
         ) as cursor:
             return [row[0] for row in await cursor.fetchall()]

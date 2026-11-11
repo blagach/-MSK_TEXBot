@@ -788,7 +788,7 @@ async def show_matching_leads(message, user_id, before=2**63 - 1):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         await provider_registry.register_area_key(db)
-        predicate = provider_registry.equipment_match("r.category", "r.region", "r.area")
+        predicate = provider_registry.alert_match("r.category", "r.region", "r.area")
         async with db.execute(
             f"""SELECT l.*, r.category, r.region, r.area, p2.method AS payment_method,
                       d.equipment_name, d.map_link, d.schedule FROM leads l
@@ -796,8 +796,8 @@ async def show_matching_leads(message, user_id, before=2**63 - 1):
                LEFT JOIN lead_work_details d ON d.lead_id=l.id
                LEFT JOIN lead_payment_preferences p2 ON p2.lead_id=l.id
                WHERE l.status='published' AND l.id<? AND EXISTS (
-                   SELECT 1 FROM provider_profiles p JOIN provider_equipment e ON e.provider_id=p.telegram_id
-                   WHERE p.telegram_id=? AND p.blocked=0 AND e.active=1
+                   SELECT 1 FROM provider_profiles p
+                   WHERE p.telegram_id=? AND p.blocked=0
                    AND {predicate}
                ) ORDER BY l.id DESC LIMIT 9""",
             (before, user_id),
