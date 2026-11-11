@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import aiosqlite
 
 import equipment_catalog
+import user_access
 
 DEFAULT_DB_PATH = "bot.db"
 PHONE_RE = re.compile(r"(?:\+7|8)[0-9]{10}\Z")
@@ -37,6 +38,7 @@ def _validate_phone(phone):
 
 
 async def init_schema(db_path=DEFAULT_DB_PATH):
+    await user_access.init_schema(db_path)
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS provider_profiles (
             telegram_id INTEGER PRIMARY KEY,
@@ -260,4 +262,5 @@ async def matching_providers(category, region, area, db_path=DEFAULT_DB_PATH, *,
               AND {predicate} ORDER BY p.telegram_id""",
             (category, region, area, notifications),
         ) as cursor:
-            return [row[0] for row in await cursor.fetchall()]
+            ids = [row[0] for row in await cursor.fetchall()]
+    return await user_access.filter_users(ids, "notifications" if notifications else "offers", db_path)

@@ -1,6 +1,8 @@
 """Private, administrator-only report and export entry points."""
 import re
 import json
+import logging
+from aiogram.exceptions import TelegramAPIError
 from uuid import uuid4
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -11,6 +13,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 import admin_reports as reports
 import support_storage
 import admin_access
+import user_access
 
 router = Router()
 router.callback_query.filter(F.message.chat.type == "private")
@@ -27,6 +30,12 @@ def keyboard(*rows):
 HOME = (("⬅️ В админ-панель", "admin:home"),)
 
 
+class ManageAccess(StatesGroup):
+    choose = State()
+    reason = State()
+    confirm = State()
+
+
 class FindUser(StatesGroup):
     query = State()
     results = State()
@@ -39,6 +48,13 @@ class ManageAdmins(StatesGroup):
 
 ROLE_LABELS = {"administrator": "Администратор", "moderator": "Модератор", "support": "Поддержка",
                "none": "Без административных прав"}
+
+
+async def retire_panel(message):
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError as error:
+        logging.warning("Could not retire administrator keyboard: %s",type(error).__name__)
 
 
 async def menu(message, user_id=None, admin_ids=(), owner_id=None):
@@ -72,7 +88,8 @@ def audit_line(row):
                "admin_view": "Просмотр раздела", "lead_view": "Просмотр заявки",
                "lead_publish": "Публикация заявки", "lead_reject": "Отклонение заявки",
                "lead_close": "Закрытие заявки", "support_reply": "Сохранение ответа поддержки",
-               "support_delivery": "Отправка ответа поддержки",
+               "support_delivery": "Отправка ответа поддержки", "user_search": "Поиск пользователей",
+               "user_profile": "Просмотр профиля", "user_access": "Изменение доступа",
                "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX"}
     results = {"success": "Успешно", "denied": "Запрещено", "conflict": "Конфликт версий",
                "not_changed": "Без изменения", "saved": "Сохранено в истории",
@@ -85,6 +102,8 @@ def audit_line(row):
         details = json.loads(row['details'])
     except (ValueError, TypeError):
         return text
+    if isinstance(details,dict) and row["action"]=="user_access" and row["result"]=="success":
+        text += f"\n{scope_text(details.get('previous',[]))} → {scope_text(details.get('scopes',[]))}\nПричина: {str(details.get('reason','—'))[:120]}"
     if isinstance(details, dict) and row['action'] == "support_delivery":
         text += f"\nID ответа: {details.get('message_id')}"
         if details.get("error_code"):
@@ -96,6 +115,54 @@ def audit_line(row):
         elif row['result'] == "conflict":
             text += f"\nВерсия подтверждения: {details.get('expected_revision')}; текущая: {details.get('actual_revision')}"
     return text
+
+
+SCOPE_LABELS = {"requests": "Создание заявок", "offers": "Отправка откликов",
+                "notifications": "Уведомления о заявках", "full": "Полное ограничение"}
+
+
+def scope_text(scopes):
+    return ", ".join(SCOPE_LABELS[s] for s in scopes) or "Без новых ограничений"
+
+
+async def resume_access_step(message, state):
+    data = await state.get_data()
+    nonce = uuid4().hex[:16]
+    await state.update_data(access_nonce=nonce)
+    current = await state.get_state()
+    cancel = (("Отмена", f"admin:access_cancel:{nonce}"),)
+    if current == ManageAccess.choose.state:
+        selected = data.get("access_scopes", [])
+        rows = [((f"{'✅' if scope in selected else '▫️'} {label}", f"admin:access_pick:{scope}:{nonce}"),)
+                for scope,label in SCOPE_LABELS.items()]
+        rows += [(("Снять ограничения", f"admin:access_pick:clear:{nonce}"),),
+                 (("Продолжить", f"admin:access_next:{nonce}"),), cancel]
+        text = f"Доступ пользователя {data['access_target']}\nВыберите ограничения: {scope_text(selected)}"
+    elif current == ManageAccess.reason.state:
+        text, rows = "Укажите причину изменения доступа (до 500 символов).", [cancel]
+    else:
+        text = (f"Подтвердите изменение доступа пользователя {data['access_target']}\n"
+                f"Было: {scope_text(data['access_previous'])}\nСтанет: {scope_text(data['access_scopes'])}\n"
+                f"Причина: {data['access_reason']}\nДанные и история сохраняются. Поддержка доступна.")
+        rows = [(("Подтвердить", f"admin:access_confirm:{nonce}"),), cancel]
+    sent = await message.answer(text, reply_markup=keyboard(*rows, HOME))
+    await state.update_data(form_keyboard_id=sent.message_id)
+
+
+@router.message(ManageAccess.reason)
+async def access_reason(message: Message, state: FSMContext, support_admin_ids, service_owner_id=None):
+    if message.chat.id != message.from_user.id or not await admin_access.allowed(
+        message.from_user.id,"access",support_admin_ids,service_owner_id,
+    ):
+        await message.answer("Нет доступа.")
+        return
+    reason = (message.text or "").strip()
+    if not 1 <= len(reason) <= 500:
+        await message.answer("Укажите причину длиной от 1 до 500 символов.")
+        return
+    await state.update_data(access_reason=reason)
+    await state.set_state(ManageAccess.confirm)
+    await resume_access_step(message,state)
 
 
 async def show_people(message, state, *, kind="all", after=0, query="", nonce=None):
@@ -191,6 +258,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     action = callback.data.removeprefix("admin:")
     permission = {"home": "panel", "users": "users", "records": "moderate", "stats": "stats",
                   "export": "export", "settings": "roles", "audit": "audit"}.get(action)
+    if action.startswith(("access:", "access_pick:", "access_next:", "access_cancel:", "access_confirm:")):
+        permission = "access"
     if action.startswith(("people:", "user:", "users_filter:")) or action == "find":
         permission = "users"
     if action.startswith("equipment:"):
@@ -210,7 +279,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     await callback.answer()
     await admin_access.record(callback.from_user.id, "admin_view", details={"section": permission})
     if action == "home":
-        if state is not None and await state.get_state() in (*ManageAdmins.__all_states_names__, *FindUser.__all_states_names__):
+        if state is not None and await state.get_state() in (*ManageAdmins.__all_states_names__, *FindUser.__all_states_names__, *ManageAccess.__all_states_names__):
             from bot import pause_form
             await pause_form(message, state)
         await menu(message, callback.from_user.id, support_admin_ids, service_owner_id)
@@ -252,7 +321,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             await message.answer("Этот экран устарел. Откройте назначение прав снова.")
             return
         await state.clear()
-        await message.edit_reply_markup(reply_markup=None)
+        await retire_panel(message)
         await message.answer("Изменение прав отменено.", reply_markup=keyboard(HOME))
     elif action.startswith("confirm:") and state is not None:
         data = await state.get_data()
@@ -262,7 +331,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             return
         if "admin_expected_revision" not in data:
             await state.set_state(ManageAdmins.target)
-            await message.edit_reply_markup(reply_markup=None)
+            await retire_panel(message)
             await message.answer("Введите Telegram ID заново для проверки актуальных прав.", reply_markup=keyboard(HOME))
             return
         try:
@@ -273,12 +342,12 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             )
         except admin_access.RoleConflict:
             await state.set_state(ManageAdmins.target)
-            await message.edit_reply_markup(reply_markup=None)
+            await retire_panel(message)
             await message.answer("Права уже изменились. Введите Telegram ID заново и проверьте текущую роль.",
                                  reply_markup=keyboard(HOME))
             return
         await state.clear()
-        await message.edit_reply_markup(reply_markup=None)
+        await retire_panel(message)
         if changed:
             text = "Права сохранены."
         else:
@@ -304,8 +373,78 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             "Общий итог включает зафиксированные посещения. Старые посещения без действий могли не сохраниться.\n"
             "Заказчики учитываются по заявкам, исполнители по регистрации или отклику.",
             reply_markup=keyboard((("🔎 Поиск", "admin:find"), ("Все", "admin:users_filter:all")),
-                                  (("Заказчики", "admin:users_filter:customers"), ("Исполнители", "admin:users_filter:providers")), HOME),
+                                  (("Заказчики", "admin:users_filter:customers"), ("Исполнители", "admin:users_filter:providers")),
+                                  (("Ограниченные", "admin:users_filter:restricted"),), HOME),
         )
+    elif action.startswith("access:") and state is not None:
+        target = action.split(":",1)[1]
+        if not re.fullmatch(r"[1-9][0-9]{0,17}",target) or await reports.user_profile(int(target)) is None:
+            await message.answer("Пользователь не найден.")
+            return
+        if await state.get_state() not in (None,*FindUser.__all_states_names__):
+            await message.answer("Сначала завершите текущее действие или перейдите в меню.")
+            return
+        from bot import pause_form
+        await pause_form(message,state)
+        saved = await user_access.snapshot(int(target))
+        await state.set_state(ManageAccess.choose)
+        await state.set_data({"access_target":int(target),"access_previous":saved["scopes"],
+                              "access_scopes":saved["scopes"],"access_revision":saved["revision"]})
+        await resume_access_step(message,state)
+    elif action.startswith(("access_pick:","access_next:","access_cancel:","access_confirm:")) and state is not None:
+        parts = action.split(":")
+        data = await state.get_data()
+        current = await state.get_state()
+        if (current not in ManageAccess.__all_states_names__ or parts[-1] != data.get("access_nonce")
+                or message.message_id != data.get("form_keyboard_id")):
+            await message.answer("Этот экран доступа устарел. Продолжите действие через меню.")
+            return
+        if parts[0] == "access_cancel":
+            await state.clear()
+            await retire_panel(message)
+            await message.answer("Изменение доступа отменено.",reply_markup=keyboard(HOME))
+            return
+        if parts[0] == "access_pick" and current == ManageAccess.choose.state and len(parts)==3:
+            scope = parts[1]
+            selected = set(data["access_scopes"])
+            if scope == "clear":
+                selected = set()
+            elif scope in SCOPE_LABELS:
+                if scope in selected:
+                    selected.remove(scope)
+                elif scope == "full":
+                    selected = {"full"}
+                else:
+                    selected.discard("full")
+                    selected.add(scope)
+            else:
+                return
+            await state.update_data(access_scopes=sorted(selected))
+        elif parts[0] == "access_next" and current == ManageAccess.choose.state:
+            await state.set_state(ManageAccess.reason)
+        elif parts[0] == "access_confirm" and current == ManageAccess.confirm.state:
+            try:
+                changed = await user_access.change(callback.from_user.id,data["access_target"],data["access_scopes"],
+                    data["access_reason"],data["access_nonce"],expected_revision=data["access_revision"],
+                    owner_id=service_owner_id,legacy_admins=support_admin_ids)
+            except user_access.AccessConflict:
+                saved = await user_access.snapshot(data["access_target"])
+                await state.update_data(access_previous=saved["scopes"],access_scopes=saved["scopes"],access_revision=saved["revision"])
+                await state.set_state(ManageAccess.choose)
+                await message.answer("Ограничения уже изменились. Проверьте их заново.")
+            except ValueError as error:
+                await message.answer(str(error),reply_markup=keyboard(HOME))
+                return
+            else:
+                await state.clear()
+                await retire_panel(message)
+                await message.answer("Изменение доступа сохранено." if changed else "Подтверждение уже обработано.",
+                                     reply_markup=keyboard(HOME))
+                return
+        else:
+            return
+        await retire_panel(message)
+        await resume_access_step(message,state)
     elif action == "find" and state is not None:
         if await state.get_state() not in (None, *FindUser.__all_states_names__):
             await message.answer("Сначала завершите текущее действие или перейдите в главное меню.")
@@ -314,7 +453,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         await resume_user_search(message, state)
     elif action.startswith("users_filter:") and state is not None:
         kind = action.split(":", 1)[1]
-        if kind not in {"all", "customers", "providers"}:
+        if kind not in {"all", "customers", "providers", "restricted"}:
             return
         if await state.get_state() not in (None, *FindUser.__all_states_names__):
             await message.answer("Сначала завершите текущее действие или перейдите в главное меню.")
@@ -343,8 +482,14 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             f"Telegram: {reports.profile_url(profile['username']) or 'Не указан'}\n"
             f"Заявки: {profile['leads']} · Отклики: {profile['offers']}\n"
             f"Техника: {profile['equipment']} · Обращения: {profile['tickets']}",
-            reply_markup=keyboard((("К пользователям", "admin:users"),), HOME),
+            reply_markup=keyboard(*([(("Управление доступом", f"admin:access:{profile['id']}"),)]
+                                  if await admin_access.allowed(callback.from_user.id,"access",support_admin_ids,service_owner_id) else []),
+                                  (("К пользователям", "admin:users"),), HOME),
         )
+        saved = await user_access.snapshot(profile["id"])
+        await message.answer("Ограничения: " + scope_text(saved["scopes"]) +
+                             ("\nТакже действует прежняя блокировка профиля исполнителя; она здесь не снимается."
+                              if profile["legacy_blocked"] else ""))
     elif action == "records":
         leads, offers, delivery, results = await reports.lead_and_offer_counts()
         lead_counts = " · ".join(f"{label} {n}" for label, n in reports.classify(leads).items())

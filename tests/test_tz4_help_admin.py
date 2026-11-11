@@ -17,7 +17,7 @@ from aiogram.methods import SendMessage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, Update
+from aiogram.types import Message, Update, CallbackQuery
 from openpyxl import load_workbook
 
 os.environ.update(BOT_TOKEN="123456:TEST", ADMIN_IDS="1,2", LEADS_CHANNEL_ID="-100123")
@@ -714,6 +714,85 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await admin_ui.admin_action(self.callback(owner,"admin:find"), self.admins, other_state)
         self.assertEqual((await other_state.get_data())["lead_id"],11)
         self.assertEqual(await other_state.get_state(),bot.OfferForm.price.state)
+
+    async def test_access_change_requires_reason_confirmation_and_current_version(self):
+        await provider_registry.register_provider(42,"Тест","+79991234567",True,str(self.database))
+        owner,state=self.actor(1)
+        owner.answer.return_value=Record(message_id=500)
+        owner.message_id=500
+        async def action(prefix):
+            nonce=(await state.get_data()).get("access_nonce")
+            await admin_ui.admin_action(self.callback(owner,f"admin:{prefix}:{nonce}"),self.admins,state,service_owner_id=1)
+        await admin_ui.admin_action(self.callback(owner,"admin:access:42"),self.admins,state,service_owner_id=1)
+        await action("access_pick:requests")
+        self.assertTrue(await bot.user_access.allowed(42,"requests"))
+        await action("access_next")
+        owner.text="Тестовое ограничение"
+        await admin_ui.access_reason(owner,state,self.admins,service_owner_id=1)
+        self.assertTrue(await bot.user_access.allowed(42,"requests"))
+        await action("access_confirm")
+        self.assertFalse(await bot.user_access.allowed(42,"requests"))
+        self.assertTrue(await bot.user_access.allowed(42,"offers"))
+        self.assertEqual([r["id"] for r in await admin_reports.user_page(kind="restricted")],[42])
+        await admin_ui.admin_action(self.callback(owner,"admin:access:42"),self.admins,state,service_owner_id=1)
+        await action("access_pick:clear")
+        await action("access_next")
+        owner.text="Снять ограничение"
+        await admin_ui.access_reason(owner,state,self.admins,service_owner_id=1)
+        revision=(await bot.user_access.snapshot(42))["revision"]
+        await bot.user_access.change(1,42,["full"],"Более позднее решение","later",expected_revision=revision,owner_id=1)
+        await action("access_confirm")
+        self.assertEqual(await state.get_state(),admin_ui.ManageAccess.choose.state)
+        self.assertEqual((await bot.user_access.snapshot(42))["scopes"],["full"])
+        await action("access_cancel")
+        self.assertEqual((await bot.user_access.snapshot(42))["scopes"],["full"])
+
+    async def test_access_management_is_owner_only_and_survives_menu(self):
+        await provider_registry.register_provider(42,"Тест","+79991234567",True,str(self.database))
+        staff,staff_state=self.actor(2)
+        denied=self.callback(staff,"admin:access:42")
+        await admin_ui.admin_action(denied,self.admins,staff_state,service_owner_id=1)
+        denied.answer.assert_awaited_once_with("Нет доступа.",show_alert=True)
+        owner,state=self.actor(1)
+        owner.answer.return_value=Record(message_id=500)
+        await admin_ui.admin_action(self.callback(owner,"admin:access:42"),self.admins,state,service_owner_id=1)
+        old=(await state.get_data())["access_nonce"]
+        await bot.pause_form(owner,state)
+        owner.text=bot.ADMIN_ACCESS_DRAFT
+        with patch.object(bot,"admin_allowed",new_callable=AsyncMock,return_value=True):
+            await bot.resume_auxiliary_action(owner,state)
+        self.assertEqual((await state.get_data())["access_target"],42)
+        self.assertNotEqual((await state.get_data())["access_nonce"],old)
+        owner.message_id=500
+        await admin_ui.admin_action(self.callback(owner,f"admin:access_confirm:{old}"),self.admins,state,service_owner_id=1)
+        self.assertEqual((await bot.user_access.snapshot(42))["revision"],0)
+
+    async def test_restriction_gates_preserve_forms_and_allow_support(self):
+        customer,state=self.actor(42)
+        await state.set_state(bot.LeadForm.region)
+        await state.set_data({"equipment":"автокран"})
+        await bot.user_access.change(1,42,["full"],"Тест","full",expected_revision=0,owner_id=1)
+        customer.text="Москва"
+        handler=AsyncMock()
+        await bot.check_user_access(handler,customer,{"state":state})
+        handler.assert_not_awaited()
+        self.assertEqual((await state.get_data())["equipment"],"автокран")
+        await state.set_state(support_ui.Support.compose)
+        old_button=MagicMock(spec=CallbackQuery)
+        old_button.message=customer
+        old_button.from_user=customer.from_user
+        old_button.data="provider:old_action"
+        old_button.answer=AsyncMock()
+        await bot.check_user_access(handler,old_button,{"state":state})
+        old_button.answer.assert_awaited_once()
+        handler.assert_not_awaited()
+        customer.text="/support"
+        await bot.check_user_access(handler,customer,{"state":state})
+        handler.assert_awaited_once()
+        await bot.submit_lead(customer,customer.from_user,state,self.telegram,{})
+        await bot.send_offer(customer,customer.from_user,state,self.telegram)
+        self.telegram.send_message.assert_not_awaited()
+        self.assertEqual((await state.get_data())["equipment"],"автокран")
 
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):

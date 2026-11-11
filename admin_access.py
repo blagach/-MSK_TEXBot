@@ -13,7 +13,7 @@ PERMISSIONS = {
     "administrator": frozenset({"moderate", "stats", "catalog", "support", "users", "export"}),
     "none": frozenset(),
 }
-ALL_PERMISSIONS = frozenset().union(*PERMISSIONS.values(), {"roles", "audit"})
+ALL_PERMISSIONS = frozenset().union(*PERMISSIONS.values(), {"roles", "audit", "access"})
 
 
 def now():

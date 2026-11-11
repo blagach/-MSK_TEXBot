@@ -44,7 +44,8 @@ USER_DETAILS = """
                             (SELECT report_username(o.username) FROM offers o WHERE o.provider_id=u.id
                              AND report_username(o.username) IS NOT NULL ORDER BY o.id DESC LIMIT 1)) AS username,
                    c.first_seen AS customer_since, r.first_seen AS registered_at,
-                   c.id IS NOT NULL AS customer, p.id IS NOT NULL AS performer
+                   c.id IS NOT NULL AS customer, p.id IS NOT NULL AS performer,
+                   COALESCE(profile.blocked,0) AS legacy_blocked
             FROM users u LEFT JOIN customers c ON c.id=u.id LEFT JOIN performers p ON p.id=u.id
             LEFT JOIN registrations r ON r.id=u.id LEFT JOIN provider_profiles profile ON profile.telegram_id=u.id
             LEFT JOIN providers legacy ON legacy.telegram_id=u.id
@@ -309,7 +310,7 @@ def folded(value):
 
 
 async def user_page(query="", kind="all", after=0, limit=10):
-    if kind not in {"all", "customers", "providers"}:
+    if kind not in {"all", "customers", "providers", "restricted"}:
         raise ValueError("Unknown user filter")
     query = query.strip()
     if len(query) > 100:
@@ -321,11 +322,13 @@ async def user_page(query="", kind="all", after=0, limit=10):
         await db.create_function("report_fold", 1, folded, deterministic=True)
         return await rows(db, USERS + ", details AS (" + USER_DETAILS + ")" + """
             SELECT * FROM details WHERE id>? AND
-                (?='all' OR (?='customers' AND customer=1) OR (?='providers' AND performer=1)) AND
+                (?='all' OR (?='customers' AND customer=1) OR (?='providers' AND performer=1)
+                 OR (?='restricted' AND (legacy_blocked=1 OR COALESCE((SELECT scopes_json FROM user_access_events a
+                    WHERE a.user_id=details.id ORDER BY a.id DESC LIMIT 1),'[]')!='[]'))) AND
                 (?='' OR CAST(id AS TEXT)=? OR instr(report_fold(display_name),report_fold(?))>0
                       OR instr(report_fold(username),report_fold(?))>0 OR phone=?)
             ORDER BY id LIMIT ?
-        """, (after, kind, kind, kind, query, query, query, (query[1:] if query.startswith("@") and len(query)>1 else query), normalized, min(max(limit,1),21)))
+        """, (after, kind, kind, kind, kind, query, query, query, (query[1:] if query.startswith("@") and len(query)>1 else query), normalized, min(max(limit,1),21)))
 
 
 async def user_profile(user_id):
