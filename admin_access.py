@@ -165,3 +165,20 @@ async def mark_lead_view(user_id, lead_id):
             (user_id, lead_id, now()),
         )
         await db.commit()
+
+
+async def administrator_page(legacy_admins, owner_id=None, *, after=0, limit=10):
+    """Read a consistent page without changing or hiding past assignments."""
+    configured = sorted(set(legacy_admins) | ({owner_id} if owner_id is not None else set()))
+    union = "".join(" UNION SELECT ?" for _ in configured)
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        await db.execute("BEGIN")
+        candidates = await (await db.execute(
+            "WITH candidates(id) AS (SELECT DISTINCT target_id FROM admin_role_events" + union +
+            ") SELECT id FROM candidates WHERE id>? ORDER BY id LIMIT ?",
+            (*configured, after, min(max(limit, 1), 50)),
+        )).fetchall()
+        result = []
+        for (user_id,) in candidates:
+            result.append({"id": user_id, **await role_snapshot_in(db, user_id, legacy_admins, owner_id)})
+        return result

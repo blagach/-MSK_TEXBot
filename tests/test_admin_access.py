@@ -94,3 +94,12 @@ class AdminAccessTests(unittest.IsolatedAsyncioTestCase):
         ), return_exceptions=True)
         self.assertEqual(sum(item is True for item in results), 1)
         self.assertEqual(sum(isinstance(item, access.RoleConflict) for item in results), 1)
+
+    async def test_administrator_pages_keep_owner_legacy_and_revoked_assignments(self):
+        await access.assign_role(1, 2, "none", "revoke", owner_id=1)
+        await access.assign_role(1, 3, "support", "assign", owner_id=1)
+        page = await access.administrator_page({1, 2}, 1, limit=2)
+        self.assertEqual([(r["id"], r["role"]) for r in page], [(1, "owner"), (2, "none")])
+        second = await access.administrator_page({1, 2}, 1, after=2)
+        self.assertEqual([(r["id"], r["role"]) for r in second], [(3, "support")])
+        self.assertEqual(len(await access.administrator_page({1, 2}, 1)), 3)

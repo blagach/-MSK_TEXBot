@@ -1,5 +1,6 @@
 """Private, administrator-only report and export entry points."""
 import re
+import json
 from uuid import uuid4
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -61,6 +62,30 @@ async def menu(message, user_id=None, admin_ids=(), owner_id=None):
     await message.answer("Админ-панель", reply_markup=keyboard(*rows))
 
 
+def audit_line(row):
+    actions = {"role_changed": "Изменение прав", "admin_denied": "Отказ в доступе",
+               "admin_view": "Просмотр раздела", "lead_view": "Просмотр заявки",
+               "lead_publish": "Публикация заявки", "lead_reject": "Отклонение заявки",
+               "lead_close": "Закрытие заявки", "support_reply": "Ответ поддержки",
+               "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX"}
+    results = {"success": "Успешно", "denied": "Запрещено", "conflict": "Конфликт версий",
+               "not_changed": "Без изменения"}
+    text = (f"#{row['id']} · {row['created_at']} (UTC) · пользователь {row['actor_id']}\n"
+            f"{actions.get(row['action'], row['action'])} · объект {row['target_id'] or '—'} · "
+            f"{results.get(row['result'], row['result'])}")
+    try:
+        details = json.loads(row['details'])
+    except (ValueError, TypeError):
+        return text
+    if isinstance(details, dict) and row['action'] == "role_changed":
+        if row['result'] == "success" and "previous_role" in details:
+            text += (f"\n{ROLE_LABELS.get(details['previous_role'], details['previous_role'])} → "
+                     f"{ROLE_LABELS.get(details['role'], details['role'])}")
+        elif row['result'] == "conflict":
+            text += f"\nВерсия подтверждения: {details.get('expected_revision')}; текущая: {details.get('actual_revision')}"
+    return text
+
+
 async def resume_admin_step(message, state):
     data = await state.get_data()
     if await state.get_state() == ManageAdmins.target.state:
@@ -118,6 +143,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         permission = "catalog"
     if re.fullmatch(r"audit:[1-9][0-9]{0,18}", action):
         permission = "audit"
+    if re.fullmatch(r"admins:[0-9]{1,19}", action):
+        permission = "roles"
     if action.startswith(("role:", "confirm:", "role_cancel:")):
         permission = "roles"
     if permission is None or not await admin_access.allowed(
@@ -135,8 +162,24 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         await menu(message, callback.from_user.id, support_admin_ids, service_owner_id)
     elif action == "settings":
         await message.answer("Настройки", reply_markup=keyboard(
-            (("Администраторы", "admin:role:choose"), ("Журнал действий", "admin:audit")), HOME,
+            (("Администраторы", "admin:admins:0"), ("Журнал действий", "admin:audit")), HOME,
         ))
+    elif action.startswith("admins:"):
+        after = min(int(action.split(":")[1]), 2**63 - 1)
+        page = await admin_access.administrator_page(support_admin_ids, service_owner_id, after=after, limit=11)
+        rows = page[:10]
+        labels = {**ROLE_LABELS, "owner": "Владелец", "finance": "Финансы", "marketer": "Маркетолог"}
+        text = "Права администраторов\n\n" + "\n".join(
+            f"ID {row['id']} · {labels.get(row['role'], row['role'])}" for row in rows
+        )
+        buttons = [(("Назначить права", "admin:role:choose"),)]
+        if len(page) > 10:
+            buttons.append((("Далее", f"admin:admins:{rows[-1]['id']}"),))
+        if after:
+            buttons.append((("К началу списка", "admin:admins:0"),))
+        buttons.append(HOME)
+        await message.answer(text if rows else "Права администраторов: записей на этой странице нет.",
+                             reply_markup=keyboard(*buttons))
     elif action == "role:choose":
         await message.answer("Выберите роль для назначения. Изменение потребует подтверждения.",
                              reply_markup=keyboard(*(((label, f"admin:role:{role}"),)
@@ -192,11 +235,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         before = min(int(action.split(":")[1]), 2**63 - 1) if ":" in action else 2**63 - 1
         page = await admin_access.history(before, 11)
         rows = page[:10]
-        text = "\n".join(
-            f"#{row['id']} · {row['created_at']} · пользователь {row['actor_id']} · "
-            f"{row['action']} · объект {row['target_id'] or '—'} · {row['result']}"
-            for row in rows
-        )
+        text = "\n\n".join(audit_line(row) for row in rows)
         navigation = []
         if len(page) > 10:
             navigation.append((("Ранее", f"admin:audit:{rows[-1]['id']}"),))

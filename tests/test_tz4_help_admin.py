@@ -620,6 +620,23 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
         ordinary.answer.assert_not_awaited()
 
+    async def test_owner_can_inspect_roles_and_audit_but_other_staff_cannot(self):
+        await admin_access.assign_role(1, 2, "support", "assign-support", owner_id=1, legacy_admins=self.admins)
+        owner, state = self.actor(1)
+        await admin_ui.admin_action(self.callback(owner, "admin:admins:0"), self.admins,
+                                    state, service_owner_id=1)
+        self.assertIn("ID 1 · Владелец", owner.answer.await_args.args[0])
+        self.assertIn("ID 2 · Поддержка", owner.answer.await_args.args[0])
+        await admin_ui.admin_action(self.callback(owner, "admin:audit"), self.admins,
+                                    state, service_owner_id=1)
+        self.assertIn("Администратор → Поддержка", owner.answer.await_args.args[0])
+        self.assertIn("Изменение прав", owner.answer.await_args.args[0])
+        staff, staff_state = self.actor(2)
+        denied = self.callback(staff, "admin:admins:0")
+        await admin_ui.admin_action(denied, self.admins, staff_state, service_owner_id=1)
+        denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
+        staff.answer.assert_not_awaited()
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)
