@@ -107,7 +107,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             await admin_ui.admin_action(self.callback(admin, "admin:home"), self.admins)
             self.assertEqual(buttons(admin)["help:queue"], f"📥 Обращения · {new}")
             await self.help_action(admin, admin_state, "home")
-            self.assertEqual(buttons(admin)["help:queue"], f"📥 Очередь поддержки · {new}")
+            self.assertEqual(len(buttons(admin)), 3)
+            self.assertEqual(buttons(admin)["help:resources"], "📖 Как пользоваться сервисом")
             await self.help_action(admin, admin_state, "queue")
             labels = buttons(admin)
             for status, title, count in (
@@ -263,6 +264,45 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any(method.chat_id == 20 and method.text == f"№{ticket} · Поддержка\n{response}"
                                     for method in delivered))
         self.assertEqual((await support_storage.history(ticket))[0]["delivery_status"], "sent")
+
+    async def test_tz7_support_menu_keeps_old_features_in_guide(self):
+        user, state = self.actor(20)
+        for user_id in (20, 1):
+            await support_ui.menu(user, user_id, self.admins)
+            rows = user.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual([button.text for row in rows for button in row], [
+                "📖 Как пользоваться сервисом", "📋 Мои обращения", "💬 Написать в поддержку",
+            ])
+        await self.help_action(user, state, "resources")
+        rows = user.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        actions = {button.callback_data for row in rows for button in row}
+        self.assertTrue({"help:guides", "help:faq", "help:training", "help:new:bug"} <= actions)
+
+    async def test_tz7_requester_closes_reopens_without_losing_history(self):
+        ticket, _ = await support_storage.create_ticket(20, "help", "tz7-owner", "Вопрос", "photo")
+        await support_storage.add_reply(ticket, 1, "tz7-answer", "Ответ")
+        before = [(row["id"], row["text"], row["photo_id"]) for row in await support_storage.history(ticket)]
+        stranger, foreign_state = self.actor(21)
+        denied = await self.help_action(stranger, foreign_state, f"owner_confirm:{ticket}")
+        self.assertEqual((await support_storage.ticket(ticket))["status"], "in_progress")
+
+        owner, state = self.actor(20)
+        await self.help_action(owner, state, f"owner_close:{ticket}")
+        self.assertEqual((await support_storage.ticket(ticket))["status"], "in_progress")
+        await self.help_action(owner, state, f"owner_confirm:{ticket}")
+        self.assertEqual((await support_storage.ticket(ticket))["status"], "closed")
+        self.telegram.send_message.reset_mock()
+        await self.help_action(owner, state, f"owner_reopen:{ticket}")
+        await self.help_action(owner, state, f"owner_reopen:{ticket}")
+        self.assertEqual((await support_storage.ticket(ticket))["status"], "new")
+        self.assertEqual(self.telegram.send_message.await_count, len(self.admins))
+        self.assertEqual(before, [(row["id"], row["text"], row["photo_id"])
+                                  for row in await support_storage.history(ticket)])
+        async with aiosqlite.connect(self.database) as db:
+            events = await (await db.execute(
+                "SELECT actor_id,status FROM support_status_events WHERE ticket_id=? ORDER BY id", (ticket,),
+            )).fetchall()
+        self.assertEqual(events, [(1, "in_progress"), (20, "closed"), (20, "new")])
 
     async def test_delivery_error_and_legacy_history_are_persisted(self):
         ticket_id, _ = await support_storage.create_ticket(20, "bug", "first", "Question", None)

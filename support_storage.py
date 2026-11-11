@@ -149,6 +149,25 @@ async def change_status(ticket_id, status, actor_id=None):
         return cursor.rowcount == 1
 
 
+async def requester_status(ticket_id, requester_id, target):
+    if target not in {"new", "closed"}:
+        raise ValueError("Invalid requester support status")
+    async with connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            """UPDATE support_tickets SET status=? WHERE id=? AND requester_id=?
+               AND ((?='new' AND status='closed') OR (?='closed' AND status IN ('new','in_progress')))""",
+            (target, ticket_id, requester_id, target, target),
+        )
+        if cursor.rowcount:
+            await db.execute(
+                "INSERT INTO support_status_events(ticket_id,actor_id,status,created_at) VALUES (?,?,?,?)",
+                (ticket_id, requester_id, target, now()),
+            )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
 async def add_reply(ticket_id, admin_id, request_id, text):
     async with connection() as db:
         await db.execute("BEGIN IMMEDIATE")

@@ -54,17 +54,11 @@ BACK = (("⬅️ В помощь", "home"),)
 
 
 async def menu(message, user_id, admin_ids):
-    rows = [
-        (("📖 Как пользоваться ботом", "guides"),),
-        (("❔ Частые вопросы", "faq"), ("🎓 Попробовать на примере", "training")),
-        (("✉️ Написать в поддержку", "new:help"),),
-        (("🐞 Сообщить об ошибке", "new:bug"),),
-        (("📂 Мои обращения", "mine:0"),),
-    ]
-    if user_id in admin_ids:
-        totals = await store.counts()
-        rows.append(((f"📥 Очередь поддержки · {totals.get('new', 0)}", "queue"),))
-    await message.answer("Помощь / Поддержка", reply_markup=keys(*rows))
+    await message.answer("Помощь / Поддержка", reply_markup=keys(
+        (("📖 Как пользоваться сервисом", "resources"),),
+        (("📋 Мои обращения", "mine:0"),),
+        (("💬 Написать в поддержку", "new:help"),),
+    ))
 
 
 async def faq_list(message, query=None):
@@ -165,6 +159,11 @@ async def show_ticket(message, ticket_id, user_id, admin, offset=0, origin=""):
         actions.append((("Более ранние сообщения", f"ticket:{ticket_id}:{offset + HISTORY_PAGE}{suffix}"),))
     if ticket["requester_id"] == user_id and ticket["status"] != "closed":
         actions.append((("✉️ Написать сообщение", f"follow:{ticket_id}"),))
+    if ticket["requester_id"] == user_id:
+        if ticket["status"] == "closed":
+            actions.append((("Открыть повторно", f"owner_reopen:{ticket_id}"),))
+        else:
+            actions.append((("Закрыть обращение", f"owner_close:{ticket_id}"),))
     if admin and ticket["status"] != "closed":
         if ticket["status"] == "new":
             actions.append((("Взять в работу", f"status:{ticket_id}:in_progress{suffix}"),))
@@ -218,6 +217,12 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         if await state.get_state() in Support.__all_states_names__:
             await state.clear()
         await menu(message, user_id, support_admin_ids)
+    elif parts == ["resources"]:
+        await message.answer("Как пользоваться сервисом", reply_markup=keys(
+            (("📖 Инструкции по ролям", "guides"),),
+            (("❔ Частые вопросы", "faq"), ("🎓 Попробовать на примере", "training")),
+            (("🐞 Сообщить об ошибке", "new:bug"),), BACK,
+        ))
     elif parts in (["guides"], ["training"]):
         prefix = "guide" if action == "guides" else "train"
         await message.answer("Выберите роль.", reply_markup=keys(
@@ -293,6 +298,23 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         await ticket_list(message, None, status=parts[1], offset=int(parts[2]))
     elif action == "ticket" and len(parts) >= 3 and positive_id(parts[1]) and page_number(parts[2], HISTORY_PAGE) is not None:
         await show_ticket(message, int(parts[1]), user_id, admin, int(parts[2]), ticket_list_origin(parts[3:], admin))
+    elif action in {"owner_close", "owner_reopen", "owner_confirm"} and len(parts) == 2 and positive_id(parts[1]):
+        ticket = await store.ticket(int(parts[1]), user_id)
+        if ticket is None:
+            await message.answer("Обращение недоступно.", reply_markup=keys(BACK))
+            return
+        if action == "owner_close":
+            await message.answer(f"Закрыть обращение №{ticket['id']}?", reply_markup=keys(
+                (("Подтвердить закрытие", f"owner_confirm:{ticket['id']}"),),
+                (("Вернуться", f"ticket:{ticket['id']}:0"),),
+            ))
+            return
+        target = "closed" if action == "owner_confirm" else "new"
+        changed = await store.requester_status(ticket["id"], user_id, target)
+        if changed and target == "new":
+            await notify_admins(bot, support_admin_ids, support_group_id, ticket["id"], ticket["kind"])
+        await message.answer("Статус обновлён." if changed else "Статус уже изменён.")
+        await show_ticket(message, ticket["id"], user_id, admin)
     elif action == "close" and len(parts) >= 2 and positive_id(parts[1]):
         origin = ticket_list_origin(parts[2:], admin)
         suffix = f":{origin}" if origin else ""
