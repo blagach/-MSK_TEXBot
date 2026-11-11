@@ -147,16 +147,14 @@ def run(checksum, env=None):
         raise RuntimeError('Check stopped (' + type(error).__name__ + '); files retained at ' + str(evidence)) from None
 
 
-def main():
+def main(checksum=None):
     try:
         require(os.environ.get('RENDER_SERVICE_ID') == WORKER, 'Wrong test Worker')
         require(os.environ.get('RENDER_GIT_COMMIT') == INSTALLED, 'Installed commit changed')
         disk = Path('/var/data')
         require(not disk.is_symlink() and disk.is_mount(), 'Test disk is not mounted at /var/data')
-        with open('/dev/tty', 'r+') as terminal:
-            terminal.write('Paste snapshot_sha256 from the previous JSON, then Enter: ')
-            terminal.flush()
-            checksum = terminal.readline()
+        require(isinstance(checksum, str) and bool(checksum.strip()),
+                'Snapshot SHA-256 must be supplied explicitly; terminal input is not used')
         print(json.dumps(run(checksum), ensure_ascii=False, indent=2))
     except Exception as error:
         print(json.dumps({'result': 'STOP', 'reason': str(error)}, ensure_ascii=False))
@@ -164,4 +162,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--snapshot-sha256', required=True)
+    main(parser.parse_args().snapshot_sha256)

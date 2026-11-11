@@ -1,5 +1,10 @@
 """Exercise the owner bootstrap without Render or network access."""
 from pathlib import Path
+from contextlib import redirect_stdout
+import io
+import json
+import os
+import pty
 import sqlite3
 import tempfile
 import unittest
@@ -39,6 +44,10 @@ class OwnerBootstrapTests(unittest.TestCase):
     def test_public_repository_bootstrap_runs_only_fresh_copies(self):
         root, source, restored = self.fixture()
         checksum = check.digest(source)
+        previous = root / 'owner-rehearsal-previous'
+        previous.mkdir(mode=0o700)
+        marker = previous / 'retained.txt'
+        marker.write_bytes(b'previous attempt must remain')
         env = {'RENDER_SERVICE_ID': check.WORKER, 'RENDER_GIT_COMMIT': check.INSTALLED}
         with patch.object(check, 'SNAPSHOT', source), patch.object(check, 'RESTORED', restored), \
              patch.object(check, 'REPOSITORY', str(sqlite_rehearsal.ROOT)):
@@ -57,6 +66,37 @@ class OwnerBootstrapTests(unittest.TestCase):
         self.assertEqual(check.digest(source), checksum)
         self.assertEqual(check.digest(restored), checksum)
         self.assertTrue((Path(result['evidence']) / 'owner-result.json').is_file())
+        self.assertNotEqual(Path(result['evidence']), previous)
+        self.assertEqual(marker.read_bytes(), b'previous attempt must remain')
+
+    def test_nonseekable_terminal_reproduction_and_explicit_checksum_entry(self):
+        master, slave = pty.openpty()
+        try:
+            with self.assertRaisesRegex(io.UnsupportedOperation, 'not seekable'):
+                with open(os.ttyname(slave), 'r+'):
+                    pass
+        finally:
+            os.close(slave)
+            os.close(master)
+        checksum = '92555b1828b18f6e082fe33ef3e1774efb648b617926d05ab3413f01e59d2f7f'
+        output = io.StringIO()
+        env = {'RENDER_SERVICE_ID': check.WORKER, 'RENDER_GIT_COMMIT': check.INSTALLED}
+        with patch.dict(os.environ, env), patch.object(Path, 'is_mount', return_value=True), \
+             patch('builtins.open', side_effect=AssertionError('No terminal or stdin input permitted')), \
+             patch.object(check, 'run', return_value={'result': 'ok'}) as run, redirect_stdout(output):
+            check.main(checksum)
+        run.assert_called_once_with(checksum)
+        self.assertEqual(json.loads(output.getvalue()), {'result': 'ok'})
+
+    def test_missing_explicit_checksum_stops_without_running_rehearsal(self):
+        output = io.StringIO()
+        env = {'RENDER_SERVICE_ID': check.WORKER, 'RENDER_GIT_COMMIT': check.INSTALLED}
+        with patch.dict(os.environ, env), patch.object(Path, 'is_mount', return_value=True), \
+             patch.object(check, 'run') as run, redirect_stdout(output):
+            with self.assertRaises(SystemExit):
+                check.main()
+        run.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())['result'], 'STOP')
 
     def test_wrong_worker_or_commit_stops_before_any_file_or_process(self):
         with patch.object(check, 'digest') as digest, patch.object(check.subprocess, 'run') as run:
