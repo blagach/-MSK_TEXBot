@@ -128,3 +128,21 @@ class AdminAccessTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await access.history(kind="exports OR 1=1")
         self.assertEqual([dict(r) for r in await access.history(limit=100)],[dict(r) for r in all_rows])
+
+    async def test_export_recovery_is_idempotent_actor_scoped_and_never_reclaims_requests(self):
+        for name in ('generation','sending','sent','failed','denied'):
+            await access.reserve_export(1,name)
+        await access.record(1,'export_sending',result='pending',details={'request_id':'sending'})
+        await access.record(1,'export_sent',details={'request_id':'sent'})
+        await access.record(1,'export_delivery',result='failed',details={'request_id':'failed'})
+        await access.record(1,'admin_denied',result='denied',details={'request_id':'denied'})
+        await access.reserve_export(2,'sent')
+        results=await asyncio.gather(access.recover_exports(),access.recover_exports())
+        self.assertEqual(sorted(results),[0,3])
+        recovered=[r for r in await access.history(limit=100) if r['action']=='export_delivery' and r['result']=='uncertain']
+        self.assertEqual(len(recovered),3)
+        self.assertTrue(any('"last_phase": "sending"' in r['details'] for r in recovered))
+        self.assertFalse(await access.reserve_export(1,'sending'))
+        self.assertEqual(await access.recover_exports(),0)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute('SELECT * FROM leads').fetchall(),[(11,'published')])

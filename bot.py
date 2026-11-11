@@ -1809,6 +1809,7 @@ def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatch
         support_admin_ids=settings.admin_ids, support_group_id=settings.support_group_id,
         service_owner_id=settings.owner_id,
     )
+    dispatcher.startup.register(admin_access.recover_exports)
     dispatcher.message.outer_middleware(track_private_visitor)
     dispatcher.callback_query.outer_middleware(track_private_visitor)
     dispatcher.message.middleware(check_user_access)

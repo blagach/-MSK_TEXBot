@@ -160,7 +160,7 @@ async def history(before=2**63 - 1, limit=10, *, kind="all"):
         "all":"1=1",
         "permissions":"action IN ('role_changed','user_access')",
         "errors":"result IN ('denied','failed','uncertain','conflict')",
-        "exports":"action IN ('export_requested','export_delivery','export_sent')",
+        "exports":"action IN ('export_requested','export_sending','export_delivery','export_sent')",
     }
     if kind not in filters:
         raise ValueError("Unknown audit filter")
@@ -215,3 +215,40 @@ async def reserve_export(actor_id, request_id):
                          (actor_id,'export_requested',None,'accepted',json.dumps({'request_id':request_id}),now()))
         await db.commit()
         return True
+
+
+async def recover_exports():
+    """Mark interrupted exports as uncertain. Never generate or send a file."""
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        await db.execute('BEGIN IMMEDIATE')
+        rows=await (await db.execute(
+            "SELECT actor_id,action,details FROM admin_action_log WHERE action IN "
+            "('export_requested','export_sending','export_sent','export_delivery','admin_denied') ORDER BY id"
+        )).fetchall()
+        requested={}
+        terminal=set()
+        for actor_id,action,encoded in rows:
+            try:
+                details=json.loads(encoded)
+            except (ValueError,TypeError):
+                continue
+            request=details.get('request_id') if isinstance(details,dict) else None
+            if not isinstance(request,str) or not 1<=len(request)<=200:
+                continue
+            key=(actor_id,request)
+            if action=='export_requested':
+                requested.setdefault(key,'generation')
+            elif action=='export_sending' and key in requested:
+                requested[key]='sending'
+            elif action in {'export_sent','export_delivery','admin_denied'}:
+                terminal.add(key)
+        recovered=0
+        for (actor_id,request),phase in requested.items():
+            if (actor_id,request) in terminal:
+                continue
+            await db.execute('INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at) VALUES (?,?,?,?,?,?)',
+                (actor_id,'export_delivery',None,'uncertain',json.dumps({'request_id':request,'stage':'interrupted',
+                 'last_phase':phase,'error_code':'interrupted'}),now()))
+            recovered+=1
+        await db.commit()
+        return recovered

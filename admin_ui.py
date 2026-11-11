@@ -103,9 +103,9 @@ def audit_line(row):
                "lead_close": "Закрытие заявки", "support_reply": "Сохранение ответа поддержки",
                "support_delivery": "Отправка ответа поддержки", "user_search": "Поиск пользователей",
                "user_profile": "Просмотр профиля", "user_access": "Изменение доступа",
-               "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX", "export_requested": "Запрос XLSX", "export_delivery": "Отправка XLSX"}
+               "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX", "export_sending": "Начало отправки XLSX", "export_requested": "Запрос XLSX", "export_delivery": "Отправка XLSX"}
     results = {"success": "Успешно", "denied": "Запрещено", "conflict": "Конфликт версий",
-               "not_changed": "Без изменения", "accepted": "Запрос принят", "saved": "Сохранено в истории",
+               "not_changed": "Без изменения", "accepted": "Запрос принят", "pending": "Ожидается ответ Telegram", "saved": "Сохранено в истории",
                "sent": "Отправку подтвердил Telegram", "failed": "Ошибка отправки",
                "uncertain": "Отправка не подтверждена"}
     text = (f"#{row['id']} · {row['created_at']} (UTC) · пользователь {row['actor_id']}\n"
@@ -640,6 +640,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             await admin_access.record(callback.from_user.id,"admin_denied",result="denied",details={"section":"export","stage":"before_send","request_id":request_id})
             await message.answer("Право на выгрузку изменилось. Файл не отправлен.")
             return
+        await admin_access.record(callback.from_user.id,"export_sending",result="pending",details={"request_id":request_id})
         try:
             await message.answer_document(document, caption="Служебная выгрузка MSK TEXBot.", reply_markup=keyboard(HOME))
         except (TelegramAPIError,TimeoutError) as error:

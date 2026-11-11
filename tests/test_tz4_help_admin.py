@@ -973,6 +973,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                     stack.enter_context(patch.object(item,'_parent_router',None))
                 stack.enter_context(patch.object(telegram.session,'make_request',side_effect=transport))
                 dispatcher=bot.create_dispatcher(backing)
+                self.assertIn(admin_access.recover_exports,[h.callback for h in dispatcher.startup.handlers])
                 await dispatcher.feed_update(telegram,Update.model_validate({'update_id':900,'callback_query':{
                     'id':'900','from':user,'chat_instance':'search','data':'admin:lead_find',
                     'message':{'message_id':400,'date':stamp,'chat':chat}}}))
@@ -1074,6 +1075,17 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await admin_ui.admin_action(denied,self.admins,other,service_owner_id=1)
         denied.answer.assert_awaited_once_with('Нет доступа.',show_alert=True)
         staff.answer.assert_not_awaited()
+
+    async def test_recovered_interrupted_export_does_not_send_on_callback_replay(self):
+        admin,state=self.actor(1)
+        callback=self.callback(admin,'admin:export')
+        await admin_access.reserve_export(1,callback.id)
+        await admin_access.record(1,'export_sending',result='pending',details={'request_id':callback.id})
+        self.assertEqual(await admin_access.recover_exports(),1)
+        await admin_ui.admin_action(callback,self.admins,state,service_owner_id=1)
+        admin.answer_document.assert_not_awaited()
+        self.assertIn('Повторная отправка не выполнялась',admin.answer.await_args.args[0])
+        self.assertFalse(any(r['action']=='export_sent' for r in await admin_access.history(limit=100)))
 
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
