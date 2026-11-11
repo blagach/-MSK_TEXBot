@@ -76,6 +76,10 @@ async def record_event(db, lead_id, action, *, actor_id=None, reason=None, offer
 async def change_lifecycle(db_path, lead_id, actor_id, *, admin=False, reason=None, offer_id=None):
     if (reason is None) == (offer_id is None):
         raise ValueError("Ожидается причина закрытия или номер отклика")
+    if reason is not None:
+        if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 500:
+            raise ValueError("Укажите причину закрытия длиной от 1 до 500 символов")
+        reason = reason.strip()
     async with aiosqlite.connect(db_path) as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute("SELECT customer_id, status FROM leads WHERE id=?", (lead_id,)) as cursor:

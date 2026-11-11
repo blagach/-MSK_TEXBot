@@ -137,6 +137,21 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("#Контакт", public)
         self.assertIn(bot.payment_preferences.VAT, public)
 
+    async def test_close_reason_is_required_by_storage_and_saved_without_outer_spaces(self):
+        lead_id = await self.make_lead()
+        await self.publish(lead_id)
+        for invalid in ("", "  ", "x" * 501, 123):
+            with self.subTest(reason=invalid):
+                with self.assertRaises(ValueError):
+                    await lead_journey.change_lifecycle(str(self.path), lead_id, 12, reason=invalid)
+                self.assertEqual((await bot.get_lead(lead_id))["status"], "published")
+        self.assertTrue(await lead_journey.change_lifecycle(str(self.path), lead_id, 12,
+                                                           reason="  Работы завершены  "))
+        async with aiosqlite.connect(self.path) as db:
+            self.assertEqual(await (await db.execute(
+                "SELECT actor_id,reason FROM lead_lifecycle_events WHERE lead_id=? AND action='closed'", (lead_id,),
+            )).fetchone(), (12, "Работы завершены"))
+
     async def test_support_thread_continues_only_for_owner_and_keeps_status_history(self):
         ticket, _ = await support_storage.create_ticket(12, "help", "initial", "Вопрос", None)
         self.assertFalse(await support_storage.add_requester_message(ticket, 21, "forbidden", "Чужое обращение"))
