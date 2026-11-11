@@ -12,7 +12,7 @@ QUESTION = 'E01 a5f4eb9 test'
 ANSWER = 'E01 a5f4eb9 ok'
 
 
-def inspect(database, lead_id, ticket_id):
+def inspect(database, lead_id, ticket_id, *, requester_id=None, admin_id=None):
     database = Path(database)
     if database.is_symlink() or not database.is_file():
         raise ValueError('Existing regular test SQLite required')
@@ -72,13 +72,19 @@ def inspect(database, lead_id, ticket_id):
             'one_saved_audit': audit_count('support_reply', 'saved') == 1,
             'one_sent_audit': audit_count('support_delivery', 'sent') == 1,
         }
+        expected_accounts = {
+            'requester_matches_expected': requester_id is None or bool(lead and ticket
+                and lead['customer_id'] == ticket['requester_id'] == requester_id),
+            'administrator_matches_expected': admin_id is None or bool(reply and len(events) == 1
+                and reply['actor_id'] == events[0]['actor_id'] == admin_id),
+        }
         binding = bool(lead and ticket and reply and len(events) == 1
                        and lead['customer_id'] == ticket['requester_id']
                        and events[0]['actor_id'] == reply['actor_id']
                        and events[0]['actor_id'] != lead['customer_id'])
     return {'lead_id': lead_id, 'ticket_id': ticket_id, 'C05_backend': c05, 'E01_backend': e01,
-            'same_two_accounts': binding,
-            'backend_checks': 'ok' if all(c05.values()) and all(e01.values()) and binding else 'not_confirmed',
+            'same_two_accounts': binding, 'expected_accounts': expected_accounts,
+            'backend_checks': 'ok' if all(c05.values()) and all(e01.values()) and binding and all(expected_accounts.values()) else 'not_confirmed',
             'C05_cancel_edit_resume_and_notification': 'manual_check_required',
             'E01_human_receipt_and_reopened_history': 'manual_check_required',
             'manual_acceptance': 'pending_owner_confirmation', 'C05': 'open', 'E01': 'open'}
@@ -91,10 +97,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--lead-id', required=True, type=int)
     parser.add_argument('--ticket-id', required=True, type=int)
+    parser.add_argument('--requester-id', required=True, type=int,
+                        help='Expected ordinary tester account; never printed in the report')
     args = parser.parse_args()
+    try:
+        admin_id = int(os.environ['TEST_ADMIN_ID'])
+        testers = {int(value.strip()) for value in os.environ['TESTER_IDS'].split(',')}
+    except (KeyError, ValueError):
+        parser.error('Valid test administrator and tester configuration required')
+    if args.requester_id not in testers or args.requester_id == admin_id:
+        parser.error('Requester must be an allowed ordinary test account')
     if min(args.lead_id, args.ticket_id) <= 0:
         parser.error('Positive record IDs required')
-    print(json.dumps(inspect('/var/data/bot.db', args.lead_id, args.ticket_id), indent=2))
+    print(json.dumps(inspect('/var/data/bot.db', args.lead_id, args.ticket_id,
+                             requester_id=args.requester_id, admin_id=admin_id), indent=2))
 
 
 if __name__ == '__main__':

@@ -69,3 +69,21 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         result = check.inspect(path, 17, 4)
         self.assertFalse(result['C05_backend']['one_closure_with_final_reason'])
         self.assertFalse(result['E01_backend']['one_marked_reply'])
+
+    def test_matching_evidence_from_different_accounts_cannot_confirm_expected_pair(self):
+        path = self.fixture()
+        self.assertEqual(check.inspect(path, 17, 4, requester_id=20, admin_id=1)['backend_checks'], 'ok')
+        for requester, admin in [(21, 1), (20, 2), (21, 2)]:
+            result = check.inspect(path, 17, 4, requester_id=requester, admin_id=admin)
+            self.assertEqual(result['backend_checks'], 'not_confirmed')
+            self.assertEqual((result['C05'], result['E01']), ('open', 'open'))
+
+    def test_expected_pair_is_not_disclosed_and_inspection_keeps_source_unchanged(self):
+        path = self.fixture()
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        result = check.inspect(path, 17, 4, requester_id=20, admin_id=1)
+        self.assertTrue(all(result['expected_accounts'].values()))
+        encoded = json.dumps(result)
+        self.assertNotIn('requester_id', encoded)
+        self.assertNotIn('admin_id', encoded)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
