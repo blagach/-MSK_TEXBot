@@ -116,6 +116,36 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
         for lead_id in (other_region, other_kind):
             self.assertNotIn(f"Заявка №{lead_id}", shown)
 
+    async def test_saved_preferences_drive_notification_and_legacy_list_without_duplicates(self):
+        from dataclasses import replace
+        await provider_registry.register_provider(21, "Подписчик", "+79990000002", True, str(self.path))
+        await provider_registry.save_alert_preferences(
+            21, ["КДМ", "автокран"], ["Москва", "Московская область"], 0, str(self.path),
+        )
+        matching = await self.make_lead()
+        other_kind = await self.make_lead("самосвал")
+        await self.publish(matching)
+        await self.publish(other_kind)
+        telegram = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(bot, "settings", replace(bot.settings, test_notification_provider_ids=frozenset({21}))):
+            await bot.notify_test_providers(telegram, await bot.get_lead(matching))
+            await bot.notify_test_providers(telegram, await bot.get_lead(matching))
+            await bot.notify_test_providers(telegram, await bot.get_lead(other_kind))
+        telegram.send_message.assert_awaited_once()
+        self.assertEqual(telegram.send_message.await_args.args[0], 21)
+        self.assertIn(f"№{matching}", telegram.send_message.await_args.args[1])
+        self.assertNotIn("+79990000001", telegram.send_message.await_args.args[1])
+        message = SimpleNamespace(answer=AsyncMock())
+        await bot.show_matching_leads(message, 21)
+        self.assertEqual(len(message.answer.await_args_list), 1)
+        self.assertIn(f"№{matching}", message.answer.await_args.args[0])
+        await provider_registry.set_notifications(21, False, str(self.path))
+        another = await self.make_lead()
+        await self.publish(another)
+        with patch.object(bot, "settings", replace(bot.settings, test_notification_provider_ids=frozenset({21}))):
+            await bot.notify_test_providers(telegram, await bot.get_lead(another))
+        self.assertEqual(telegram.send_message.await_count, 1)
+
     async def test_lifecycle_actor_rights_and_data_are_preserved(self):
         lead_id = await self.make_lead()
         await self.publish(lead_id)

@@ -708,6 +708,21 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(label, tools)
         self.assertIsNotNone(await bot.draft_slot(self.state, "provider_action").get_state())
 
+    async def test_alert_preferences_detect_concurrent_changes_without_losing_draft(self):
+        await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)
+        await bot.provider_registry.save_alert_preferences(20, ["автокран"], ["Москва"], 0, storage.DB_PATH)
+        self.message.text = bot.provider_ui.MY_REGIONS
+        await bot.provider_ui.begin_alert_preferences(self.message, self.state)
+        await self.preference_action("both")
+        await bot.provider_registry.save_alert_preferences(20, ["самосвал"], ["Москва"], 1, storage.DB_PATH)
+        await self.preference_action("save")
+        self.assertIn("другом сеансе", self.message.answer.await_args.args[0])
+        self.assertEqual(await self.state.get_state(), bot.provider_ui.AlertPreferences.select.state)
+        self.assertEqual(set((await self.state.get_data())["alert_regions"]), {"Москва", "Московская область"})
+        current = await bot.provider_registry.alert_preferences(20, storage.DB_PATH)
+        self.assertEqual(current["categories"], ["самосвал"])
+        self.assertEqual(current["revision"], 2)
+
     async def test_keyboard_replacement_back_and_home(self):
         comment_markup = await self.enter_comment()
         await self.click("skip")
