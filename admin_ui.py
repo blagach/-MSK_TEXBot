@@ -37,6 +37,10 @@ class ManageAccess(StatesGroup):
     confirm = State()
 
 
+class FindLead(StatesGroup):
+    query = State()
+
+
 class FindUser(StatesGroup):
     query = State()
     results = State()
@@ -174,6 +178,38 @@ async def access_reason(message: Message, state: FSMContext, support_admin_ids, 
     await resume_access_step(message,state)
 
 
+async def resume_lead_search(message,state):
+    data=await state.get_data()
+    last=f"\nПоследний номер: {data['lead_search_id']}" if data.get('lead_search_id') else ""
+    sent=await message.answer("Введите номер заявки, например 11 или №11."+last,reply_markup=keyboard(HOME))
+    await state.update_data(form_keyboard_id=sent.message_id)
+
+
+@router.message(FindLead.query)
+async def find_lead(message: Message,state: FSMContext,support_admin_ids,service_owner_id=None):
+    if message.chat.id!=message.from_user.id or not await admin_access.allowed(
+        message.from_user.id,'moderate',support_admin_ids,service_owner_id,
+    ):
+        await message.answer('Нет доступа.')
+        return
+    value=(message.text or '').strip().lstrip('#№').strip()
+    if not re.fullmatch(r'[1-9][0-9]{0,17}',value):
+        await message.answer('Введите положительный номер заявки до 18 цифр.',reply_markup=keyboard(HOME))
+        return
+    await state.update_data(lead_search_id=int(value))
+    from bot import get_lead,show_customer_lead
+    lead=await get_lead(int(value))
+    if lead is None:
+        await message.answer('Заявка не найдена. Можно ввести другой номер.',reply_markup=keyboard(HOME))
+        return
+    if not await admin_access.allowed(message.from_user.id,'moderate',support_admin_ids,service_owner_id):
+        await message.answer('Право просмотра изменилось. Карточка не отправлена.')
+        return
+    await show_customer_lead(message,lead,message.from_user.id==lead['customer_id'],True,admin_back='admin:records')
+    await admin_access.mark_lead_view(message.from_user.id,lead['id'])
+    await admin_access.record(message.from_user.id,'lead_view',target_id=lead['id'],details={'source':'id_search'})
+
+
 async def show_people(message, state, *, kind="all", after=0, query="", nonce=None):
     nonce = nonce or uuid4().hex[:16]
     await state.set_state(FindUser.results)
@@ -270,7 +306,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
                   "marketing": "marketing", "notification_settings": "roles", "service_settings": "roles"}.get(action)
     if action.startswith(("access:", "access_pick:", "access_next:", "access_cancel:", "access_confirm:")):
         permission = "access"
-    if action.startswith("leads:"):
+    if action.startswith("leads:") or action=="lead_find":
         permission = "moderate"
     if action.startswith(("people:", "user:", "users_filter:")) or action == "find":
         permission = "users"
@@ -291,7 +327,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     await callback.answer()
     await admin_access.record(callback.from_user.id, "admin_view", details={"section": permission})
     if action == "home":
-        if state is not None and await state.get_state() in (*ManageAdmins.__all_states_names__, *FindUser.__all_states_names__, *ManageAccess.__all_states_names__):
+        if state is not None and await state.get_state() in (*ManageAdmins.__all_states_names__, *FindUser.__all_states_names__, *ManageAccess.__all_states_names__, *FindLead.__all_states_names__):
             from bot import pause_form
             await pause_form(message, state)
         await menu(message, callback.from_user.id, support_admin_ids, service_owner_id)
@@ -540,8 +576,15 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             f"Результаты откликов\n{outcomes or 'Нет записей'}\n\n"
             f"Доставка откликов\n{deliveries or 'Нет записей'}",
             reply_markup=keyboard((("Новые", "admin:leads:new:0"), ("Активные", "admin:leads:active:0")),
-                                  (("Закрытые", "admin:leads:closed:0"), ("Все", "admin:leads:all:0")), HOME),
+                                  (("Закрытые", "admin:leads:closed:0"), ("Все", "admin:leads:all:0")),
+                                  (("🔎 Поиск по номеру", "admin:lead_find"),), HOME),
         )
+    elif action == 'lead_find' and state is not None:
+        if await state.get_state() not in (None,*FindLead.__all_states_names__):
+            await message.answer('Сначала завершите текущее действие или перейдите в главное меню.')
+            return
+        await state.set_state(FindLead.query)
+        await resume_lead_search(message,state)
     elif action.startswith("leads:"):
         parts=action.split(":")
         if len(parts)!=3 or parts[1] not in {'new','active','closed','all'} or not re.fullmatch(r"[0-9]{1,18}",parts[2]):

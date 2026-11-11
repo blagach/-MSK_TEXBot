@@ -177,6 +177,7 @@ SUPPORT_ACTION_DRAFT = "▶️ Продолжить обращение"
 CLOSING_ACTION_DRAFT = "▶️ Продолжить закрытие заявки"
 ADMIN_ACTION_DRAFT = "▶️ Продолжить настройку прав"
 ADMIN_SEARCH_DRAFT = "▶️ Продолжить поиск пользователя"
+ADMIN_LEAD_SEARCH_DRAFT = "▶️ Продолжить поиск заявки"
 ADMIN_ACCESS_DRAFT = "▶️ Продолжить изменение доступа"
 CUSTOMER_ROLE = "📋 Я заказчик"
 PROVIDER_ROLE = "🚜 Я исполнитель"
@@ -398,6 +399,8 @@ async def pause_form(message: Message, state: FSMContext) -> None:
         kind = "provider_action"
     elif current in admin_ui.ManageAccess.__all_states_names__:
         kind = "admin_access"
+    elif current in admin_ui.FindLead.__all_states_names__:
+        kind = "admin_lead_search"
     elif current in admin_ui.FindUser.__all_states_names__:
         kind = "admin_search"
     elif current in admin_ui.ManageAdmins.__all_states_names__:
@@ -431,26 +434,29 @@ async def pause_form(message: Message, state: FSMContext) -> None:
 async def menu_with_paused_actions(state):
     rows = []
     for kind, label in (("provider_action", PROVIDER_ACTION_DRAFT), ("support_action", SUPPORT_ACTION_DRAFT),
-                        ("lead_closing", CLOSING_ACTION_DRAFT), ("admin_action", ADMIN_ACTION_DRAFT), ("admin_search", ADMIN_SEARCH_DRAFT), ("admin_access", ADMIN_ACCESS_DRAFT)):
+                        ("lead_closing", CLOSING_ACTION_DRAFT), ("admin_action", ADMIN_ACTION_DRAFT), ("admin_search", ADMIN_SEARCH_DRAFT), ("admin_access", ADMIN_ACCESS_DRAFT), ("admin_lead_search", ADMIN_LEAD_SEARCH_DRAFT)):
         if await draft_slot(state, kind).get_state():
             rows.append((label,))
     return main_menu(await admin_allowed(state.key.user_id, "panel"), rows)
 
 
-@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT, ADMIN_SEARCH_DRAFT, ADMIN_ACCESS_DRAFT}))
+@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT, ADMIN_SEARCH_DRAFT, ADMIN_ACCESS_DRAFT, ADMIN_LEAD_SEARCH_DRAFT}))
 async def resume_auxiliary_action(message: Message, state: FSMContext):
     provider = message.text == PROVIDER_ACTION_DRAFT
     closing = message.text == CLOSING_ACTION_DRAFT
     admin_action = message.text == ADMIN_ACTION_DRAFT
     admin_search = message.text == ADMIN_SEARCH_DRAFT
+    admin_lead_search = message.text == ADMIN_LEAD_SEARCH_DRAFT
     admin_access_action = message.text == ADMIN_ACCESS_DRAFT
     kind = "admin_action" if admin_action else ("lead_closing" if closing else ("provider_action" if provider else "support_action"))
     if admin_search:
         kind = "admin_search"
     if admin_access_action:
         kind = "admin_access"
-    if (admin_action or admin_search or admin_access_action) and not await admin_allowed(
-        message.from_user.id, "access" if admin_access_action else ("users" if admin_search else "roles"),
+    if admin_lead_search:
+        kind = "admin_lead_search"
+    if (admin_action or admin_search or admin_access_action or admin_lead_search) and not await admin_allowed(
+        message.from_user.id, "moderate" if admin_lead_search else ("access" if admin_access_action else ("users" if admin_search else "roles")),
     ):
         await message.answer("Нет доступа.")
         return
@@ -466,7 +472,9 @@ async def resume_auxiliary_action(message: Message, state: FSMContext):
         await state.set_data(await draft.get_data())
         await state.set_state(current)
         await draft.clear()
-    if admin_access_action:
+    if admin_lead_search:
+        await admin_ui.resume_lead_search(message,state)
+    elif admin_access_action:
         await admin_ui.resume_access_step(message,state)
     elif admin_search:
         await admin_ui.resume_user_search(message, state)

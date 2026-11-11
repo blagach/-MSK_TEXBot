@@ -908,6 +908,46 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(r["action"]=="export_sent" for r in audit))
         self.assertEqual([r["result"] for r in audit if r["action"]=="export_delivery"],["uncertain"])
 
+    async def test_administrator_searches_exact_lead_and_marks_it_only_after_send(self):
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute("INSERT INTO leads(id,customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                             "VALUES (11,20,'Заказчик','автокран','Москва','завтра','','+79991234567','published','2026-11-11')")
+            await db.commit()
+        admin,state=self.actor(1)
+        await admin_ui.admin_action(self.callback(admin,'admin:lead_find'),self.admins,state)
+        admin.text='№11'
+        await admin_ui.find_lead(admin,state,self.admins)
+        self.assertIn('№11',admin.answer.await_args.args[0])
+        self.assertEqual(admin.answer.await_args.kwargs['reply_markup'].inline_keyboard[-1][0].callback_data,'admin:records')
+        self.assertEqual([r['id'] for r in await admin_reports.administrator_leads(1,'new')],[])
+        admin.text='110'
+        await admin_ui.find_lead(admin,state,self.admins)
+        self.assertIn('не найдена',admin.answer.await_args.args[0])
+        await admin_access.assign_role(1,2,'support','support-no-leads',owner_id=1)
+        staff,other=self.actor(2)
+        staff.text='11'
+        await admin_ui.find_lead(staff,other,self.admins)
+        staff.answer.assert_awaited_once_with('Нет доступа.')
+
+    async def test_administrator_lead_search_survives_restart_without_reopening_card(self):
+        backing=bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        admin,_=self.actor(1)
+        admin.answer.return_value=Record(message_id=500)
+        state=FSMContext(backing,StorageKey(bot_id=99,chat_id=1,user_id=1))
+        await state.set_state(admin_ui.FindLead.query)
+        await state.set_data({'lead_search_id':11})
+        await bot.pause_form(admin,state)
+        fresh=bot.SQLiteDraftStorage(str(self.database))
+        await fresh.init_schema()
+        restored=FSMContext(fresh,state.key)
+        admin.text=bot.ADMIN_LEAD_SEARCH_DRAFT
+        await bot.resume_auxiliary_action(admin,restored)
+        self.assertEqual(await restored.get_state(),admin_ui.FindLead.query.state)
+        self.assertEqual((await restored.get_data())['lead_search_id'],11)
+        self.assertIn('Последний номер: 11',admin.answer.await_args.args[0])
+        self.assertNotIn('Статус:',admin.answer.await_args.args[0])
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)
