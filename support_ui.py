@@ -161,9 +161,9 @@ async def show_ticket(message, ticket_id, user_id, admin, offset=0, origin=""):
         actions.append((("✉️ Написать сообщение", f"follow:{ticket_id}"),))
     if ticket["requester_id"] == user_id:
         if ticket["status"] == "closed":
-            actions.append((("Открыть повторно", f"owner_reopen:{ticket_id}"),))
+            actions.append((("Открыть повторно", f"owner_reopen:{ticket_id}:{ticket['status_version']}"),))
         else:
-            actions.append((("Закрыть обращение", f"owner_close:{ticket_id}"),))
+            actions.append((("Закрыть обращение", f"owner_close:{ticket_id}:{ticket['status_version']}"),))
     if admin and ticket["status"] != "closed":
         if ticket["status"] == "new":
             actions.append((("Взять в работу", f"status:{ticket_id}:in_progress{suffix}"),))
@@ -298,19 +298,22 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         await ticket_list(message, None, status=parts[1], offset=int(parts[2]))
     elif action == "ticket" and len(parts) >= 3 and positive_id(parts[1]) and page_number(parts[2], HISTORY_PAGE) is not None:
         await show_ticket(message, int(parts[1]), user_id, admin, int(parts[2]), ticket_list_origin(parts[3:], admin))
-    elif action in {"owner_close", "owner_reopen", "owner_confirm"} and len(parts) == 2 and positive_id(parts[1]):
+    elif action in {"owner_close", "owner_reopen", "owner_confirm"} and len(parts) == 3 and positive_id(parts[1]) and re.fullmatch(r"\d{1,18}", parts[2]):
         ticket = await store.ticket(int(parts[1]), user_id)
         if ticket is None:
             await message.answer("Обращение недоступно.", reply_markup=keys(BACK))
             return
+        if ticket["status_version"] != int(parts[2]):
+            await message.answer("Статус уже изменён. Откройте обращение снова.", reply_markup=keys(BACK))
+            return
         if action == "owner_close":
             await message.answer(f"Закрыть обращение №{ticket['id']}?", reply_markup=keys(
-                (("Подтвердить закрытие", f"owner_confirm:{ticket['id']}"),),
+                (("Подтвердить закрытие", f"owner_confirm:{ticket['id']}:{ticket['status_version']}"),),
                 (("Вернуться", f"ticket:{ticket['id']}:0"),),
             ))
             return
         target = "closed" if action == "owner_confirm" else "new"
-        changed = await store.requester_status(ticket["id"], user_id, target)
+        changed = await store.requester_status(ticket["id"], user_id, target, int(parts[2]))
         if changed and target == "new":
             await notify_admins(bot, support_admin_ids, support_group_id, ticket["id"], ticket["kind"])
         await message.answer("Статус обновлён." if changed else "Статус уже изменён.")

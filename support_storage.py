@@ -87,7 +87,8 @@ async def create_ticket(requester_id, kind, request_id, text, photo_id):
 async def ticket(ticket_id, requester_id=None):
     async with connection() as db:
         async with db.execute(
-            "SELECT * FROM support_tickets WHERE id=? AND (? IS NULL OR requester_id=?)",
+            """SELECT t.*, COALESCE((SELECT max(e.id) FROM support_status_events e WHERE e.ticket_id=t.id),0) AS status_version
+               FROM support_tickets t WHERE t.id=? AND (? IS NULL OR t.requester_id=?)""",
             (ticket_id, requester_id, requester_id),
         ) as cursor:
             return await cursor.fetchone()
@@ -149,15 +150,16 @@ async def change_status(ticket_id, status, actor_id=None):
         return cursor.rowcount == 1
 
 
-async def requester_status(ticket_id, requester_id, target):
+async def requester_status(ticket_id, requester_id, target, expected_version):
     if target not in {"new", "closed"}:
         raise ValueError("Invalid requester support status")
     async with connection() as db:
         await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute(
             """UPDATE support_tickets SET status=? WHERE id=? AND requester_id=?
-               AND ((?='new' AND status='closed') OR (?='closed' AND status IN ('new','in_progress')))""",
-            (target, ticket_id, requester_id, target, target),
+               AND ((?='new' AND status='closed') OR (?='closed' AND status IN ('new','in_progress')))
+               AND COALESCE((SELECT max(id) FROM support_status_events WHERE ticket_id=?),0)=?""",
+            (target, ticket_id, requester_id, target, target, ticket_id, expected_version),
         )
         if cursor.rowcount:
             await db.execute(

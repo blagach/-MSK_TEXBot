@@ -283,17 +283,20 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await support_storage.add_reply(ticket, 1, "tz7-answer", "Ответ")
         before = [(row["id"], row["text"], row["photo_id"]) for row in await support_storage.history(ticket)]
         stranger, foreign_state = self.actor(21)
-        denied = await self.help_action(stranger, foreign_state, f"owner_confirm:{ticket}")
+        version = (await support_storage.ticket(ticket))["status_version"]
+        await self.help_action(stranger, foreign_state, f"owner_confirm:{ticket}:{version}")
         self.assertEqual((await support_storage.ticket(ticket))["status"], "in_progress")
 
         owner, state = self.actor(20)
-        await self.help_action(owner, state, f"owner_close:{ticket}")
+        await self.help_action(owner, state, f"owner_close:{ticket}:{version}")
         self.assertEqual((await support_storage.ticket(ticket))["status"], "in_progress")
-        await self.help_action(owner, state, f"owner_confirm:{ticket}")
+        await self.help_action(owner, state, f"owner_confirm:{ticket}:{version}")
         self.assertEqual((await support_storage.ticket(ticket))["status"], "closed")
         self.telegram.send_message.reset_mock()
-        await self.help_action(owner, state, f"owner_reopen:{ticket}")
-        await self.help_action(owner, state, f"owner_reopen:{ticket}")
+        closed_version = (await support_storage.ticket(ticket))["status_version"]
+        await self.help_action(owner, state, f"owner_reopen:{ticket}:{closed_version}")
+        await self.help_action(owner, state, f"owner_reopen:{ticket}:{closed_version}")
+        await self.help_action(owner, state, f"owner_confirm:{ticket}:{version}")
         self.assertEqual((await support_storage.ticket(ticket))["status"], "new")
         self.assertEqual(self.telegram.send_message.await_count, len(self.admins))
         self.assertEqual(before, [(row["id"], row["text"], row["photo_id"])
@@ -303,6 +306,18 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT actor_id,status FROM support_status_events WHERE ticket_id=? ORDER BY id", (ticket,),
             )).fetchall()
         self.assertEqual(events, [(1, "in_progress"), (20, "closed"), (20, "new")])
+
+    async def test_requester_status_race_records_only_one_event(self):
+        ticket, _ = await support_storage.create_ticket(20, "help", "tz7-race", "Вопрос", None)
+        version = (await support_storage.ticket(ticket))["status_version"]
+        results = await asyncio.gather(*(
+            support_storage.requester_status(ticket, 20, "closed", version) for _ in range(2)
+        ))
+        self.assertEqual(sorted(results), [False, True])
+        current = await support_storage.ticket(ticket)
+        self.assertFalse(await support_storage.requester_status(ticket, 21, "new", current["status_version"]))
+        self.assertTrue(await support_storage.requester_status(ticket, 20, "new", current["status_version"]))
+        self.assertFalse(await support_storage.requester_status(ticket, 20, "closed", version))
 
     async def test_delivery_error_and_legacy_history_are_persisted(self):
         ticket_id, _ = await support_storage.create_ticket(20, "bug", "first", "Question", None)
