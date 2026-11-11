@@ -659,6 +659,62 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await state.get_state(), support_ui.Support.reply.state)
         self.assertEqual(len(await support_storage.history(ticket)), len(before))
 
+    async def test_user_search_uses_shared_excel_contact_rules_and_literal_unicode_search(self):
+        async with aiosqlite.connect(self.database) as db:
+            await db.execute("INSERT INTO provider_profiles(telegram_id,display_name,phone,consent_at,updated_at) "
+                             "VALUES (42,'ООО Ёлка','8 (999) 123-45-67','2026-11-11','2026-11-11')")
+            await db.execute("INSERT INTO leads(customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                             "VALUES (42,'Старое имя','автокран','Москва','завтра','','+79991234567','published','2026-11-11')")
+            await db.execute("INSERT INTO lead_work_details(lead_id,customer_username) VALUES (1,'test_company')")
+            await db.commit()
+        for query in ("елка", "42", "+79991234567", "8 (999) 123-45-67", "@TEST_COMPANY"):
+            self.assertEqual([r["id"] for r in await admin_reports.user_page(query)], [42])
+        self.assertEqual(await admin_reports.user_page("%' OR 1=1 --"), [])
+        self.assertEqual(await admin_reports.user_page("%"), [])
+        profile = await admin_reports.user_profile(42)
+        self.assertEqual((profile["leads"], profile["offers"], profile["customer"], profile["performer"]), (1,0,1,1))
+        self.assertEqual(profile["phone"], "+79991234567")
+        self.assertIsNone(await admin_reports.user_profile(43))
+
+    async def test_user_search_survives_sqlite_restart_and_retired_pages_do_not_apply(self):
+        from draft_storage import SQLiteDraftStorage
+        backing = SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        owner, _ = self.actor(1)
+        owner.answer.return_value = Record(message_id=500)
+        state = FSMContext(backing, StorageKey(bot_id=99, chat_id=1, user_id=1))
+        await state.set_state(admin_ui.FindUser.query)
+        owner.text = "Нет такого имени"
+        await admin_ui.find_user(owner, state, self.admins)
+        old = (await state.get_data())["user_nonce"]
+        await bot.pause_form(owner, state)
+        restarted = SQLiteDraftStorage(str(self.database))
+        await restarted.init_schema()
+        restored = FSMContext(restarted, state.key)
+        owner.text = bot.ADMIN_SEARCH_DRAFT
+        await bot.resume_auxiliary_action(owner, restored)
+        data = await restored.get_data()
+        self.assertEqual(data["user_query"], "Нет такого имени")
+        self.assertNotEqual(data["user_nonce"], old)
+        owner.message_id = 500
+        await admin_ui.admin_action(self.callback(owner, f"admin:people:42:{old}"), self.admins, restored)
+        self.assertIn("поиск устарел", owner.answer.await_args.args[0])
+
+    async def test_user_profile_and_search_deny_support_only_role_and_keep_existing_form(self):
+        await admin_access.assign_role(1, 2, "support", "support-only-search", owner_id=1)
+        staff, state = self.actor(2)
+        for action in ("admin:find", "admin:user:42", "admin:users_filter:all"):
+            denied = self.callback(staff, action)
+            await admin_ui.admin_action(denied, self.admins, state)
+            denied.answer.assert_awaited_once_with("Нет доступа.", show_alert=True)
+        staff.answer.assert_not_awaited()
+        owner, other_state = self.actor(1)
+        await other_state.set_state(bot.OfferForm.price)
+        await other_state.set_data({"lead_id": 11})
+        await admin_ui.admin_action(self.callback(owner,"admin:find"), self.admins, other_state)
+        self.assertEqual((await other_state.get_data())["lead_id"],11)
+        self.assertEqual(await other_state.get_state(),bot.OfferForm.price.state)
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)

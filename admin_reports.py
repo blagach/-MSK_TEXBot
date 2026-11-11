@@ -29,6 +29,27 @@ WITH customers AS (
     UNION SELECT telegram_id FROM bot_visitors
 )
 """
+USER_DETAILS = """
+            SELECT u.id, COALESCE(NULLIF(TRIM(profile.display_name), ''), NULLIF(TRIM(legacy.name), ''),
+                   (SELECT customer_name FROM leads WHERE customer_id=u.id AND TRIM(customer_name)!='' ORDER BY id DESC LIMIT 1),
+                   (SELECT provider_name FROM offers WHERE provider_id=u.id AND TRIM(provider_name)!='' ORDER BY id DESC LIMIT 1)) AS display_name,
+                   COALESCE(report_phone(profile.phone), report_phone(legacy.phone),
+                            (SELECT report_phone(l.phone) FROM leads l WHERE l.customer_id=u.id
+                             AND report_phone(l.phone) IS NOT NULL ORDER BY l.id DESC LIMIT 1),
+                            (SELECT report_phone(o.phone) FROM offers o WHERE o.provider_id=u.id
+                             AND report_phone(o.phone) IS NOT NULL ORDER BY o.id DESC LIMIT 1)) AS phone,
+                   COALESCE((SELECT report_username(d.customer_username) FROM lead_work_details d JOIN leads l
+                             ON l.id=d.lead_id WHERE l.customer_id=u.id AND report_username(d.customer_username) IS NOT NULL
+                             ORDER BY l.id DESC LIMIT 1),
+                            (SELECT report_username(o.username) FROM offers o WHERE o.provider_id=u.id
+                             AND report_username(o.username) IS NOT NULL ORDER BY o.id DESC LIMIT 1)) AS username,
+                   c.first_seen AS customer_since, r.first_seen AS registered_at,
+                   c.id IS NOT NULL AS customer, p.id IS NOT NULL AS performer
+            FROM users u LEFT JOIN customers c ON c.id=u.id LEFT JOIN performers p ON p.id=u.id
+            LEFT JOIN registrations r ON r.id=u.id LEFT JOIN provider_profiles profile ON profile.telegram_id=u.id
+            LEFT JOIN providers legacy ON legacy.telegram_id=u.id
+        """
+
 EQUIPMENT = """
 SELECT * FROM (
     SELECT CAST(e.id AS TEXT) AS equipment_id, e.provider_id, p.display_name AS owner,
@@ -179,26 +200,7 @@ async def export_xlsx():
     async with read_db() as db:
         await db.create_function("report_phone", 1, normalized_phone, deterministic=True)
         await db.create_function("report_username", 1, profile_name, deterministic=True)
-        users = await rows(db, USERS + """
-            SELECT u.id, COALESCE(NULLIF(TRIM(profile.display_name), ''), NULLIF(TRIM(legacy.name), ''),
-                   (SELECT customer_name FROM leads WHERE customer_id=u.id AND TRIM(customer_name)!='' ORDER BY id DESC LIMIT 1),
-                   (SELECT provider_name FROM offers WHERE provider_id=u.id AND TRIM(provider_name)!='' ORDER BY id DESC LIMIT 1)) AS display_name,
-                   COALESCE(report_phone(profile.phone), report_phone(legacy.phone),
-                            (SELECT report_phone(l.phone) FROM leads l WHERE l.customer_id=u.id
-                             AND report_phone(l.phone) IS NOT NULL ORDER BY l.id DESC LIMIT 1),
-                            (SELECT report_phone(o.phone) FROM offers o WHERE o.provider_id=u.id
-                             AND report_phone(o.phone) IS NOT NULL ORDER BY o.id DESC LIMIT 1)) AS phone,
-                   COALESCE((SELECT report_username(d.customer_username) FROM lead_work_details d JOIN leads l
-                             ON l.id=d.lead_id WHERE l.customer_id=u.id AND report_username(d.customer_username) IS NOT NULL
-                             ORDER BY l.id DESC LIMIT 1),
-                            (SELECT report_username(o.username) FROM offers o WHERE o.provider_id=u.id
-                             AND report_username(o.username) IS NOT NULL ORDER BY o.id DESC LIMIT 1)) AS username,
-                   c.first_seen AS customer_since, r.first_seen AS registered_at,
-                   c.id IS NOT NULL AS customer, p.id IS NOT NULL AS performer
-            FROM users u LEFT JOIN customers c ON c.id=u.id LEFT JOIN performers p ON p.id=u.id
-            LEFT JOIN registrations r ON r.id=u.id LEFT JOIN provider_profiles profile ON profile.telegram_id=u.id
-            LEFT JOIN providers legacy ON legacy.telegram_id=u.id ORDER BY u.id
-        """)
+        users = await rows(db, USERS + USER_DETAILS + " ORDER BY u.id")
         equipment = await rows(db, EQUIPMENT)
         leads = await rows(db, """
             SELECT l.*, r.region, r.area, d.equipment_name, d.map_link, d.schedule, p.method,
@@ -300,3 +302,41 @@ def profile_name(username):
 def profile_url(username):
     handle = profile_name(username)
     return f"https://t.me/{handle}" if handle else None
+
+
+def folded(value):
+    return str(value or "").strip().casefold().replace("ё", "е")
+
+
+async def user_page(query="", kind="all", after=0, limit=10):
+    if kind not in {"all", "customers", "providers"}:
+        raise ValueError("Unknown user filter")
+    query = query.strip()
+    if len(query) > 100:
+        raise ValueError("Search is too long")
+    normalized = normalized_phone(query.translate(str.maketrans("", "", " ()-\u00a0\u202f"))) or query
+    async with read_db() as db:
+        await db.create_function("report_phone", 1, normalized_phone, deterministic=True)
+        await db.create_function("report_username", 1, profile_name, deterministic=True)
+        await db.create_function("report_fold", 1, folded, deterministic=True)
+        return await rows(db, USERS + ", details AS (" + USER_DETAILS + ")" + """
+            SELECT * FROM details WHERE id>? AND
+                (?='all' OR (?='customers' AND customer=1) OR (?='providers' AND performer=1)) AND
+                (?='' OR CAST(id AS TEXT)=? OR instr(report_fold(display_name),report_fold(?))>0
+                      OR instr(report_fold(username),report_fold(?))>0 OR phone=?)
+            ORDER BY id LIMIT ?
+        """, (after, kind, kind, kind, query, query, query, (query[1:] if query.startswith("@") and len(query)>1 else query), normalized, min(max(limit,1),21)))
+
+
+async def user_profile(user_id):
+    people = await user_page(str(user_id), after=user_id-1, limit=1)
+    if not people or people[0]["id"] != user_id:
+        return None
+    async with read_db() as db:
+        counts = (await rows(db, """SELECT
+            (SELECT count(*) FROM leads WHERE customer_id=?) AS leads,
+            (SELECT count(*) FROM offers WHERE provider_id=?) AS offers,
+            (SELECT count(*) FROM provider_equipment WHERE provider_id=?) AS equipment,
+            (SELECT count(*) FROM support_tickets WHERE requester_id=?) AS tickets
+        """, (user_id,)*4))[0]
+    return {**dict(people[0]), **dict(counts)}

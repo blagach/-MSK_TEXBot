@@ -27,6 +27,11 @@ def keyboard(*rows):
 HOME = (("⬅️ В админ-панель", "admin:home"),)
 
 
+class FindUser(StatesGroup):
+    query = State()
+    results = State()
+
+
 class ManageAdmins(StatesGroup):
     target = State()
     confirm = State()
@@ -93,6 +98,46 @@ def audit_line(row):
     return text
 
 
+async def show_people(message, state, *, kind="all", after=0, query="", nonce=None):
+    nonce = nonce or uuid4().hex[:16]
+    await state.set_state(FindUser.results)
+    await state.update_data(user_query=query, user_kind=kind, user_nonce=nonce, user_after=after)
+    page = await reports.user_page(query, kind, after, 11)
+    buttons = [((f"{row['id']} · {(row['display_name'] or 'Без имени')[:35]}", f"admin:user:{row['id']}"),)
+               for row in page[:10]]
+    if len(page) > 10:
+        buttons.append((("Далее", f"admin:people:{page[9]['id']}:{nonce}"),))
+    buttons.extend([(("🔎 Новый поиск", "admin:find"),), (("К пользователям", "admin:users"),), HOME])
+    sent = await message.answer("Пользователи" + (f" · поиск: {query}" if query else "") +
+                               ("\nНичего не найдено." if not page else ""), reply_markup=keyboard(*buttons))
+    await state.update_data(form_keyboard_id=sent.message_id)
+
+
+async def resume_user_search(message, state):
+    if await state.get_state() == FindUser.query.state:
+        sent = await message.answer("Введите имя, Telegram ID, username или полный телефон.", reply_markup=keyboard(HOME))
+        await state.update_data(form_keyboard_id=sent.message_id)
+    else:
+        data = await state.get_data()
+        await show_people(message, state, kind=data.get("user_kind", "all"),
+                          query=data.get("user_query", ""), after=data.get("user_after", 0))
+
+
+@router.message(FindUser.query)
+async def find_user(message: Message, state: FSMContext, support_admin_ids, service_owner_id=None):
+    if message.chat.id != message.from_user.id or not await admin_access.allowed(
+        message.from_user.id, "users", support_admin_ids, service_owner_id,
+    ):
+        await message.answer("Нет доступа.")
+        return
+    query = (message.text or "").strip()
+    if not 1 <= len(query) <= 100:
+        await message.answer("Введите от 1 до 100 символов для поиска.")
+        return
+    await admin_access.record(message.from_user.id, "user_search")
+    await show_people(message, state, query=query)
+
+
 async def resume_admin_step(message, state):
     data = await state.get_data()
     if await state.get_state() == ManageAdmins.target.state:
@@ -146,6 +191,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     action = callback.data.removeprefix("admin:")
     permission = {"home": "panel", "users": "users", "records": "moderate", "stats": "stats",
                   "export": "export", "settings": "roles", "audit": "audit"}.get(action)
+    if action.startswith(("people:", "user:", "users_filter:")) or action == "find":
+        permission = "users"
     if action.startswith("equipment:"):
         permission = "catalog"
     if re.fullmatch(r"audit:[1-9][0-9]{0,18}", action):
@@ -163,7 +210,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     await callback.answer()
     await admin_access.record(callback.from_user.id, "admin_view", details={"section": permission})
     if action == "home":
-        if state is not None and await state.get_state() in ManageAdmins.__all_states_names__:
+        if state is not None and await state.get_state() in (*ManageAdmins.__all_states_names__, *FindUser.__all_states_names__):
             from bot import pause_form
             await pause_form(message, state)
         await menu(message, callback.from_user.id, support_admin_ids, service_owner_id)
@@ -256,7 +303,47 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             f"Две роли · {data['both']}\n\n"
             "Общий итог включает зафиксированные посещения. Старые посещения без действий могли не сохраниться.\n"
             "Заказчики учитываются по заявкам, исполнители по регистрации или отклику.",
-            reply_markup=keyboard(HOME),
+            reply_markup=keyboard((("🔎 Поиск", "admin:find"), ("Все", "admin:users_filter:all")),
+                                  (("Заказчики", "admin:users_filter:customers"), ("Исполнители", "admin:users_filter:providers")), HOME),
+        )
+    elif action == "find" and state is not None:
+        if await state.get_state() not in (None, *FindUser.__all_states_names__):
+            await message.answer("Сначала завершите текущее действие или перейдите в главное меню.")
+            return
+        await state.set_state(FindUser.query)
+        await resume_user_search(message, state)
+    elif action.startswith("users_filter:") and state is not None:
+        kind = action.split(":", 1)[1]
+        if kind not in {"all", "customers", "providers"}:
+            return
+        if await state.get_state() not in (None, *FindUser.__all_states_names__):
+            await message.answer("Сначала завершите текущее действие или перейдите в главное меню.")
+            return
+        await show_people(message, state, kind=kind)
+    elif action.startswith("people:") and state is not None:
+        parts = action.split(":")
+        data = await state.get_data()
+        if (len(parts) != 3 or not re.fullmatch(r"[1-9][0-9]{0,17}", parts[1])
+                or await state.get_state() != FindUser.results.state or parts[2] != data.get("user_nonce")
+                or message.message_id != data.get("form_keyboard_id")):
+            await message.answer("Этот поиск устарел. Откройте список заново.")
+            return
+        await show_people(message, state, kind=data["user_kind"], query=data["user_query"],
+                          after=int(parts[1]), nonce=data["user_nonce"])
+    elif re.fullmatch(r"user:[1-9][0-9]{0,17}", action):
+        profile = await reports.user_profile(int(action[5:]))
+        if profile is None:
+            await message.answer("Пользователь не найден.", reply_markup=keyboard(HOME))
+            return
+        await admin_access.record(callback.from_user.id, "user_profile", target_id=profile["id"])
+        roles = ", ".join(label for key, label in (("customer", "Заказчик"), ("performer", "Исполнитель")) if profile[key])
+        await message.answer(
+            f"Пользователь ID {profile['id']}\nИмя: {(profile['display_name'] or 'Не указано')[:300]}\n"
+            f"Роли: {roles or 'Посетитель'}\nТелефон: {profile['phone'] or 'Не указан'}\n"
+            f"Telegram: {reports.profile_url(profile['username']) or 'Не указан'}\n"
+            f"Заявки: {profile['leads']} · Отклики: {profile['offers']}\n"
+            f"Техника: {profile['equipment']} · Обращения: {profile['tickets']}",
+            reply_markup=keyboard((("К пользователям", "admin:users"),), HOME),
         )
     elif action == "records":
         leads, offers, delivery, results = await reports.lead_and_offer_counts()
