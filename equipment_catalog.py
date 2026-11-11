@@ -18,6 +18,13 @@ GROUPS = (
                          "доставка материалов", "вывоз снега")),
     ("Другая техника", (OTHER,)),
 )
+GROUP_ICONS = ("🚜", "🚜", "🏗", "🚛", "🛣", "🧹", "🧱", "🛠", "🚚", "⚙️")
+DISPLAY_LABELS = {}
+for (group, kinds), icon in zip(GROUPS, GROUP_ICONS, strict=True):
+    DISPLAY_LABELS[group] = f"{icon} {group}"
+    for kind in kinds:
+        DISPLAY_LABELS[kind] = f"{icon} {kind[0].upper() + kind[1:]}"
+
 LEGACY_ALIASES = {"каток": "дорожный каток"}
 TYPES = frozenset(kind for _, kinds in GROUPS for kind in kinds) | LEGACY_ALIASES.keys()
 
@@ -29,7 +36,7 @@ def button_rows(labels, button):
         if len(label) > 21 and pair:
             rows.append(pair)
             pair = []
-        pair.append(button(index, label[0].upper() + label[1:]))
+        pair.append(button(index, DISPLAY_LABELS.get(label, label[0].upper() + label[1:])))
         if len(pair) == 2 or len(label) > 21:
             rows.append(pair)
             pair = []
