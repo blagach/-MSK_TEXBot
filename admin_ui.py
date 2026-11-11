@@ -64,6 +64,11 @@ async def retire_panel(message):
 
 async def menu(message, user_id=None, admin_ids=(), owner_id=None):
     user_id = message.chat.id if user_id is None else user_id
+    # Reject unauthorized callers before reading private operational counters.
+    if not any([await admin_access.allowed(user_id,key,admin_ids,owner_id)
+                for key in ("users","catalog","moderate","stats","support","export","roles","audit","finance","marketing")]):
+        await message.answer("Нет доступа.")
+        return
     counts=await reports.dashboard_totals(user_id)
     permissions = {key: await admin_access.allowed(user_id,key,admin_ids,owner_id)
                    for key in ("users","catalog","moderate","stats","support","export","roles","audit","finance","marketing")}

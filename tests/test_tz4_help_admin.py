@@ -1122,6 +1122,15 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             await admin_ui.menu(staff,2,self.admins,1)
         staff.answer.assert_awaited_once_with('Нет доступа.')
 
+    async def test_dashboard_rejects_unknown_and_revoked_users_before_reading_counters(self):
+        await admin_access.assign_role(1,2,'none','deny-before-dashboard-read',owner_id=1)
+        for user_id in (20,2):
+            message,_=self.actor(user_id)
+            with patch.object(admin_reports,'dashboard_totals',new_callable=AsyncMock) as read:
+                await admin_ui.menu(message,user_id,self.admins,1)
+                read.assert_not_awaited()
+                message.answer.assert_awaited_once_with('Нет доступа.')
+
     async def test_admin_access_checked_on_every_export(self):
         for user, chat_type in ((20, "private"), (1, "supergroup")):
             message, _ = self.actor(user, chat_type=chat_type)
