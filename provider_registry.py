@@ -212,7 +212,6 @@ def category_match(column, target):
 def alert_match(category, region, area):
     equipment = equipment_match(category, region, area)
     preferred = category_match("kind.value", category)
-    existing = category_match("e.category", category)
     return f"""(
         EXISTS (
             SELECT 1 FROM provider_alert_preferences a
@@ -220,12 +219,7 @@ def alert_match(category, region, area):
               AND a.revision=(SELECT max(revision) FROM provider_alert_preferences WHERE provider_id=p.telegram_id)
               AND EXISTS(SELECT 1 FROM json_each(a.categories_json) kind WHERE {preferred})
               AND EXISTS(SELECT 1 FROM json_each(a.regions_json) zone WHERE zone.value={region})
-              AND (
-                  NOT EXISTS(SELECT 1 FROM provider_equipment e
-                             WHERE e.provider_id=p.telegram_id AND {existing})
-                  OR EXISTS(SELECT 1 FROM provider_equipment e
-                            WHERE e.provider_id=p.telegram_id AND {existing} AND e.active=1)
-              )
+
         )
         OR (
             NOT EXISTS(SELECT 1 FROM provider_alert_preferences WHERE provider_id=p.telegram_id)

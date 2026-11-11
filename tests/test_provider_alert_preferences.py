@@ -34,10 +34,13 @@ class PreferenceTests(unittest.IsolatedAsyncioTestCase):
         await registry.set_blocked(101, True, admin_id=1, admin_ids={1}, db_path=self.path)
         self.assertEqual(await self.match(), [])
 
-    async def test_legacy_filter_stays_until_explicit_save_and_paused_cards_still_block(self):
+    async def test_legacy_pause_blocks_only_until_independent_subscription_is_saved(self):
         machine = await registry.add_equipment(101, "автокран", "Кран", "Москва", "СЗАО", self.path)
         self.assertEqual(await self.match(area="СЗАО"), [101])
         self.assertEqual(await self.match(), [])
+        await registry.update_equipment(101, machine, category="автокран", description="Кран",
+                                        region="Москва", area="СЗАО", active=False, db_path=self.path)
+        self.assertEqual(await self.match(area="СЗАО"), [])
         pref = await registry.alert_preferences(101, self.path)
         self.assertEqual(pref, {"revision": 0, "categories": ["автокран"], "regions": ["Москва"]})
         with sqlite3.connect(self.path) as db:
@@ -49,7 +52,7 @@ class PreferenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute("SELECT * FROM provider_equipment").fetchall(), before)
         await registry.update_equipment(101, machine, category="автокран", description="Кран",
                                         region="Москва", area="СЗАО", active=False, db_path=self.path)
-        self.assertEqual(await self.match(region="Московская область"), [])
+        self.assertEqual(await self.match(region="Московская область"), [101])
         self.assertEqual(await self.match("самосвал", "Московская область"), [101])
         await registry.update_equipment(101, machine, category="автокран", description="Кран",
                                         region="Москва", area="СЗАО", active=True, db_path=self.path)

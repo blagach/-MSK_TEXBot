@@ -209,7 +209,7 @@ async def alert_preference_action(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         await callback.message.answer(
             "Настройки сохранены. Подходящие заявки будут приходить отдельными сообщениями. "
-            "Уведомления зависят от сохранённого переключателя. Приостановленные карточки учитываются.",
+            "Уведомления зависят от сохранённого переключателя. Выбор видов не зависит от карточек отдельных машин.",
             reply_markup=await executor_keyboard(callback.from_user.id, state),
         )
         return
