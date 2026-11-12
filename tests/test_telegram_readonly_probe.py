@@ -20,12 +20,26 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_only_approved_pair_is_queried_and_output_has_no_identifiers(self):
         env,client,factory=self.fixture()
         result=await probe(env,{101,102},'synthetic-service','example_test_bot',factory)
-        self.assertEqual(result['result'],'ok')
+        self.assertEqual(result['result'],'STOP')
+        self.assertTrue(result['pair_channel_checks'])
+        self.assertEqual(result['reason'],'APPROVED_SET_MISMATCH')
         self.assertTrue(result['configured_extra_present'])
         self.assertEqual([x.args[1] for x in client.get_chat_member.await_args_list],[900,101,102])
         self.assertEqual(len(result['checks']),7)
         for secret in ('synthetic-secret','-100123','101','102','103','example_test_bot'):
             self.assertNotIn(secret,str(result))
+    async def test_exact_pair_configuration_is_required_for_overall_success(self):
+        env,client,factory=self.fixture()
+        env['TESTER_IDS']='102,101'
+        result=await probe(env,{101,102},'synthetic-service','example_test_bot',factory)
+        self.assertEqual(result['result'],'ok')
+        self.assertTrue(result['configuration_matches_approved'])
+        self.assertFalse(result['configured_extra_present'])
+        env['TESTER_IDS']='101'
+        result=await probe(env,{101,102},'synthetic-service','example_test_bot',factory)
+        self.assertEqual(result['result'],'STOP')
+        self.assertEqual(result['reason'],'APPROVED_SET_MISMATCH')
+
     async def test_api_failure_is_sanitized_and_no_third_actor_is_contacted(self):
         env,client,factory=self.fixture()
         client.get_chat_member.side_effect=TelegramBadRequest(GetChatMember(chat_id=-100123,user_id=101),

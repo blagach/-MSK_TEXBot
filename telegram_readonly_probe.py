@@ -23,6 +23,7 @@ async def probe(env, approved, service_id, bot_username, factory=None):
     configured = frozenset(int(x.strip()) for x in env.get('TESTER_IDS', '').split(',') if x.strip())
     report = {'result': 'STOP', 'checks': [],
               'configured_extra_present': bool(configured - approved),
+              'configuration_matches_approved': configured == approved,
               'worker_started': False, 'polling_started': False, 'messages_sent': 0}
     async def read(api, actor, call):
         try:
@@ -66,8 +67,12 @@ async def probe(env, approved, service_id, bot_username, factory=None):
         actual_count = await read('getChatMemberCount', 'channel', lambda: client.get_chat_member_count(channel))
         valid = valid and actual_count == expected_count
         report['pair_channel_checks'] = bool(valid)
-        if valid:
+        if valid and configured == approved:
             report['result'] = 'ok'
+        elif valid:
+            report['reason'] = 'APPROVED_SET_MISMATCH'
+        else:
+            report['reason'] = 'PAIR_CHECK_FAILED'
     return report
 
 
