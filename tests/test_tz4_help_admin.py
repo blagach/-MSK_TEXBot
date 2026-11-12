@@ -157,6 +157,26 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             async with db.execute("SELECT (SELECT COUNT(*) FROM leads), (SELECT COUNT(*) FROM offers), (SELECT COUNT(*) FROM support_tickets)") as cursor:
                 self.assertEqual(await cursor.fetchone(), (0, 0, 0))
 
+    async def test_provider_training_uses_contact_button_without_offer_or_contact_write(self):
+        message, state = self.actor(20)
+        await self.help_action(message, state, "train:provider:0")
+        await self.help_action(message, state, "try:provider:0:1")
+        await self.help_action(message, state, "try:provider:1:1")
+        rows = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual(rows[0][0].text, "📞 Получить контакт заказчика")
+        self.assertEqual(rows[0][0].callback_data, "help:try:provider:2:1")
+        self.assertIn("Длинный отклик не требуется", message.answer.await_args.args[0])
+        await self.help_action(message, state, "try:provider:2:1")
+        rows = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual(rows[0][0].text, "Завершить тренировку")
+        await self.help_action(message, state, "try:provider:3:1")
+        self.assertIn("Тренировка завершена", message.answer.await_args.args[0])
+        async with aiosqlite.connect(self.database) as db:
+            for table in ("leads", "offers", "customer_contact_access", "support_tickets"):
+                row = await (await db.execute(f"SELECT COUNT(*) FROM {table}")).fetchone()
+                self.assertEqual(row[0], 0, table)
+        self.telegram.send_message.assert_not_awaited()
+
     async def test_support_ticket_ownership_admin_reply_and_status(self):
         customer, customer_state = self.actor(20)
         await self.help_action(customer, customer_state, "new:bug")

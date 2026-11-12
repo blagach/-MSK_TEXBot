@@ -83,3 +83,41 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
         prompt=self.message.answer.await_args.args[0]
         self.assertIn('Точка на карте',prompt)
         self.assertNotIn('HTTPS',prompt)
+    async def test_back_from_each_standard_lead_step_preserves_all_fields(self):
+        steps=(bot.LeadForm.equipment_type,bot.LeadForm.region,bot.LeadForm.area,
+               bot.LeadForm.place,bot.LeadForm.map_link,bot.LeadForm.date,
+               bot.LeadForm.schedule,bot.LeadForm.details,bot.LeadForm.attachments,
+               bot.LeadForm.payment,bot.LeadForm.phone,bot.LeadForm.review)
+        previous=(bot.LeadForm.equipment,bot.LeadForm.equipment_type,bot.LeadForm.region,
+                  bot.LeadForm.area,bot.LeadForm.place,bot.LeadForm.map_link,
+                  bot.LeadForm.date,bot.LeadForm.schedule,bot.LeadForm.details,
+                  bot.LeadForm.attachments,bot.LeadForm.payment,bot.LeadForm.phone)
+        for step,target in zip(steps,previous,strict=True):
+            with self.subTest(step=step.state):
+                original={**self.original,'equipment_group':0}
+                await self.state.set_state(step)
+                await self.state.set_data(original)
+                await bot.form_navigation(self.callback('form_nav:back'),self.state)
+                self.assertEqual(await self.state.get_state(),target.state)
+                self.assertEqual(await self.state.get_data(),original)
+
+    async def test_back_to_custom_equipment_and_legacy_category_preserves_values(self):
+        for extra,target in (({'equipment_name':'Канатная установка'},bot.LeadForm.equipment_other),
+                             ({},bot.LeadForm.equipment)):
+            with self.subTest(target=target.state):
+                original={**self.original,**extra}
+                await self.state.set_state(bot.LeadForm.region)
+                await self.state.set_data(original)
+                await bot.form_navigation(self.callback('form_nav:back'),self.state)
+                self.assertEqual(await self.state.get_state(),target.state)
+                self.assertEqual(await self.state.get_data(),original)
+
+    async def test_back_from_every_edit_step_returns_to_review_without_changes(self):
+        for step in bot.LEAD_EDIT_FIELDS:
+            with self.subTest(step=step.state):
+                original={**self.original,'lead_editing':step.state}
+                await self.state.set_state(step)
+                await self.state.set_data(original)
+                await bot.form_navigation(self.callback('form_nav:back'),self.state)
+                self.assertEqual(await self.state.get_state(),bot.LeadForm.review.state)
+                self.assertEqual(await self.state.get_data(),{**original,'lead_editing':None})
