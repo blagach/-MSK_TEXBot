@@ -43,7 +43,7 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
     async def make_lead(self, kind="КДМ", region="Московская область", area="Химки"):
         return (await bot.save_lead_from_draft(self.customer, "+79990000001", {
             "equipment": kind, "region": region, "area": area,
-            "place": "Учебный адрес", "work_date": "15 ноября 09:00", "schedule": "2 смены",
+            "place": "Учебный адрес", "work_date": "завтра 09:00", "schedule": "2 смены",
             "map_link": "https://example.test/map", "payment_method": bot.payment_preferences.VAT,
             "details": "Площадка, телефон 8 (999) 123-45-67 #Контакт",
         }))[0]
@@ -251,3 +251,20 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
         sheet = load_workbook(BytesIO(await admin_reports.export_xlsx()))["Заявки"]
         header, row = list(sheet.values)
         self.assertEqual(row[header.index("Допоборудование")], "Вилы, Особое")
+
+    async def test_expired_submission_has_no_rows_and_keeps_input(self):
+        data={'draft_id':'expired-date','work_date':'01.01.2000 09:00','place':'Сохранённый адрес'}
+        before=dict(data)
+        with self.assertRaises(bot.ExpiredLeadDate):
+            await bot.save_lead_from_draft(self.customer,'+79990000001',data)
+        self.assertEqual(data,before)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM leads').fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT count(*) FROM lead_draft_submissions').fetchone()[0],0)
+
+    async def test_existing_submission_stays_idempotent_after_date_expires(self):
+        lead_id=await self.make_lead()
+        with sqlite3.connect(self.path) as db:
+            db.execute('INSERT INTO lead_draft_submissions VALUES (?,?)',('saved-before-expiry',lead_id))
+        result=await bot.save_lead_from_draft(self.customer,'+79990000001',{'draft_id':'saved-before-expiry','work_date':'01.01.2000 09:00'})
+        self.assertEqual(result,(lead_id,False))

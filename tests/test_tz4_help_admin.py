@@ -141,8 +141,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         message, state = self.actor(20)
         for role in ("customer", "provider"):
             await self.help_action(message, state, f"guide:{role}:0")
-            self.assertIn("1/6", message.answer.await_args.args[0])
-            await self.help_action(message, state, f"guide:{role}:5")
+            self.assertIn(f"1/{len(support_ui.GUIDES[role])}", message.answer.await_args.args[0])
+            await self.help_action(message, state, f"guide:{role}:{len(support_ui.GUIDES[role])-1}")
             buttons = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
             self.assertIn("Завершить инструкцию", [row[0].text for row in buttons])
             for step in range(4):

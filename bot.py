@@ -1,3 +1,4 @@
+import customer_contacts
 import work_datetime
 import asyncio
 import logging
@@ -210,7 +211,7 @@ async def admin_recipients(permission):
 
 def respond_button(lead_id: int) -> InlineKeyboardButton:
     return InlineKeyboardButton(
-        text="🚜 Откликнуться", url=f"https://t.me/{settings.bot_username}?start=lead_{lead_id}",
+        text="📞 Получить контакт заказчика", url=f"https://t.me/{settings.bot_username}?start=contact_{lead_id}",
     )
 
 
@@ -250,6 +251,7 @@ async def init_db() -> None:
     await payment_preferences.init_schema(storage.DB_PATH)
     await notification_reservations.init_schema(storage.DB_PATH)
     await support_storage.init_schema()
+    await customer_contacts.init_schema(storage.DB_PATH)
 
 
 PUBLIC_PHONE = re.compile(r"(?<![0-9])(?:\+7|[78])(?:[ ()-]*[0-9]){10}(?![0-9])")
@@ -720,6 +722,17 @@ async def cancel(message: Message, state: FSMContext) -> None:
 
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
+    contact_id = storage.parse_id(command.args, "contact_")
+    if contact_id is not None:
+        if message.chat.type != "private":
+            return
+        try:
+            phone = await customer_contacts.open_contact(storage.DB_PATH, message.from_user.id, contact_id)
+        except PermissionError as exc:
+            await message.answer(str(exc))
+            return
+        await message.answer(f"Контакт заказчика заявки №{contact_id}: {phone}")
+        return
     lead_id = storage.parse_id(command.args, "lead_")
     await open_offer(message, state, lead_id, message.from_user.id)
 
@@ -1299,6 +1312,10 @@ async def lead_payment(message: Message, state: FSMContext) -> None:
     await apply_lead_choice(message, state, LeadForm.payment, message.text)
 
 
+class ExpiredLeadDate(ValueError):
+    pass
+
+
 async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[int, bool]:
     draft_id = data.get("draft_id")
     async with aiosqlite.connect(storage.DB_PATH) as db:
@@ -1310,6 +1327,10 @@ async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[
                 return previous[0], False
         if not await user_access.allowed_in(db,customer.id,"requests"):
             raise user_access.AccessDenied("Создание заявок ограничено")
+        try:
+            work_datetime.parse_work_datetime(data.get("work_date", ""))
+        except (ValueError, AttributeError):
+            raise ExpiredLeadDate("Укажите будущую дату и время по Москве. Черновик сохранён.")
         cursor = await db.execute(
             """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1391,6 +1412,10 @@ async def submit_lead(message, customer, state, bot, data):
         lead_id, created = await save_lead_from_draft(customer, data["phone"], data)
     except user_access.AccessDenied:
         await message.answer("Создание заявок ограничено. Черновик сохранён; обратитесь в поддержку.")
+        return
+    except ExpiredLeadDate as exc:
+        await message.answer(str(exc))
+        await show_lead_step(message, state, LeadForm.date, lead_editing=LeadForm.date.state)
         return
     if not created:
         await clear_form_keyboard(message, state)

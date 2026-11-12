@@ -9,7 +9,7 @@ class ShadowFlowGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_shadow_candidate_does_not_publish(self):
         state = SimpleNamespace(get_data=AsyncMock(return_value={
             "equipment":"каток", "region":"Москва", "area":"СЗАО",
-            "place":"улица Свободы", "work_date":"завтра",
+            "place":"улица Свободы", "work_date":"завтра 09:00",
             "details":"Работы"}), clear=AsyncMock())
         message = SimpleNamespace(text="+79991234567",
             from_user=SimpleNamespace(id=501, full_name="Тест"),
@@ -27,7 +27,7 @@ class ShadowFlowGuardTests(unittest.IsolatedAsyncioTestCase):
             shadow.return_value = SimpleNamespace(route="candidate")
             get_lead.return_value = {"id":1,"customer_id":501,
                 "customer_name":"Тест","equipment":"каток","place":"улица Свободы",
-                "work_date":"завтра","details":"Работы","phone":"+79991234567",
+                "work_date":"завтра 09:00","details":"Работы","phone":"+79991234567",
                 "status":"new"}
             db = AsyncMock()
             cursor = SimpleNamespace(lastrowid=1)

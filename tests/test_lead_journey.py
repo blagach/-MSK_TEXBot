@@ -27,7 +27,7 @@ class LeadJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.state = SimpleNamespace(
             get_data=AsyncMock(return_value={
                 "equipment": "каток", "region": "Москва", "area": "СЗАО",
-                "place": "улица Свободы", "work_date": "завтра в 9",
+                "place": "улица Свободы", "work_date": "завтра 09:00",
                 "details": "Укатать площадку",
             }),
             clear=AsyncMock(),

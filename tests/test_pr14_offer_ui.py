@@ -226,7 +226,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.state.storage.init_schema()
         await bot.show_lead_step(self.message, self.state, bot.LeadForm.attachments,
                                  equipment="КДМ", details="Работа", region="Москва", area="ЦАО",
-                                 place="Адрес", work_date="завтра", phone="+79990000001",
+                                 place="Адрес", work_date="завтра 09:00", phone="+79990000001",
                                  payment_method=bot.payment_preferences.CASH, draft_id="attachments-draft")
 
         async def choose(action):
@@ -566,8 +566,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Описание:", notification.args[1])
         for send in (channel, notification):
             button = send.kwargs["reply_markup"].inline_keyboard[0][0]
-            self.assertEqual(button.text, "🚜 Откликнуться")
-            self.assertTrue(button.url.endswith("?start=lead_2"))
+            self.assertEqual(button.text, "📞 Получить контакт заказчика")
+            self.assertTrue(button.url.endswith("?start=contact_2"))
         await bot.start_offer(self.message, self.state, CommandObject(args="lead_2"))
         self.assertEqual((await self.state.get_data())["lead_id"], lead_id)
         self.assertEqual(await self.state.get_state(), bot.OfferForm.price.state)
