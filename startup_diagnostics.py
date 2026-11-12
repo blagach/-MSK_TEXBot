@@ -8,5 +8,17 @@ def startup_failure_message(error: Exception) -> str:
         "setMyCommands", "setChatMenuButton", "getUpdates",
     }
     suffix = f" [{method}]" if isinstance(method, str) and method in safe_methods else ""
+    # Classify locally; never emit Telegram's free-form error message or payload.
+    message = getattr(error, "message", None)
+    if isinstance(message, str):
+        normalized = message.casefold()
+        for fragment, code in (
+            ("user not found", "USER_NOT_FOUND"),
+            ("chat not found", "CHAT_NOT_FOUND"),
+            ("not enough rights", "INSUFFICIENT_RIGHTS"),
+        ):
+            if fragment in normalized:
+                suffix += f" [{code}]"
+                break
     return f"Test startup failed: {type(error).__name__}{suffix}"
 

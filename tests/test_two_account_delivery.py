@@ -46,3 +46,17 @@ class TwoAccountDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(startup_failure_message(error),'Test startup failed: TelegramBadRequest [getChatMember]')
         error.method=Record(__api_method__='private request contents')
         self.assertEqual(startup_failure_message(error),'Test startup failed: TelegramBadRequest')
+
+    def test_safe_diagnostics_classify_known_reasons_without_echoing_details(self):
+        for reason, code in (
+            ('USER NOT FOUND', 'USER_NOT_FOUND'),
+            ('chat not found', 'CHAT_NOT_FOUND'),
+            ('not enough rights to send', 'INSUFFICIENT_RIGHTS'),
+        ):
+            with self.subTest(code=code):
+                error = TelegramBadRequest(
+                    GetChatMember(chat_id=-100123, user_id=103),
+                    f'Bad Request: {reason}; private diagnostic payload',
+                )
+                self.assertEqual(startup_failure_message(error),
+                    f'Test startup failed: TelegramBadRequest [getChatMember] [{code}]')
