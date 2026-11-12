@@ -63,6 +63,47 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
         for key,value in self.original.items():
             if key != 'map_link': self.assertEqual(data[key],value)
 
+    async def test_map_accepts_trimmed_and_shared_yandex_links_preserving_form(self):
+        link = 'https://yandex.ru/maps/-/example?ll=37.6%2C55.7'
+        for text in (f'  {link}\n', f'Место работ\n{link}', f'Яндекс Карты {link}'):
+            with self.subTest(text=text):
+                await self.state.set_state(bot.LeadForm.map_link)
+                await self.state.set_data(dict(self.original))
+                self.message.text = text
+                await bot.lead_map_link(self.message, self.state)
+                self.assertEqual(await self.state.get_state(), bot.LeadForm.date.state)
+                expected = {**self.original, 'map_link': link}
+                self.assertEqual(await self.state.get_data(), expected)
+
+    async def test_typed_map_skip_advances_creation_and_finishes_edit_without_data_loss(self):
+        for editing in (False, True):
+            with self.subTest(editing=editing):
+                original = dict(self.original)
+                if editing:
+                    original['lead_editing'] = bot.LeadForm.map_link.state
+                await self.state.set_state(bot.LeadForm.map_link)
+                await self.state.set_data(original)
+                self.message.text = '  ПРОПУСТИТЬ  '
+                await bot.lead_map_link(self.message, self.state)
+                target = bot.LeadForm.review if editing else bot.LeadForm.date
+                self.assertEqual(await self.state.get_state(), target.state)
+                expected = {**original, 'map_link': ''}
+                if editing:
+                    expected['lead_editing'] = None
+                self.assertEqual(await self.state.get_data(), expected)
+
+    async def test_invalid_map_input_redisplays_actionable_skip_button(self):
+        await self.state.set_state(bot.LeadForm.map_link)
+        await self.state.set_data(dict(self.original))
+        self.message.text = 'не ссылка'
+        await bot.lead_map_link(self.message, self.state)
+        buttons = [button for row in self.message.answer.await_args.kwargs['reply_markup'].inline_keyboard for button in row]
+        self.assertIn('lead_optional_skip', [button.callback_data for button in buttons])
+        self.assertEqual(await self.state.get_data(), self.original)
+        await bot.skip_lead_optional(self.callback('lead_optional_skip'), self.state)
+        self.assertEqual(await self.state.get_state(), bot.LeadForm.date.state)
+        self.assertEqual(await self.state.get_data(), {**self.original, 'map_link': ''})
+
     async def test_invalid_map_link_leaves_entire_form_unchanged(self):
         await self.state.set_state(bot.LeadForm.map_link)
         await self.state.set_data(dict(self.original))

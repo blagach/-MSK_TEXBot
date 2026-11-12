@@ -1229,9 +1229,17 @@ async def lead_date(message: Message, state: FSMContext) -> None:
 
 @router.message(LeadForm.map_link)
 async def lead_map_link(message: Message, state: FSMContext) -> None:
-    value = message.text or ""
+    value = (message.text or "").strip()
+    if value.casefold() == "пропустить":
+        await advance_lead(message, state, LeadForm.date, map_link="")
+        return
+    # Yandex's Share action can include a place name before the URL.
+    links = re.findall(r"https://[^\s]+", value)
+    if (len(links) == 1 and value.endswith(links[0])
+            and re.match(r"https://(?:maps\.)?yandex\.(?:ru|com)(?:[/?#]|$)", links[0])):
+        value = links[0]
     if not re.fullmatch(r"https://[a-zA-Z0-9.-]+(?:[/?#][^\s]*)?", value) or len(value) > 500:
-        await message.answer("Откройте Яндекс Карты → нужное место → «Поделиться» → «Скопировать ссылку» и отправьте её сюда. Можно оставить только адрес: нажмите «Пропустить».")
+        await show_lead_step(message, state, LeadForm.map_link)
         return
     await advance_lead(message, state, LeadForm.date, map_link=value)
 

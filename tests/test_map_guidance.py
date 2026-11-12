@@ -24,6 +24,7 @@ class MapGuidanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_link_does_not_advance_or_clear_address(self):
         message=AsyncMock();message.text='не ссылка'
         state=AsyncMock()
+        state.get_data.return_value={}
         with patch.object(bot,'advance_lead',AsyncMock()) as advance:
             await bot.lead_map_link(message,state)
         advance.assert_not_awaited()
