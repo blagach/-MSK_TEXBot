@@ -1,3 +1,4 @@
+import work_datetime
 import asyncio
 import logging
 import json
@@ -152,7 +153,7 @@ LEAD_PROMPTS = {
     LeadForm.region: "Выберите регион:",
     LeadForm.area: "Укажите район или населённый пункт (например, СЗАО или Химки).",
     LeadForm.place: "Укажите точный адрес, ориентир или ближайшее метро.",
-    LeadForm.date: "На какую дату и время нужна техника?",
+    LeadForm.date: "На какую дату и время нужна техника? Укажите ДД.ММ.ГГГГ ЧЧ:ММ, например 25.12.2026 09:00, или «завтра 09:00». Время московское.",
     LeadForm.details: "Опишите работу: объём, срок, груз, навесное оборудование, важные условия.",
     LeadForm.attachments: "Выберите дополнительное оборудование. Можно отметить несколько вариантов или написать свой. Затем нажмите «Готово».",
     LeadForm.payment: "Выберите форму оплаты:",
@@ -1205,7 +1206,12 @@ async def lead_place(message: Message, state: FSMContext) -> None:
 async def lead_date(message: Message, state: FSMContext) -> None:
     if not await valid_input(message, 100, phone=False):
         return
-    await advance_lead(message, state, LeadForm.schedule, work_date=message.text)
+    try:
+        work_date = work_datetime.parse_work_datetime(message.text)
+    except ValueError:
+        await message.answer("Укажите будущую дату и время по Москве: ДД.ММ.ГГГГ ЧЧ:ММ или завтра ЧЧ:ММ. Остальные данные сохранены.")
+        return
+    await advance_lead(message, state, LeadForm.schedule, work_date=work_date)
 
 
 @router.message(LeadForm.map_link)

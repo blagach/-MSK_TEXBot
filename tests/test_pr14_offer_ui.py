@@ -131,7 +131,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         for handler, value in (
             (bot.lead_area, "СЗАО"),
             (bot.lead_place, "улица Свободы"),
-            (bot.lead_date, "завтра в 9"),
+            (bot.lead_date, "завтра 09:00"),
             (bot.lead_details, "Работа на смену"),
         ):
             self.message.text = value
@@ -159,7 +159,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.submit_lead_review()
         async with aiosqlite.connect(storage.DB_PATH) as db:
             rows = await (await db.execute("SELECT place, work_date, details FROM leads WHERE customer_id=20")).fetchall()
-        self.assertEqual(rows, [("улица Свободы", "завтра в 9", "Работа на смену")])
+        self.assertEqual(rows, [("улица Свободы", bot.work_datetime.parse_work_datetime("завтра 09:00"), "Работа на смену")])
 
     async def test_admin_closure_requires_confirmation_survives_menu_and_sends_once(self):
         self.state = self.reopen_sqlite_state()
@@ -389,7 +389,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         for handler, value in (
             (bot.lead_area, "СЗАО"),
             (bot.lead_place, "улица Свободы"),
-            (bot.lead_date, "завтра"),
+            (bot.lead_date, "завтра 09:00"),
             (bot.lead_details, "Работа на смену"),
         ):
             self.message.text = value
@@ -530,7 +530,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.pick_lead_option(0)
         await self.pick_lead_option(0)
         await self.pick_lead_option(0)
-        for handler, value in ((bot.lead_area, "ЦАО"), (bot.lead_place, "Тверская"), (bot.lead_date, "завтра")):
+        for handler, value in ((bot.lead_area, "ЦАО"), (bot.lead_place, "Тверская"), (bot.lead_date, "завтра 09:00")):
             self.message.text = value
             await handler(self.message, self.state)
             if handler in (bot.lead_place, bot.lead_date):
