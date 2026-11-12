@@ -132,7 +132,7 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
         previous=(bot.LeadForm.equipment,bot.LeadForm.equipment_type,bot.LeadForm.region,
                   bot.LeadForm.area,bot.LeadForm.place,bot.LeadForm.map_link,
                   bot.LeadForm.date,bot.LeadForm.schedule,bot.LeadForm.details,
-                  bot.LeadForm.attachments,bot.LeadForm.payment,bot.LeadForm.phone)
+                  bot.LeadForm.attachments,bot.LeadForm.payment,bot.LeadForm.edit)
         for step,target in zip(steps,previous,strict=True):
             with self.subTest(step=step.state):
                 original={**self.original,'equipment_group':0}
@@ -177,3 +177,18 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.state.get_data())['work_date'],'25.12.2099 09:00')
         for k,v in self.original.items():
             if k!='form_keyboard_id':self.assertEqual((await self.state.get_data())[k],v)
+
+    async def test_edit_address_then_back_opens_field_selection_not_phone(self):
+        await self.state.set_state(bot.LeadForm.edit)
+        await self.state.set_data(dict(self.original))
+        await bot.lead_review_action(self.callback('lead_review:3'),self.state,SimpleNamespace())
+        self.message.text='Новый адрес'
+        await bot.lead_place(self.message,self.state)
+        self.assertEqual(await self.state.get_state(),bot.LeadForm.review.state)
+        await bot.form_navigation(self.callback('form_nav:back'),self.state)
+        self.assertEqual(await self.state.get_state(),bot.LeadForm.edit.state)
+        data=await self.state.get_data()
+        self.assertEqual(data['place'],'Новый адрес')
+        for key,value in self.original.items():
+            if key not in ('place','form_keyboard_id'):self.assertEqual(data[key],value)
+        self.assertIn('Что изменить?',self.message.answer.await_args.args[0])

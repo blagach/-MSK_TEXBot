@@ -259,10 +259,10 @@ async def reveal_customer_contact(callback: CallbackQuery) -> None:
         await message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
-            await callback.answer(f"Контакт: {phone}. Карточка не обновилась; откройте список заявок заново.", show_alert=True)
+            await callback.answer(f"Контакт: {phone}. Карточка не обновилась; откройте заявку из уведомления заново.", show_alert=True)
             return
     except TelegramAPIError:
-        await callback.answer("Не удалось обновить карточку. Доступ сохранён; откройте список заявок заново.", show_alert=True)
+        await callback.answer("Не удалось обновить карточку. Доступ сохранён; откройте заявку из уведомления заново.", show_alert=True)
         return
     await callback.answer()
 
@@ -582,6 +582,9 @@ async def back_in_form(message: Message, state: FSMContext, current: str) -> Non
     if form_kind(current) == "lead":
         data = await state.get_data()
         step = FORM_STEPS[current]
+        if step == LeadForm.review:
+            await show_lead_step(message, state, LeadForm.edit)
+            return
         if step == LeadForm.edit or data.get("lead_editing"):
             await show_lead_step(message, state, LeadForm.review, lead_editing=None)
             return
@@ -783,7 +786,32 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
         except PermissionError as exc:
             await message.answer(str(exc))
             return
-        await message.answer(f"Контакт заказчика заявки №{contact_id}: {phone}")
+        lead = await get_lead(contact_id)
+        if lead is None:
+            await message.answer("Карточка заявки недоступна.")
+            return
+        text = lead_text(lead) + f"\nКонтакт заказчика: {phone}"
+        markup = InlineKeyboardMarkup(inline_keyboard=[[revealed_contact_button(phone)]])
+        # A legacy URL contains no originating message ID. Keep one private card
+        # per actor/lead in an isolated UI slot; never mutate a channel message.
+        panel = draft_slot(state, f"contact_card_{contact_id}")
+        saved = await panel.get_data()
+        if saved.get("message_id"):
+            try:
+                await message.bot.edit_message_text(text, chat_id=message.chat.id,
+                    message_id=saved["message_id"], reply_markup=markup)
+            except TelegramAPIError:
+                logging.warning("Could not refresh saved private contact card")
+            return
+        if saved.get("delivery_attempted"):
+            return  # An uncertain send must not trigger automatic duplicate delivery.
+        await panel.update_data(delivery_attempted=True)
+        try:
+            sent = await message.answer(text, reply_markup=markup)
+        except TelegramAPIError:
+            logging.warning("Private contact card delivery not confirmed")
+            return
+        await panel.update_data(message_id=sent.message_id)
         return
     lead_id = storage.parse_id(command.args, "lead_")
     await open_offer(message, state, lead_id, message.from_user.id)
