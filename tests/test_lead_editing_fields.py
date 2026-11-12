@@ -52,3 +52,34 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['place'],self.original['place'])
         self.assertEqual(data['phone'],self.original['phone'])
         self.assertIsNone(data['lead_editing'])
+    async def test_yandex_link_is_saved_and_address_survives(self):
+        await self.state.set_state(bot.LeadForm.map_link)
+        await self.state.set_data(dict(self.original))
+        self.message.text='https://yandex.ru/maps/-/example'
+        await bot.lead_map_link(self.message,self.state)
+        data=await self.state.get_data()
+        self.assertEqual(await self.state.get_state(),bot.LeadForm.date.state)
+        self.assertEqual(data['map_link'],self.message.text)
+        for key,value in self.original.items():
+            if key != 'map_link': self.assertEqual(data[key],value)
+
+    async def test_invalid_map_link_leaves_entire_form_unchanged(self):
+        await self.state.set_state(bot.LeadForm.map_link)
+        await self.state.set_data(dict(self.original))
+        for value in ('', 'http://yandex.ru/maps/', 'javascript:alert(1)', 'https://yandex.ru/maps/ bad', 'https://yandex.ru/'+'x'*501):
+            with self.subTest(value=value[:40]):
+                self.message.text=value
+                await bot.lead_map_link(self.message,self.state)
+                self.assertEqual(await self.state.get_data(),self.original)
+                self.assertEqual(await self.state.get_state(),bot.LeadForm.map_link.state)
+
+    async def test_map_panel_has_open_skip_back_and_home_controls(self):
+        await self.state.set_data(dict(self.original))
+        await bot.show_lead_step(self.message,self.state,bot.LeadForm.map_link)
+        controls=[button for row in self.message.answer.await_args.kwargs['reply_markup'].inline_keyboard for button in row]
+        self.assertIn('https://yandex.ru/maps/',[button.url for button in controls])
+        for action in ('lead_optional_skip','form_nav:back','form_nav:home'):
+            self.assertIn(action,[button.callback_data for button in controls])
+        prompt=self.message.answer.await_args.args[0]
+        self.assertIn('Точка на карте',prompt)
+        self.assertNotIn('HTTPS',prompt)
