@@ -6,8 +6,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, CallbackQuery, Message, ReplyKeyboardMarkup
 
-from draft_storage import offer_draft_ids
-
 import provider_registry as registry
 import payment_preferences as payments
 import storage
@@ -53,18 +51,14 @@ async def executor_keyboard(user_id: int, state: FSMContext) -> ReplyKeyboardMar
         ) as cursor:
             notifications_enabled, legacy = await cursor.fetchone()
 
-    draft = (OFFER_DRAFT,) if await offer_draft_ids(state) else ()
     if notifications_enabled is not None:
         notifications = NOTIFICATIONS_ON if notifications_enabled else NOTIFICATIONS_OFF
-        rows = [(MY_TECH, MY_REGIONS), (notifications, *draft)]
+        rows = [(MY_TECH, MY_REGIONS), (notifications,)]
 
     else:
-        rows = [(MY_OFFERS,)] if legacy else []
-        rows.append((REGISTER_PROVIDER,))
+        rows = [(REGISTER_PROVIDER,)]
         if legacy:
             rows.append((LEGACY_PROVIDER,))
-        if draft:
-            rows.append(draft)
     return section_keyboard(*rows, (HOME,))
 
 
@@ -91,7 +85,7 @@ class AddMachine(StatesGroup):
 def provider_tools_keyboard():
     return section_keyboard(
         (INVENTORY, "👤 Мой профиль"), ("➕ Добавить технику", PAYMENT_METHOD),
-        (MY_OFFERS,), (HOME,),
+        (HOME,),
     )
 
 

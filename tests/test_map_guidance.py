@@ -41,3 +41,8 @@ class MapGuidanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Как получить контакт заказчика?',faq)
         self.assertIn('длинная анкета отклика не обязательна',faq)
         self.assertIn('зарегистрированные исполнители',faq)
+        customer = str(support_content.GUIDES['customer'])
+        for obsolete in ('🚜 Откликнуться', '✅ Отправить отклик', '▶️ Продолжить отклик'):
+            self.assertNotIn(obsolete, guide)
+        self.assertNotIn('«Отклики»', customer)
+        self.assertIn('Статус заявки', customer)

@@ -52,6 +52,57 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await storage.transition(lead_id, "new", "publishing"))
         await storage.finish_publication(lead_id, -100123, lead_id)
 
+    async def test_customer_card_hides_offers_keeps_status_close_and_legacy_history(self):
+        lead_id = await self.make_lead()
+        await self.publish(lead_id)
+        offer_id = await storage.save_offer(lead_id, 21, 'Исполнитель', '', '28000', 'Смена', '+79990000002')
+        message = SimpleNamespace(answer=AsyncMock())
+        lead = dict(await bot.get_lead(lead_id))
+        for status in ('new', 'published', 'closed'):
+            with self.subTest(status=status):
+                await bot.show_customer_lead(message, {**lead, 'status': status}, True, False)
+                call = message.answer.await_args
+                buttons = [b for row in call.kwargs['reply_markup'].inline_keyboard for b in row]
+                self.assertNotIn('Отклики', [b.text for b in buttons])
+                self.assertFalse(any((b.callback_data or '').startswith('lc:offers:') for b in buttons))
+                self.assertIn(f'lc:repeat:{lead_id}', [b.callback_data for b in buttons])
+                self.assertIn('lc:list:0', [b.callback_data for b in buttons])
+                self.assertEqual('Закрыть заявку' in [b.text for b in buttons], status == 'published')
+                self.assertIn(bot.LEAD_STATUS[status], call.args[0])
+        message.answer.reset_mock()
+        await bot.show_customer_offers(message, lead, 2**63 - 1)
+        self.assertIn('28000', message.answer.await_args_list[0].args[0])
+        self.assertTrue(await storage.has_offer(lead_id, 21))
+        self.assertEqual(await storage.offer_phone_for_customer(offer_id, 12), '+79990000002')
+        self.assertTrue(bot.respond_button(lead_id).url.endswith(f'?start=contact_{lead_id}'))
+
+    async def test_provider_primary_menus_hide_offer_actions_without_changing_saved_drafts(self):
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            await db.execute("INSERT INTO providers VALUES (21,'Прежний профиль','кран','Москва','+79990000002','now')")
+            await db.commit()
+        for actor, registered, enabled in ((22, False, True), (21, False, True), (21, True, True), (21, True, False)):
+            with self.subTest(actor=actor, registered=registered, enabled=enabled):
+                if registered:
+                    await provider_registry.register_provider(actor, 'Исполнитель', '+79990000002', True, str(self.path))
+                    await provider_registry.set_notifications(actor, enabled, str(self.path))
+                state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=actor, user_id=actor))
+                legacy = bot.draft_slot(state, 'offer')
+                await legacy.set_state(bot.OfferForm.price)
+                await legacy.set_data({'lead_id': 42, 'price': '28000'})
+                keyboard = await provider_ui.executor_keyboard(actor, state)
+                labels = [b.text for row in keyboard.keyboard for b in row]
+                self.assertNotIn(provider_ui.OFFER_DRAFT, labels)
+                self.assertNotIn(provider_ui.MY_OFFERS, labels)
+                self.assertIn(provider_ui.HOME, labels)
+                if registered:
+                    self.assertIn(provider_ui.MY_TECH, labels)
+                    self.assertIn(provider_ui.NOTIFICATIONS_ON if enabled else provider_ui.NOTIFICATIONS_OFF, labels)
+                else:
+                    self.assertIn(provider_ui.REGISTER_PROVIDER, labels)
+                self.assertEqual(await legacy.get_state(), bot.OfferForm.price.state)
+                self.assertEqual(await legacy.get_data(), {'lead_id': 42, 'price': '28000'})
+        self.assertNotIn(provider_ui.MY_OFFERS, [b.text for row in provider_ui.provider_tools_keyboard().keyboard for b in row])
+
     async def test_both_roles_show_the_same_catalog_and_return_controls(self):
         states = MemoryStorage()
         buyer = FSMContext(states, StorageKey(bot_id=1, chat_id=12, user_id=12))

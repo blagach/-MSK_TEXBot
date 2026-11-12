@@ -962,7 +962,7 @@ async def show_customer_lead(message, lead, owner, admin, admin_back=None):
     status = lead["status"]
     rows = []
     if owner:
-        rows.append([lead_key("Отклики", f"offers:{lead_id}"), lead_key("Повторить заявку", f"repeat:{lead_id}")])
+        rows.append([lead_key("Повторить заявку", f"repeat:{lead_id}")])
     if status == "published":
         rows.append([lead_key("Закрыть заявку", f"close:{lead_id}")])
     if admin and status == "new":

@@ -364,7 +364,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(bot.LEAD_DRAFT, [row[0].text for row in keyboard.keyboard])
         await bot.executor_menu(self.message, self.state)
         keyboard = self.message.answer.await_args.kwargs["reply_markup"]
-        self.assertIn(bot.OFFER_DRAFT, [row[0].text for row in keyboard.keyboard])
+        self.assertNotIn(bot.OFFER_DRAFT, [button.text for row in keyboard.keyboard for button in row])
         await bot.resume_draft(self.message, self.state, "lead")
         self.assertEqual((await self.state.get_data())["draft_id"], original_draft_id)
         self.assertEqual(await self.state.get_state(), bot.LeadForm.area.state)
@@ -587,11 +587,11 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.offer_price(self.message, self.state)
         await bot.executor_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows()[1:], [
-            ["🔔 Уведомления включены", "▶️ Продолжить отклик"], ["🏠 Главное меню"],
+            ["🔔 Уведомления включены"], ["🏠 Главное меню"],
         ])
         self.message.text = "🔔 Уведомления включены"
         await bot.provider_ui.notifications(self.message, self.state)
-        self.assertEqual(self.keyboard_rows()[1], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
+        self.assertEqual(self.keyboard_rows()[1], ["🔕 Уведомления выключены"])
         await bot.provider_ui.notifications(self.message, self.state)
         self.assertEqual(self.keyboard_rows()[1][0], "🔕 Уведомления выключены")
 
@@ -602,7 +602,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.equipment_type.state)
         await bot.executor_menu(self.message, self.state)
-        self.assertEqual(self.keyboard_rows()[1], ["🔕 Уведомления выключены", "▶️ Продолжить отклик"])
+        self.assertEqual(self.keyboard_rows()[1], ["🔕 Уведомления выключены"])
         self.assertEqual((await bot.draft_slot(self.state, "offer_1").get_data())["price"], "28000")
         self.message.text = "🔕 Уведомления выключены"
         await bot.provider_ui.notifications(self.message, self.state)
@@ -611,7 +611,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             await handler(self.message, self.state)
             if handler in (bot.lead_place, bot.lead_date):
                 await self.skip_lead_optional()
-            self.assertEqual(self.keyboard_rows()[1], ["🔔 Уведомления включены", "▶️ Продолжить отклик"])
+            self.assertEqual(self.keyboard_rows()[1], ["🔔 Уведомления включены"])
 
     async def test_legacy_registration_remains_accessible_with_compact_menu(self):
         async with aiosqlite.connect(storage.DB_PATH) as db:
@@ -704,8 +704,9 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.preference_action("tools")
         tools = [button for row in self.keyboard_rows() for button in row]
         for label in (bot.provider_ui.INVENTORY, "👤 Мой профиль", "➕ Добавить технику",
-                      bot.provider_ui.PAYMENT_METHOD, bot.MY_OFFERS):
+                      bot.provider_ui.PAYMENT_METHOD):
             self.assertIn(label, tools)
+        self.assertNotIn(bot.MY_OFFERS, tools)
         self.assertIsNotNone(await bot.draft_slot(self.state, "provider_action").get_state())
 
     async def test_alert_preferences_detect_concurrent_changes_without_losing_draft(self):
