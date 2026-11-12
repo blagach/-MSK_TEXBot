@@ -60,3 +60,18 @@ class ProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    async def test_owner_edits_all_equipment_fields_and_pauses_without_deleting(self):
+        await registry.register_provider(100,'Исполнитель','+79991234567',True,self.db)
+        item=await registry.add_equipment(100,'каток','Старая карточка','Москва','ЦАО',self.db)
+        self.assertTrue(await registry.update_equipment(100,item,category='мини-погрузчик',description=' Новая карточка ',region='Московская область',area=' Химки ',active=False,db_path=self.db))
+        rows=await registry.list_equipment(100,self.db)
+        self.assertEqual(len(rows),1)
+        row=dict(rows[0])
+        self.assertEqual(row['id'],item)
+        for key,value in {'category':'мини-погрузчик','description':'Новая карточка','region':'Московская область','area':'Химки','active':0}.items():
+            with self.subTest(field=key): self.assertEqual(row[key],value)
+        self.assertEqual(await registry.matching_providers('мини-погрузчик','Московская область','Химки',self.db),[])
+        self.assertTrue(await registry.update_equipment(100,item,category=row['category'],description=row['description'],region=row['region'],area=row['area'],active=True,db_path=self.db))
+        self.assertEqual(await registry.matching_providers('мини-погрузчик','Московская область','Химки',self.db),[100])
+        self.assertEqual((await registry.list_equipment(100,self.db))[0]['id'],item)

@@ -42,3 +42,14 @@ class ContactAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('+79990000001',message.answer.await_args.args[0])
         state.set_state.assert_not_awaited()
         state.clear.assert_not_awaited()
+    async def test_every_unavailable_status_and_missing_lead_denies_new_access(self):
+        for status in ('new','publishing','closed','completed','cancelled','rejected','archived','unknown'):
+            with self.subTest(status=status):
+                with sqlite3.connect(self.path) as db: db.execute('UPDATE leads SET status=?',(status,))
+                with self.assertRaises(PermissionError): await contacts.open_contact(self.path,2,10)
+        with self.assertRaises(PermissionError): await contacts.open_contact(self.path,2,999)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM customer_contact_access').fetchone()[0],0)
+    async def test_customer_cannot_open_own_contact_as_provider(self):
+        with sqlite3.connect(self.path) as db: db.execute('INSERT INTO provider_profiles VALUES(1,0)')
+        with self.assertRaises(PermissionError): await contacts.open_contact(self.path,1,10)

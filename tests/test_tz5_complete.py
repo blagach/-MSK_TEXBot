@@ -268,3 +268,25 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
             db.execute('INSERT INTO lead_draft_submissions VALUES (?,?)',('saved-before-expiry',lead_id))
         result=await bot.save_lead_from_draft(self.customer,'+79990000001',{'draft_id':'saved-before-expiry','work_date':'01.01.2000 09:00'})
         self.assertEqual(result,(lead_id,False))
+
+    async def test_repeat_lead_preserves_every_source_field_and_blocks_duplicate_draft(self):
+        from unittest.mock import MagicMock
+        from aiogram.types import Message
+        lead_id=await self.make_lead()
+        await self.publish(lead_id)
+        source=dict(await bot.get_lead(lead_id))
+        state=FSMContext(MemoryStorage(),StorageKey(bot_id=99,chat_id=12,user_id=12))
+        message=MagicMock(spec=Message)
+        message.chat=SimpleNamespace(id=12,type='private')
+        message.answer=AsyncMock(return_value=SimpleNamespace(message_id=51))
+        message.bot=SimpleNamespace(edit_message_reply_markup=AsyncMock())
+        callback=SimpleNamespace(data=f'lc:repeat:{lead_id}',message=message,from_user=self.customer,answer=AsyncMock())
+        await bot.lead_card_action(callback,state,message.bot)
+        copied=await state.get_data()
+        self.assertEqual(await state.get_state(),bot.LeadForm.review.state)
+        for key in ('equipment','equipment_name','region','area','place','map_link','work_date','schedule','details','payment_method','phone'):
+            with self.subTest(field=key): self.assertEqual(copied[key],source[key])
+        self.assertTrue(copied['draft_id'])
+        await bot.lead_card_action(callback,state,message.bot)
+        self.assertEqual((await state.get_data())['draft_id'],copied['draft_id'])
+        self.assertEqual(dict(await bot.get_lead(lead_id)),source)
