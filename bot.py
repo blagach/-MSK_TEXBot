@@ -112,6 +112,10 @@ class LeadForm(StatesGroup):
     edit = State()
 
 
+class CancelLeadDraft(StatesGroup):
+    confirm = State()
+
+
 class CloseLead(StatesGroup):
     reason = State()
     confirm = State()
@@ -174,6 +178,7 @@ LEAD_CHOICES = {
 }
 FORM_STEPS = {step.state: step for step in (*LeadForm.__all_states__, *OfferForm.__all_states__)}
 LEAD_DRAFT = "▶️ Продолжить заявку"
+CANCEL_LEAD_DRAFT = "Отменить черновик"
 PROVIDER_ACTION_DRAFT = "▶️ Продолжить настройку исполнителя"
 SUPPORT_ACTION_DRAFT = "▶️ Продолжить обращение"
 CLOSING_ACTION_DRAFT = "▶️ Продолжить закрытие заявки"
@@ -651,6 +656,53 @@ async def form_navigation(callback: CallbackQuery, state: FSMContext) -> None:
         await show_main_menu(callback.message, state)
 
 
+@router.message(F.text == CANCEL_LEAD_DRAFT)
+async def ask_cancel_lead_draft(message: Message, state: FSMContext):
+    await pause_form(message, state)
+    draft = draft_slot(state, "lead")
+    saved_state, saved_data = await draft.get_state(), await draft.get_data()
+    if not saved_state:
+        await message.answer("Активного черновика заявки нет.")
+        return
+    await state.set_state(CancelLeadDraft.confirm)
+    await state.update_data(cancel_draft_state=saved_state, cancel_draft_data=saved_data)
+    await send_form_panel(message, state,
+        "Отменить этот черновик? Он будет убран из активных, а заполненные данные сохранятся в архиве. Опубликованные заявки не изменятся.", [
+        [InlineKeyboardButton(text="Да, отменить черновик", callback_data="cancel_lead_draft:yes")],
+        [InlineKeyboardButton(text="Нет, сохранить", callback_data="cancel_lead_draft:no")],
+    ])
+
+
+@router.callback_query(F.data.startswith("cancel_lead_draft:"))
+async def confirm_cancel_lead_draft(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    message = callback.message
+    if (await state.get_state() != CancelLeadDraft.confirm.state or not is_form_panel(callback, data)
+            or message.chat.type != "private" or message.chat.id != callback.from_user.id):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    action = callback.data.removeprefix("cancel_lead_draft:")
+    if action not in {"yes", "no"}:
+        await callback.answer("Неизвестное действие.")
+        return
+    draft = draft_slot(state, "lead")
+    if await draft.get_state() != data['cancel_draft_state'] or await draft.get_data() != data['cancel_draft_data']:
+        await callback.answer("Черновик изменился. Откройте меню заказчика заново.", show_alert=True)
+        return
+    await callback.answer()
+    if action == "yes":
+        archive = draft_slot(state, f"cancelled_lead_{uuid4().hex}")
+        if isinstance(state.storage, SQLiteDraftStorage):
+            await state.storage.transfer(draft.key, archive.key)
+        else:
+            await archive.set_data(await draft.get_data())
+            await archive.set_state(await draft.get_state())
+            await draft.clear()
+    await clear_form_keyboard(message, state)
+    await state.clear()
+    await customer_menu(message, state)
+
+
 @router.message(F.text.in_({LEAD_DRAFT, OFFER_DRAFT}))
 async def resume_form_from_menu(message: Message, state: FSMContext) -> None:
     if message.text == LEAD_DRAFT:
@@ -882,7 +934,7 @@ async def customer_menu(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     rows = [("📝 Оставить заявку", MY_LEADS)]
     if await draft_slot(state, "lead").get_state():
-        rows.append((LEAD_DRAFT,))
+        rows.append((LEAD_DRAFT, CANCEL_LEAD_DRAFT))
     await message.answer("Меню заказчика.", reply_markup=section_keyboard(*rows, (OFFER_HOME,)))
 
 
@@ -1053,7 +1105,7 @@ async def show_customer_lead(message, lead, owner, admin, admin_back=None):
         async with db.execute("SELECT reason FROM lead_lifecycle_events WHERE lead_id=? AND action='closed'",
                               (lead_id,)) as cursor:
             closing = await cursor.fetchone()
-    closing_text = f"\nПричина закрытия: {closing[0]}" if closing else ""
+    closing_text = f"\nПричина закрытия: {closing[0] or 'не указана'}" if closing else ""
     await message.answer(f"{lead_text(lead, True)}\nСтатус: {LEAD_STATUS.get(status, status)}{closing_text}",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1096,10 +1148,13 @@ async def show_closing_step(message, state):
             [InlineKeyboardButton(text=OFFER_HOME, callback_data="lead_close:home")],
         ]
         await send_form_panel(message, state,
-                              f"Закрыть заявку №{data['closing_lead']}?\nПричина: {data['closing_reason']}", rows)
+                              f"Закрыть заявку №{data['closing_lead']}?\nПричина: {data.get('closing_reason') or 'не указана'}", rows)
     else:
-        await message.answer("Укажите причину закрытия заявки.",
-                             reply_markup=section_keyboard((OFFER_HOME,)))
+        await send_form_panel(message, state, "Причина закрытия необязательна. Напишите её или нажмите «Без причины».", [
+            [InlineKeyboardButton(text="Без причины", callback_data="lead_close:skip")],
+            [InlineKeyboardButton(text="Отмена", callback_data="lead_close:cancel"),
+             InlineKeyboardButton(text=OFFER_HOME, callback_data="lead_close:home")],
+        ])
 
 
 @router.message(CloseLead.reason)
@@ -1115,13 +1170,23 @@ async def close_lead_reason(message: Message, state: FSMContext):
 async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     message = callback.message
-    if (await state.get_state() != CloseLead.confirm.state or not is_form_panel(callback, data)
+    current = await state.get_state()
+    if (current not in CloseLead.__all_states_names__ or not is_form_panel(callback, data)
             or message.chat.type != "private" or message.chat.id != callback.from_user.id):
         await callback.answer("Этот шаг уже неактуален.")
         return
     action = callback.data.removeprefix("lead_close:")
-    if action not in {"send", "edit", "cancel", "home"}:
+    if action not in {"send", "edit", "cancel", "home", "skip"}:
         await callback.answer("Неизвестное действие.")
+        return
+    if (action == "send" and current != CloseLead.confirm.state) or (action == "skip" and current != CloseLead.reason.state):
+        await callback.answer("Этот шаг уже неактуален.")
+        return
+    if action == "skip":
+        await callback.answer()
+        await state.update_data(closing_reason="")
+        await state.set_state(CloseLead.confirm)
+        await show_closing_step(message, state)
         return
     await callback.answer()
     if action == "home":
@@ -1139,7 +1204,7 @@ async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bo
         await message.answer("Закрытие отменено.", reply_markup=main_menu(await admin_allowed(user_id, "panel")))
         return
     changed = await lead_journey.change_lifecycle(
-        storage.DB_PATH, lead_id, user_id, admin=await admin_allowed(user_id, "moderate"), reason=data["closing_reason"],
+        storage.DB_PATH, lead_id, user_id, admin=await admin_allowed(user_id, "moderate"), reason=data.get("closing_reason", ""),
     )
     await admin_access.record(user_id, "lead_close", target_id=lead_id,
                               result="success" if changed else "not_changed")
@@ -1149,10 +1214,10 @@ async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bo
         lead = await get_lead(lead_id)
         if lead["customer_id"] != user_id:
             delivered = await notify(bot, lead["customer_id"],
-                                           f"Заявка №{lead_id} закрыта администратором.\nПричина: {data['closing_reason']}")
+                                           f"Заявка №{lead_id} закрыта администратором.\nПричина: {data.get('closing_reason') or 'не указана'}")
             notice = "\nУведомление принято Telegram." if delivered else "\nУведомление заказчику не отправлено."
     await message.answer(
-        (f"Заявка №{lead_id} закрыта. Причина сохранена." + notice) if changed
+        (f"Заявка №{lead_id} закрыта." + notice) if changed
         else "Заявка недоступна или уже закрыта.", reply_markup=main_menu(await admin_allowed(user_id, "panel")),
     )
 

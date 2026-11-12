@@ -218,10 +218,10 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("#Контакт", public)
         self.assertIn(bot.payment_preferences.VAT, public)
 
-    async def test_close_reason_is_required_by_storage_and_saved_without_outer_spaces(self):
+    async def test_close_reason_is_optional_but_validated_and_saved_without_outer_spaces(self):
         lead_id = await self.make_lead()
         await self.publish(lead_id)
-        for invalid in ("", "  ", "x" * 501, 123):
+        for invalid in ("x" * 501, 123):
             with self.subTest(reason=invalid):
                 with self.assertRaises(ValueError):
                     await lead_journey.change_lifecycle(str(self.path), lead_id, 12, reason=invalid)

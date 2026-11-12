@@ -602,7 +602,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.state = self.reopen_sqlite_state()
         await bot.customer_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows(), [
-            ["📝 Оставить заявку", "📋 Мои заявки"], ["▶️ Продолжить заявку"], ["🏠 Главное меню"],
+            ["📝 Оставить заявку", "📋 Мои заявки"], ["▶️ Продолжить заявку", bot.CANCEL_LEAD_DRAFT], ["🏠 Главное меню"],
         ])
         self.assertEqual(await bot.draft_slot(self.state, "lead").get_state(), bot.LeadForm.equipment_type.state)
         await bot.executor_menu(self.message, self.state)
@@ -851,3 +851,66 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         sent = self.telegram.send_message.await_args
         self.assertEqual(sent.args, (10, "Телефон исполнителя: +79990000001"))
         self.assertEqual(sent.kwargs["reply_markup"].inline_keyboard[0][0].copy_text.text, "+79990000001")
+
+    async def test_close_without_reason_requires_confirmation_and_notifies_once(self):
+        self.state=self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        self.assertFalse(await bot.lead_journey.change_lifecycle(storage.DB_PATH,1,99,reason=''))
+        with patch.object(bot,'settings',replace(bot.settings,admin_ids={20})):
+            start=self.step('start',1);start.data='lc:close:1'
+            await bot.lead_card_action(start,self.state,self.telegram)
+            panel=(await self.state.get_data())['form_keyboard_id']
+            skip=self.step('skip',panel);skip.data='lead_close:skip'
+            await bot.close_lead_confirmation(skip,self.state,self.telegram)
+            self.assertEqual((await bot.get_lead(1))['status'],'published')
+            self.assertEqual((await self.state.get_data())['closing_reason'],'')
+            panel=(await self.state.get_data())['form_keyboard_id']
+            send=self.step('send',panel);send.data='lead_close:send'
+            await bot.close_lead_confirmation(send,self.state,self.telegram)
+            await bot.close_lead_confirmation(send,self.state,self.telegram)
+        self.assertEqual((await bot.get_lead(1))['status'],'closed')
+        self.telegram.send_message.assert_awaited_once()
+        self.assertIn('не указана',self.telegram.send_message.await_args.args[1])
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            self.assertEqual(await (await db.execute("SELECT reason FROM lead_lifecycle_events WHERE lead_id=1 AND action='closed'")).fetchall(),[('',)])
+        self.assertFalse(await bot.lead_journey.change_lifecycle(storage.DB_PATH,1,99,reason=''))
+
+    async def test_cancel_saved_draft_requires_confirmation_archives_and_keeps_published_lead(self):
+        self.state=self.reopen_sqlite_state()
+        await self.state.storage.init_schema()
+        draft=bot.draft_slot(self.state,'lead')
+        original={'draft_id':'retained-test','phone':'+79990000001','place':'Сохранённый адрес'}
+        await draft.set_state(bot.LeadForm.place)
+        await draft.set_data(original)
+        await bot.customer_menu(self.message,self.state)
+        labels=[b.text for row in self.message.answer.await_args.kwargs['reply_markup'].keyboard for b in row]
+        self.assertIn(bot.CANCEL_LEAD_DRAFT,labels)
+        await bot.ask_cancel_lead_draft(self.message,self.state)
+        self.assertEqual(await draft.get_data(),original)
+        panel=(await self.state.get_data())['form_keyboard_id']
+        no=self.step('no',panel);no.data='cancel_lead_draft:no'
+        await bot.confirm_cancel_lead_draft(no,self.state)
+        self.assertEqual(await draft.get_data(),original)
+        await bot.ask_cancel_lead_draft(self.message,self.state)
+        panel=(await self.state.get_data())['form_keyboard_id']
+        yes=self.step('yes',panel);yes.data='cancel_lead_draft:yes'
+        foreign=self.step('yes',panel);foreign.data=yes.data
+        foreign.from_user=SimpleNamespace(id=99)
+        await bot.confirm_cancel_lead_draft(foreign,self.state)
+        self.assertEqual(await draft.get_data(),original)
+        await bot.confirm_cancel_lead_draft(yes,self.state)
+        await bot.confirm_cancel_lead_draft(yes,self.state)
+        self.assertIsNone(await draft.get_state())
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            archived=await (await db.execute("SELECT data FROM form_drafts WHERE storage_key LIKE '%draft_cancelled_lead_%'")).fetchall()
+        import json
+        self.assertEqual([json.loads(row[0]) for row in archived],[original])
+        self.assertEqual((await bot.get_lead(1))['status'],'published')
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            await db.execute('UPDATE leads SET customer_id=20 WHERE id=1')
+            await db.commit()
+        repeat=self.step('repeat',1);repeat.data='lc:repeat:1'
+        await bot.lead_card_action(repeat,self.state,self.telegram)
+        self.assertIn(await self.state.get_state(),bot.LeadForm.__all_states_names__)
+        self.assertEqual((await self.state.get_data())['phone'],'+79991234567')
+        self.assertEqual((await bot.get_lead(1))['status'],'published')
