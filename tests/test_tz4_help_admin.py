@@ -177,6 +177,83 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row[0], 0, table)
         self.telegram.send_message.assert_not_awaited()
 
+    async def test_machine_preview_requires_confirmation_and_duplicate_save_is_inactive(self):
+        message, state = self.actor(20)
+        message.message_id = 101
+        message.answer.return_value = Record(message_id=101)
+        await provider_registry.register_provider(20, "Учебный исполнитель", "+79990000001", True, str(self.database))
+        values = {"category":"мини-экскаватор", "description":"Учебная машина", "region":"Москва"}
+        await state.set_data(values)
+        await provider_ui.review_machine(message, state, "СЗАО")
+        self.assertEqual(await provider_registry.list_equipment(20,str(self.database)), [])
+        self.assertEqual(await state.get_state(),provider_ui.AddMachine.review.state)
+        markup=message.answer.await_args.kwargs["reply_markup"]
+        self.assertEqual([b.callback_data for row in markup.inline_keyboard for b in row],
+                         ["machine_review:save", "machine_review:edit"])
+        for value in (*values.values(),"СЗАО"):
+            self.assertIn(value,message.answer.await_args.args[0])
+        await provider_ui.machine_review(self.callback(message,"machine_review:save"),state)
+        saved=await provider_registry.list_equipment(20,str(self.database))
+        self.assertEqual(len(saved),1)
+        self.assertEqual(saved[0]["description"],values["description"])
+        again=self.callback(message,"machine_review:save")
+        await provider_ui.machine_review(again,state)
+        self.assertEqual(await provider_registry.list_equipment(20,str(self.database)),saved)
+        again.answer.assert_awaited_once_with("Этот шаг уже неактуален.")
+        await provider_ui.my_machines(message,state)
+        text=message.answer.await_args_list[-2].args[0]
+        self.assertIn("\n✅ Активна",text)
+        self.assertIn(values["description"],text)
+
+    async def test_machine_old_panel_cannot_save_or_replace_preview(self):
+        message,state=self.actor(20)
+        message.message_id=100
+        values={"category":"автокран","description":"Учебный кран","region":"Москва","area":"СЗАО","machine_panel":101}
+        await state.set_state(provider_ui.AddMachine.review)
+        await state.set_data(values)
+        for action in ("save","edit"):
+            await provider_ui.machine_review(self.callback(message,"machine_review:"+action),state)
+            self.assertEqual(await state.get_data(),values)
+            self.assertEqual(await state.get_state(),provider_ui.AddMachine.review.state)
+        self.assertEqual(await provider_registry.list_equipment(20,str(self.database)),[])
+
+    async def test_support_compose_prompt_has_exact_safety_instruction(self):
+        message,state=self.actor(20)
+        await self.help_action(message,state,"new:help")
+        self.assertEqual(message.answer.await_args.args[0],
+            "Опишите, с чем нужна помощь.\nПри желании приложите скриншот. Не добавляйте пароли и коды.")
+        self.assertNotIn("как фото",message.answer.await_args.args[0])
+        self.assertEqual(await support_storage.list_tickets(requester_id=20),[])
+
+    async def test_closed_support_history_is_visible_only_to_author_and_admin(self):
+        await provider_registry.register_provider(20,"Учебный исполнитель","+79990000001",True,str(self.database))
+        ticket,_=await support_storage.create_ticket(20,"help","history-owner","Учебный вопрос","test-photo")
+        await support_storage.add_reply(ticket,1,"history-answer","Учебный ответ")
+        await support_storage.change_status(ticket,"closed",actor_id=1)
+        before=[dict(row) for row in await support_storage.history(ticket)]
+        for user in (20,1):
+            message,state=self.actor(user)
+            await self.help_action(message,state,f"ticket:{ticket}:0")
+            rendered="\n".join(call.args[0] for call in message.answer.await_args_list)
+            self.assertIn("Учебный вопрос",rendered)
+            self.assertIn("Учебный ответ",rendered)
+            message.answer_photo.assert_awaited_once_with("test-photo")
+        outsider,state=self.actor(40)
+        await self.help_action(outsider,state,f"ticket:{ticket}:0")
+        self.assertIn("Обращение недоступно",outsider.answer.await_args.args[0])
+        outsider.answer_photo.assert_not_awaited()
+        self.assertEqual([dict(row) for row in await support_storage.history(ticket)],before)
+        self.assertEqual((await support_storage.ticket(ticket))["status"],"closed")
+        self.telegram.send_message.assert_not_awaited()
+
+    async def test_admin_support_lists_keep_status_navigation_for_each_status(self):
+        admin,state=self.actor(1)
+        for status in ("new","in_progress","closed"):
+            with self.subTest(status=status):
+                await self.help_action(admin,state,f"list:{status}:0")
+                buttons=[b for row in admin.answer.await_args.kwargs["reply_markup"].inline_keyboard for b in row]
+                self.assertIn(("⬅️ К статусам","help:queue"),[(b.text,b.callback_data) for b in buttons])
+
     async def test_support_ticket_ownership_admin_reply_and_status(self):
         customer, customer_state = self.actor(20)
         await self.help_action(customer, customer_state, "new:bug")
