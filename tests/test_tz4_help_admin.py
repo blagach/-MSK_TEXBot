@@ -254,6 +254,40 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 buttons=[b for row in admin.answer.await_args.kwargs["reply_markup"].inline_keyboard for b in row]
                 self.assertIn(("⬅️ К статусам","help:queue"),[(b.text,b.callback_data) for b in buttons])
 
+    async def test_support_edit_keeps_photo_until_replaced_and_rejects_old_send(self):
+        user,state=self.actor(20)
+        await self.help_action(user,state,"new:help")
+        user.text="Исходный учебный текст"
+        user.photo=[Record(file_id="first-test-photo")]
+        await support_ui.compose_ticket(user,state)
+        original=(await state.get_data())["support_nonce"]
+        await self.help_action(user,state,f"edit:{original}")
+        user.photo=None
+        user.text="Исправленный учебный текст"
+        await support_ui.compose_ticket(user,state)
+        self.assertEqual((await state.get_data())["support_photo"],"first-test-photo")
+        second=(await state.get_data())["support_nonce"]
+        await self.help_action(user,state,f"edit:{second}")
+        user.text=None
+        user.photo=[Record(file_id="replacement-test-photo")]
+        await support_ui.compose_ticket(user,state)
+        final=await state.get_data()
+        self.assertEqual(final["support_text"],"Исправленный учебный текст")
+        self.assertEqual(final["support_photo"],"replacement-test-photo")
+        for nonce in (original,second):
+            await self.help_action(user,state,f"send:{nonce}")
+            self.assertEqual(await support_storage.list_tickets(requester_id=20),[])
+        await self.help_action(user,state,f"send:{final['support_nonce']}")
+        count=self.telegram.send_message.await_count
+        await self.help_action(user,state,f"send:{final['support_nonce']}")
+        tickets=await support_storage.list_tickets(requester_id=20)
+        self.assertEqual(len(tickets),1)
+        rows=await support_storage.history(tickets[0]["id"])
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0]["text"],rows[0]["photo_id"]),
+                         ("Исправленный учебный текст","replacement-test-photo"))
+        self.assertEqual(self.telegram.send_message.await_count,count)
+
     async def test_support_ticket_ownership_admin_reply_and_status(self):
         customer, customer_state = self.actor(20)
         await self.help_action(customer, customer_state, "new:bug")
