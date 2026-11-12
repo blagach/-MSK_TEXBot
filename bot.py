@@ -209,10 +209,62 @@ async def admin_recipients(permission):
     return await admin_access.staff(permission, settings.admin_ids, settings.owner_id)
 
 
-def respond_button(lead_id: int) -> InlineKeyboardButton:
+def respond_button(lead_id: int, *, private=False) -> InlineKeyboardButton:
+    if private:
+        return InlineKeyboardButton(text="📞 Получить контакт заказчика", callback_data=f"customer_contact:{lead_id}")
     return InlineKeyboardButton(
         text="📞 Получить контакт заказчика", url=f"https://t.me/{settings.bot_username}?start=contact_{lead_id}",
     )
+
+
+def revealed_contact_button(phone):
+    return InlineKeyboardButton(text=f"📞 {phone}", copy_text=CopyTextButton(text=phone))
+
+
+async def private_contact_card(lead, user_id):
+    text = lead_text(lead)
+    try:
+        phone = await customer_contacts.open_contact(storage.DB_PATH, user_id, lead["id"], saved_only=True)
+    except PermissionError:
+        phone = None
+    button = revealed_contact_button(phone) if phone else respond_button(lead["id"], private=True)
+    if phone:
+        text += f"\nКонтакт заказчика: {phone}"
+    return text, InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+@router.callback_query(F.data.startswith("customer_contact:"))
+async def reveal_customer_contact(callback: CallbackQuery) -> None:
+    message = callback.message
+    if not message or message.chat.type != "private" or message.chat.id != callback.from_user.id:
+        await callback.answer("Контакт доступен только в личном чате с ботом.", show_alert=True)
+        return
+    lead_id = storage.parse_id(callback.data, "customer_contact:")
+    if lead_id is None:
+        await callback.answer("Заявка недоступна", show_alert=True)
+        return
+    try:
+        phone = await customer_contacts.open_contact(storage.DB_PATH, callback.from_user.id, lead_id)
+    except PermissionError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    original_rows = message.reply_markup.inline_keyboard if message.reply_markup else [[respond_button(lead_id, private=True)]]
+    rows = [[revealed_contact_button(phone) if button.callback_data == callback.data else button
+             for button in row] for row in original_rows]
+    text = message.html_text or message.text or ""
+    line = f"Контакт заказчика: {phone}"
+    if line not in text:
+        text += "\n" + line
+    try:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            await callback.answer(f"Контакт: {phone}. Карточка не обновилась; откройте список заявок заново.", show_alert=True)
+            return
+    except TelegramAPIError:
+        await callback.answer("Не удалось обновить карточку. Доступ сохранён; откройте список заявок заново.", show_alert=True)
+        return
+    await callback.answer()
 
 
 async def init_db() -> None:
@@ -875,9 +927,8 @@ async def show_matching_leads(message, user_id, before=2**63 - 1):
         ) as cursor:
             leads = await cursor.fetchall()
     for lead in leads[:8]:
-        await message.answer(lead_text(lead), reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[respond_button(lead["id"])]],
-        ))
+        text, markup = await private_contact_card(lead, user_id)
+        await message.answer(text, reply_markup=markup)
     if len(leads) > 8:
         await message.answer("Другие подходящие заявки", reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[lead_key("Следующая страница", f"match:{leads[7]['id']}")]],
@@ -1221,8 +1272,8 @@ async def lead_date(message: Message, state: FSMContext) -> None:
         return
     try:
         work_date = work_datetime.parse_work_datetime(message.text)
-    except ValueError:
-        await message.answer("Укажите будущую дату и время по Москве: ДД.ММ.ГГГГ ЧЧ:ММ или завтра ЧЧ:ММ. Остальные данные сохранены.")
+    except ValueError as exc:
+        await message.answer(f"{exc} Время — московское. Остальные данные сохранены.")
         return
     await advance_lead(message, state, LeadForm.schedule, work_date=work_date)
 
@@ -1734,7 +1785,7 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
         ):
             continue
         delivered = await notify(bot, provider_id, public_text(text),
-                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead["id"])]]))
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead["id"], private=True)]]))
         await notification_reservations.record_outcome(
             lead["id"], provider_id, "confirmed" if delivered else "uncertain", storage.DB_PATH,
         )

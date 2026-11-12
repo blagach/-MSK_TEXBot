@@ -567,7 +567,11 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         for send in (channel, notification):
             button = send.kwargs["reply_markup"].inline_keyboard[0][0]
             self.assertEqual(button.text, "📞 Получить контакт заказчика")
-            self.assertTrue(button.url.endswith("?start=contact_2"))
+            if send is channel:
+                self.assertTrue(button.url.endswith("?start=contact_2"))
+            else:
+                self.assertEqual(button.callback_data,"customer_contact:2")
+                self.assertIsNone(button.url)
         await bot.start_offer(self.message, self.state, CommandObject(args="lead_2"))
         self.assertEqual((await self.state.get_data())["lead_id"], lead_id)
         self.assertEqual(await self.state.get_state(), bot.OfferForm.price.state)

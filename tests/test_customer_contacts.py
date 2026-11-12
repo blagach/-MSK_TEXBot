@@ -53,3 +53,44 @@ class ContactAccessTests(unittest.IsolatedAsyncioTestCase):
     async def test_customer_cannot_open_own_contact_as_provider(self):
         with sqlite3.connect(self.path) as db: db.execute('INSERT INTO provider_profiles VALUES(1,0)')
         with self.assertRaises(PermissionError): await contacts.open_contact(self.path,1,10)
+    async def test_inline_reveal_is_private_idempotent_and_preserves_other_buttons(self):
+        import os
+        os.environ.setdefault('BOT_TOKEN','123456:TEST')
+        import bot
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock,patch
+        from aiogram.types import InlineKeyboardMarkup,InlineKeyboardButton
+        from aiogram.exceptions import TelegramBadRequest
+        message=SimpleNamespace(chat=SimpleNamespace(type='private',id=2),text='Заявка №10',html_text='Заявка №10',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[bot.respond_button(10,private=True)],[InlineKeyboardButton(text='Назад',callback_data='back')]]),edit_text=AsyncMock(),answer=AsyncMock())
+        cb=SimpleNamespace(data='customer_contact:10',message=message,from_user=SimpleNamespace(id=2),answer=AsyncMock())
+        with patch.object(bot.storage,'DB_PATH',self.path):
+            await bot.reveal_customer_contact(cb)
+            call=message.edit_text.await_args
+            self.assertEqual(call.args[0].count('+79990000001'),1)
+            self.assertEqual(call.kwargs['reply_markup'].inline_keyboard[0][0].copy_text.text,'+79990000001')
+            self.assertEqual(call.kwargs['reply_markup'].inline_keyboard[1][0].callback_data,'back')
+            message.html_text=call.args[0]
+            await bot.reveal_customer_contact(cb)
+            self.assertEqual(message.edit_text.await_args.args[0].count('+79990000001'),1)
+            message.edit_text.side_effect=TelegramBadRequest(method='editMessageText',message='message cannot be edited')
+            await bot.reveal_customer_contact(cb)
+            self.assertTrue(cb.answer.await_args.kwargs['show_alert'])
+            message.answer.assert_not_awaited()
+            with patch.object(bot,'lead_text',return_value='Заявка №10'):
+                text,markup=await bot.private_contact_card({'id':10},2)
+                self.assertIn('+79990000001',text)
+                self.assertEqual(markup.inline_keyboard[0][0].copy_text.text,'+79990000001')
+
+            cb.from_user.id=3
+            message.edit_text.reset_mock()
+            await bot.reveal_customer_contact(cb)
+            message.edit_text.assert_not_awaited()
+            cb.from_user.id=2
+            with sqlite3.connect(self.path) as db:db.execute('UPDATE provider_profiles SET blocked=1 WHERE telegram_id=2')
+            await bot.reveal_customer_contact(cb)
+            message.edit_text.assert_not_awaited()
+            self.assertNotIn('+79990000001',cb.answer.await_args.args[0])
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM customer_contact_access').fetchone()[0],1)
+        self.assertIsNone(await contacts.open_contact(self.path,3,10,saved_only=True))

@@ -162,3 +162,18 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
                 await bot.form_navigation(self.callback('form_nav:back'),self.state)
                 self.assertEqual(await self.state.get_state(),bot.LeadForm.review.state)
                 self.assertEqual(await self.state.get_data(),{**original,'lead_editing':None})
+
+    async def test_date_error_keeps_all_fields_and_dot_input_advances(self):
+        await self.state.set_state(bot.LeadForm.date)
+        await self.state.set_data(dict(self.original))
+        self.message.text='25.12.2099 после 9 утра'
+        await bot.lead_date(self.message,self.state)
+        self.assertEqual(await self.state.get_data(),self.original)
+        self.assertEqual(await self.state.get_state(),bot.LeadForm.date.state)
+        self.assertIn('точное время',self.message.answer.await_args.args[0])
+        self.message.text='25.12.2099 09.00'
+        await bot.lead_date(self.message,self.state)
+        self.assertEqual(await self.state.get_state(),bot.LeadForm.schedule.state)
+        self.assertEqual((await self.state.get_data())['work_date'],'25.12.2099 09:00')
+        for k,v in self.original.items():
+            if k!='form_keyboard_id':self.assertEqual((await self.state.get_data())[k],v)

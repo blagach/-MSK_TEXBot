@@ -16,3 +16,11 @@ class WorkDatetimeTests(unittest.TestCase):
     def test_clock_converted_to_moscow(self):
         now=datetime(2026,12,31,22,0,tzinfo=timezone.utc)
         self.assertEqual(parse_work_datetime('сегодня 02:00',now=now),'01.01.2027 02:00')
+    def test_dot_separator_and_case_keep_moscow_date(self):
+        for value in ('Завтра 09.00','завтра 09:00','01.01.2027 09.00','01.01.2027 09:00'):
+            self.assertEqual(parse_work_datetime(value,now=self.now),'01.01.2027 09:00')
+    def test_ambiguous_time_is_not_invented_and_reason_is_specific(self):
+        with self.assertRaisesRegex(ValueError,'точное время'):
+            parse_work_datetime('01.01.2027 после 9 утра',now=self.now)
+        with self.assertRaisesRegex(ValueError,'уже прошли'):
+            parse_work_datetime('31.12.2026 09.00',now=self.now)
