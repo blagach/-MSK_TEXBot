@@ -30,3 +30,13 @@ class MapGuidanceTests(unittest.IsolatedAsyncioTestCase):
         state.clear.assert_not_awaited()
         self.assertIn('Пропустить',message.answer.await_args.args[0])
         self.assertIn('Точка на карте',str(support_content.GUIDES['customer']))
+
+    async def test_help_explains_current_contact_visibility_and_notification_navigation(self):
+        import support_content
+        guide=str(support_content.GUIDES['provider'])
+        faq=str(support_content.FAQ)
+        self.assertIn('отдельными сообщениями',guide)
+        self.assertNotIn('Откройте «🔎 Подходящие заявки»',guide)
+        self.assertIn('Как получить контакт заказчика?',faq)
+        self.assertIn('длинная анкета отклика не обязательна',faq)
+        self.assertIn('зарегистрированные исполнители',faq)
