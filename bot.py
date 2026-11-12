@@ -147,7 +147,7 @@ LEAD_PROMPTS = {
     LeadForm.equipment: "Выберите категорию техники:",
     LeadForm.equipment_type: "Выберите вид техники:",
     LeadForm.equipment_other: "Укажите название нужной техники.",
-    LeadForm.map_link: "Пришлите HTTPS-ссылку на карту или пропустите этот шаг.",
+    LeadForm.map_link: "Точка на карте (необязательно). Откройте Яндекс Карты, найдите место работ, нажмите «Поделиться» и отправьте сюда ссылку. Адрес уже сохранён; если точки нет, нажмите «Пропустить».",
     LeadForm.schedule: "Укажите продолжительность и график смен или пропустите этот шаг.",
     LeadForm.region: "Выберите регион:",
     LeadForm.area: "Укажите район или населённый пункт (например, СЗАО или Химки).",
@@ -363,6 +363,8 @@ async def show_lead_step(message: Message, state: FSMContext, step: State, **fie
             tuple(LEAD_EDIT_FIELDS.values()),
             lambda index, label: InlineKeyboardButton(text=label, callback_data=f"lead_review:{index}"),
         )
+    if step == LeadForm.map_link:
+        rows.append([InlineKeyboardButton(text="📍 Открыть Яндекс Карты", url="https://yandex.ru/maps/")])
     if step in (LeadForm.schedule, LeadForm.map_link):
         rows.append([InlineKeyboardButton(text="Пропустить", callback_data="lead_optional_skip")])
     if step == LeadForm.details:
@@ -1210,7 +1212,7 @@ async def lead_date(message: Message, state: FSMContext) -> None:
 async def lead_map_link(message: Message, state: FSMContext) -> None:
     value = message.text or ""
     if not re.fullmatch(r"https://[a-zA-Z0-9.-]+(?:[/?#][^\s]*)?", value) or len(value) > 500:
-        await message.answer("Нужна HTTPS-ссылка на карту. Без ссылки нажмите «Пропустить».")
+        await message.answer("Откройте Яндекс Карты → нужное место → «Поделиться» → «Скопировать ссылку» и отправьте её сюда. Можно оставить только адрес: нажмите «Пропустить».")
         return
     await advance_lead(message, state, LeadForm.date, map_link=value)
 
@@ -1322,7 +1324,7 @@ async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[
 
 LEAD_EDIT_FIELDS = {
     LeadForm.equipment: "Техника", LeadForm.region: "Регион", LeadForm.area: "Район",
-    LeadForm.place: "Адрес", LeadForm.map_link: "Ссылка на карту", LeadForm.date: "Дата и время",
+    LeadForm.place: "Адрес", LeadForm.map_link: "Точка на карте", LeadForm.date: "Дата и время",
     LeadForm.schedule: "График смен", LeadForm.details: "Описание",
     LeadForm.attachments: "Допоборудование",
     LeadForm.payment: "Оплата", LeadForm.phone: "Телефон",
