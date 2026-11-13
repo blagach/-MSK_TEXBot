@@ -1,5 +1,7 @@
 """Aiogram router for provider self-service. Attach after init_schema."""
 from aiogram import F, Router
+from aiogram.filters import StateFilter
+from uuid import uuid4
 import aiosqlite
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
@@ -10,7 +12,7 @@ import provider_registry as registry
 import payment_preferences as payments
 import storage
 import equipment_catalog
-from draft_storage import draft_slot
+from draft_storage import SQLiteDraftStorage, draft_slot
 
 router = Router()
 router.message.filter(F.chat.type == "private")
@@ -21,6 +23,7 @@ MY_OFFERS = "📋 Мои отклики"
 OFFER_DRAFT = "▶️ Продолжить отклик"
 HOME = "🏠 Главное меню"
 REGISTER_PROVIDER = "🚜 Зарегистрироваться как исполнитель"
+CANCEL_REGISTRATION = "Отменить регистрацию"
 LEGACY_PROVIDER = "🛠 Обновить быструю регистрацию"
 MY_TECH = "🚜 Моя техника"
 MY_REGIONS = "📍 Мои регионы"
@@ -253,6 +256,80 @@ async def alert_preference_action(callback: CallbackQuery, state: FSMContext):
     await show_alert_preferences(callback.message, state, kind, group)
 
 
+def registration_keyboard():
+    return section_keyboard((CANCEL_REGISTRATION,), (HOME,))
+
+
+async def show_registration_cancel_confirmation(message, state):
+    await retire_inline_panel(message, state, "registration_cancel_panel")
+    nonce = uuid4().hex
+    sent = await message.answer(
+        "Отменить незавершённую регистрацию? Заполненные поля сохранятся в архиве. "
+        "Существующий профиль, техника и другие черновики не изменятся.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Да, отменить", callback_data=f"registration_cancel:yes:{nonce}")],
+            [InlineKeyboardButton(text="Нет, продолжить", callback_data=f"registration_cancel:no:{nonce}")],
+        ]),
+    )
+    await state.update_data(registration_cancel_nonce=nonce, registration_cancel_panel=sent.message_id)
+
+
+async def registration_cancel_pending(message, state):
+    original = (await state.get_data()).get("registration_original_state")
+    if not original or original != await state.get_state():
+        return False
+    await show_registration_cancel_confirmation(message, state)
+    return True
+
+
+@router.message(StateFilter(Register.consent, Register.name, Register.phone, Register.payment), F.text == CANCEL_REGISTRATION)
+async def ask_cancel_registration(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current not in (Register.consent.state, Register.name.state, Register.phone.state, Register.payment.state):
+        return
+    if await registration_cancel_pending(message, state):
+        return
+    data = await state.get_data()
+    if current == Register.payment.state:
+        await retire_payment_panel(message, state)
+    await state.update_data(registration_original_state=current, registration_original_data=data)
+    await show_registration_cancel_confirmation(message, state)
+
+
+@router.callback_query(F.data.startswith("registration_cancel:"))
+async def confirm_cancel_registration(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    parts = callback.data.split(":")
+    current = await state.get_state()
+    if (current not in (Register.consent.state, Register.name.state, Register.phone.state, Register.payment.state)
+            or data.get("registration_original_state") != current
+            or not isinstance(callback.message, Message) or len(parts) != 3
+            or parts[1] not in {"yes", "no"} or parts[2] != data.get("registration_cancel_nonce")
+            or callback.message.message_id != data.get("registration_cancel_panel")
+            or callback.message.chat.type != "private" or callback.message.chat.id != callback.from_user.id
+            or callback.from_user.id != state.key.user_id):
+        await callback.answer("Подтверждение устарело. Откройте анкету снова.")
+        return
+    await retire_inline_panel(callback.message, state, "registration_cancel_panel")
+    if parts[1] == "no":
+        await state.set_data(data["registration_original_data"])
+        await state.set_state(data["registration_original_state"])
+        await callback.answer()
+        await resume_provider_step(callback.message, state, data["registration_original_state"])
+        return
+    archive = draft_slot(state, f"cancelled_provider_{parts[2]}")
+    if isinstance(state.storage, SQLiteDraftStorage):
+        await state.storage.transfer(state.key, archive.key)
+    else:
+        await archive.set_data(await state.get_data())
+        await archive.set_state(current)
+        await state.clear()
+    await callback.answer("Регистрация отменена. Поля сохранены в архиве.", show_alert=True)
+    await callback.message.answer("Меню исполнителя", reply_markup=await executor_keyboard(
+        callback.from_user.id, state, tools=True,
+    ))
+
+
 @router.message(F.text == REGISTER_PROVIDER)
 async def begin_register(message: Message, state: FSMContext):
     if await state.get_state() is not None:
@@ -265,23 +342,28 @@ async def begin_register(message: Message, state: FSMContext):
     await message.answer(
         "Для регистрации сохраняем имя или название компании, телефон, "
         "Telegram ID и сведения о технике. Телефон не публикуем в канале. "
-        "Согласны на обработку этих данных для подбора заявок? Ответьте «Да» или «Нет»."
+        "Согласны на обработку этих данных для подбора заявок? Ответьте «Да» или «Нет».",
+        reply_markup=registration_keyboard(),
     )
 
 
 @router.message(Register.consent)
 async def consent(message: Message, state: FSMContext):
+    if await registration_cancel_pending(message, state):
+        return
     if not message.text or message.text.strip().lower() != "да":
         await state.clear()
         await message.answer("Регистрация не выполнена: согласие не получено.")
         return
     await state.update_data(consent=True)
     await state.set_state(Register.name)
-    await message.answer("Укажите имя или название компании.")
+    await message.answer("Укажите имя или название компании.", reply_markup=registration_keyboard())
 
 
 @router.message(Register.name)
 async def name(message: Message, state: FSMContext):
+    if await registration_cancel_pending(message, state):
+        return
     try:
         name = registry._validate_name(message.text)
     except ValueError as exc:
@@ -289,11 +371,13 @@ async def name(message: Message, state: FSMContext):
         return
     await state.update_data(name=name)
     await state.set_state(Register.phone)
-    await message.answer("Укажите телефон: +7XXXXXXXXXX или 8XXXXXXXXXX.")
+    await message.answer("Укажите телефон: +7XXXXXXXXXX или 8XXXXXXXXXX.", reply_markup=registration_keyboard())
 
 
 @router.message(Register.phone)
 async def phone(message: Message, state: FSMContext):
+    if await registration_cancel_pending(message, state):
+        return
     try:
         data = await state.get_data()
         await registry.register_provider(message.from_user.id, data["name"], message.text,
@@ -380,6 +464,8 @@ async def payment_selection_callback(callback: CallbackQuery, state: FSMContext)
 
 @router.message(Register.payment)
 async def provider_payment(message: Message, state: FSMContext):
+    if await registration_cancel_pending(message, state):
+        return
     methods = {part.strip() for part in (message.text or "").split(",")}
     if not methods or not methods <= payments.METHODS:
         await message.answer("Укажите формы оплаты точно из списка, через запятую.")
@@ -751,7 +837,9 @@ async def edit_payment_methods(callback: CallbackQuery, state: FSMContext):
 
 async def resume_provider_step(message, state, current):
     data = await state.get_data()
-    if current == AlertPreferences.select.state:
+    if data.get("registration_original_state") == current and data.get("registration_cancel_nonce"):
+        await show_registration_cancel_confirmation(message, state)
+    elif current == AlertPreferences.select.state:
         await show_alert_preferences(message, state, data["alert_kind"], data.get("alert_group"))
     elif current in (AddMachine.category.state, AddMachine.equipment_type.state):
         await machine_catalog(message, state, data.get("machine_group"))
@@ -775,4 +863,6 @@ async def resume_provider_step(message, state, current):
             Register.name.state: "Укажите имя или название компании.",
             Register.phone.state: "Укажите телефон в формате +7XXXXXXXXXX или 8XXXXXXXXXX.",
         }
-        await message.answer(prompts[current], reply_markup=section_keyboard((HOME,)))
+        await message.answer(prompts[current], reply_markup=registration_keyboard() if current in (
+            Register.consent.state, Register.name.state, Register.phone.state,
+        ) else section_keyboard((HOME,)))

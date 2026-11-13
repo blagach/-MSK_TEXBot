@@ -37,6 +37,93 @@ import support_ui
 
 
 class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def test_early_registration_cancel_requires_confirmation_archives_and_releases_entry(self):
+        backing = bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        await provider_registry.register_provider(20, "Сохранённый профиль", "+79991234567", True, str(self.database))
+        machine = await provider_registry.add_equipment(20, "автокран", "Сохранённая техника", "Москва", "весь регион", str(self.database))
+
+        async def business_rows():
+            async with aiosqlite.connect(self.database) as db:
+                names = [r[0] for r in await (await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='form_drafts'"
+                )).fetchall()]
+                return {name: sorted(await (await db.execute('SELECT * FROM "' + name + '"')).fetchall(), key=repr) for name in names}
+
+        for user_id in (20, 30):
+            owner, memory_state = self.actor(user_id)
+            owner.message_id = 500
+            owner.answer.return_value = Record(message_id=500)
+            for step, values in ((provider_ui.Register.consent, {}),
+                                 (provider_ui.Register.name, {"consent": True}),
+                                 (provider_ui.Register.phone, {"consent": True, "name": "Несохранённая правка"}),
+                                 (provider_ui.Register.payment, {"payment_selection": [payments.CASH]})):
+                with self.subTest(user=user_id, step=step.state):
+                    state = FSMContext(backing, memory_state.key)
+                    await state.set_state(step)
+                    await state.set_data(values)
+                    lead = bot.draft_slot(state, "lead")
+                    await lead.set_state(bot.LeadForm.region)
+                    await lead.set_data({"equipment": "автокран", "marker": "независимый"})
+                    before = await business_rows()
+                    owner.text = provider_ui.CANCEL_REGISTRATION
+                    await provider_ui.ask_cancel_registration(owner, state)
+                    nonce = (await state.get_data())["registration_cancel_nonce"]
+                    foreign = self.callback(owner, f"registration_cancel:yes:{nonce}")
+                    foreign.from_user = Record(id=99)
+                    await provider_ui.confirm_cancel_registration(foreign, state)
+                    self.assertEqual(await state.get_state(), step.state)
+                    await provider_ui.confirm_cancel_registration(self.callback(owner, f"registration_cancel:no:{nonce}"), state)
+                    self.assertEqual(await state.get_state(), step.state)
+                    restored = await state.get_data()
+                    for key, value in values.items():
+                        self.assertEqual(restored[key], value)
+                    self.assertNotIn("registration_cancel_nonce", restored)
+                    self.assertEqual(await business_rows(), before)
+                    # Save the confirmation through /menu and restart before confirming.
+                    await provider_ui.ask_cancel_registration(owner, state)
+                    if step == provider_ui.Register.payment:
+                        await provider_ui.payment_selection_callback(self.callback(owner, "provider_payment:save"), state)
+                        self.assertEqual(await business_rows(), before)
+                    old_nonce = (await state.get_data())["registration_cancel_nonce"]
+                    await bot.pause_form(owner, state)
+                    state = FSMContext(bot.SQLiteDraftStorage(str(self.database)), memory_state.key)
+                    owner.text = bot.PROVIDER_ACTION_DRAFT
+                    await bot.resume_auxiliary_action(owner, state)
+                    nonce = (await state.get_data())["registration_cancel_nonce"]
+                    self.assertNotEqual(nonce, old_nonce)
+                    await provider_ui.confirm_cancel_registration(self.callback(owner, f"registration_cancel:yes:{old_nonce}"), state)
+                    self.assertEqual(await state.get_state(), step.state)
+                    yes = self.callback(owner, f"registration_cancel:yes:{nonce}")
+                    await provider_ui.confirm_cancel_registration(yes, state)
+                    self.assertIsNone(await state.get_state())
+                    self.assertIsNone(await bot.draft_slot(state, "provider_action").get_state())
+                    archived = bot.draft_slot(state, f"cancelled_provider_{nonce}")
+                    self.assertEqual((await archived.get_data())["registration_original_state"], step.state)
+                    self.assertEqual((await archived.get_data())["registration_original_data"], restored)
+                    self.assertEqual(await business_rows(), before)
+                    self.assertEqual(await lead.get_data(), {"equipment": "автокран", "marker": "независимый"})
+                    self.assertEqual(await lead.get_state(), bot.LeadForm.region.state)
+                    if user_id == 20:
+                        buttons = [b.text for row in owner.answer.await_args.kwargs["reply_markup"].keyboard for b in row]
+                        self.assertIn("➕ Добавить технику", buttons)
+                        await provider_ui.machine_action(self.callback(owner, f"machine:edit:{machine}"), state)
+                        self.assertEqual(await state.get_state(), provider_ui.AddMachine.review.state)
+                        await provider_ui.machine_edit_field(self.callback(owner, "machine_field:cancel"), state)
+                        await provider_ui.begin_machine(owner, state)
+                        self.assertEqual(await state.get_state(), provider_ui.AddMachine.category.state)
+                        # Test fixture only: resolve this separate probe before the next registration.
+                        await state.clear()
+                    await provider_ui.begin_register(owner, state)
+                    self.assertEqual(await state.get_state(), provider_ui.Register.consent.state)
+                    current_data = await state.get_data()
+                    await provider_ui.confirm_cancel_registration(yes, state)
+                    self.assertEqual(await state.get_state(), provider_ui.Register.consent.state)
+                    self.assertEqual(await state.get_data(), current_data)
+                    self.assertEqual(await business_rows(), before)
+                    await state.clear()
+        self.telegram.send_message.assert_not_awaited()
+
     async def test_paused_provider_form_cannot_be_replaced_by_another_entry(self):
         await provider_registry.register_provider(20, "Учебный профиль", "+79991234567", True, str(self.database))
         machine = await provider_registry.add_equipment(20, "автокран", "Учебная техника", "Москва", "весь регион", str(self.database))
