@@ -37,11 +37,13 @@ class ContactAccessTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock,patch
         from aiogram.fsm.context import FSMContext
         from aiogram.fsm.storage.base import StorageKey
-        from aiogram.fsm.storage.memory import MemoryStorage
-        from aiogram.exceptions import TelegramNetworkError
+        from draft_storage import SQLiteDraftStorage
+        from aiogram.exceptions import TelegramNetworkError,TelegramBadRequest
         message=SimpleNamespace(chat=SimpleNamespace(type='private',id=2),from_user=SimpleNamespace(id=2),
             answer=AsyncMock(return_value=SimpleNamespace(message_id=55)),bot=SimpleNamespace(edit_message_text=AsyncMock()))
-        state=FSMContext(MemoryStorage(),StorageKey(bot_id=1,chat_id=2,user_id=2))
+        drafts=SQLiteDraftStorage(self.path)
+        await drafts.init_schema()
+        state=FSMContext(drafts,StorageKey(bot_id=1,chat_id=2,user_id=2))
         await state.set_state(bot.LeadForm.place)
         await state.set_data({'place':'Черновик','phone':'+79990000002'})
         with patch.object(bot.storage,'DB_PATH',self.path),patch.object(bot,'get_lead',new=AsyncMock(return_value={'id':10})),patch.object(bot,'lead_text',return_value='Заявка №10 · техника · адрес'):
@@ -49,9 +51,20 @@ class ContactAccessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Заявка №10',message.answer.await_args.args[0])
             self.assertIn('+79990000001',message.answer.await_args.args[0])
             self.assertEqual(message.answer.await_args.kwargs['reply_markup'].inline_keyboard[0][0].copy_text.text,'+79990000001')
+            state=FSMContext(SQLiteDraftStorage(self.path),state.key)
             await bot.start_offer(message,state,SimpleNamespace(args='contact_10'))
             message.answer.assert_awaited_once()
             self.assertEqual(message.bot.edit_message_text.await_args.kwargs['message_id'],55)
+            message.bot.edit_message_text.side_effect=TelegramBadRequest(method='editMessageText',message='Bad Request: message is not modified')
+            with self.assertLogs(level='INFO') as logs:
+                await bot.start_offer(message,state,SimpleNamespace(args='contact_10'))
+            self.assertIn('already current',logs.output[0])
+            self.assertFalse(any('WARNING' in entry for entry in logs.output))
+            message.bot.edit_message_text.side_effect=TelegramBadRequest(method='editMessageText',message='secret recipient and token')
+            with self.assertLogs(level='WARNING') as logs:
+                await bot.start_offer(message,state,SimpleNamespace(args='contact_10'))
+            self.assertIn('bad_request',logs.output[0])
+            self.assertNotIn('secret',str(logs.output))
             message.bot.edit_message_text.side_effect=TelegramNetworkError(method='editMessageText',message='timeout')
             await bot.start_offer(message,state,SimpleNamespace(args='contact_10'))
             message.answer.assert_awaited_once()

@@ -689,7 +689,6 @@ async def confirm_cancel_lead_draft(callback: CallbackQuery, state: FSMContext):
     if await draft.get_state() != data['cancel_draft_state'] or await draft.get_data() != data['cancel_draft_data']:
         await callback.answer("Черновик изменился. Откройте меню заказчика заново.", show_alert=True)
         return
-    await callback.answer()
     if action == "yes":
         archive = draft_slot(state, f"cancelled_lead_{uuid4().hex}")
         if isinstance(state.storage, SQLiteDraftStorage):
@@ -698,6 +697,9 @@ async def confirm_cancel_lead_draft(callback: CallbackQuery, state: FSMContext):
             await archive.set_data(await draft.get_data())
             await archive.set_state(await draft.get_state())
             await draft.clear()
+        await callback.answer("Черновик отменён. Данные сохранены в архиве.", show_alert=True)
+    else:
+        await callback.answer()
     await clear_form_keyboard(message, state)
     await state.clear()
     await customer_menu(message, state)
@@ -852,8 +854,13 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
             try:
                 await message.bot.edit_message_text(text, chat_id=message.chat.id,
                     message_id=saved["message_id"], reply_markup=markup)
-            except TelegramAPIError:
-                logging.warning("Could not refresh saved private contact card")
+            except TelegramBadRequest as exc:
+                if "message is not modified" in exc.message.lower():
+                    logging.info("Saved private contact card is already current")
+                else:
+                    logging.warning("Could not refresh saved private contact card (bad_request)")
+            except TelegramAPIError as exc:
+                logging.warning("Could not refresh saved private contact card (%s)", type(exc).__name__)
             return
         if saved.get("delivery_attempted"):
             return  # An uncertain send must not trigger automatic duplicate delivery.

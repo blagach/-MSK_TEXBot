@@ -899,6 +899,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.confirm_cancel_lead_draft(foreign,self.state)
         self.assertEqual(await draft.get_data(),original)
         await bot.confirm_cancel_lead_draft(yes,self.state)
+        yes.answer.assert_awaited_once_with("Черновик отменён. Данные сохранены в архиве.", show_alert=True)
         await bot.confirm_cancel_lead_draft(yes,self.state)
         self.assertIsNone(await draft.get_state())
         async with aiosqlite.connect(storage.DB_PATH) as db:
