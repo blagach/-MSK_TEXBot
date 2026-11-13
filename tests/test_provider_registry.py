@@ -58,9 +58,6 @@ class ProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await registry.list_equipment(100, self.db))[0]["description"], "4 тонны")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
     async def test_owner_edits_all_equipment_fields_and_pauses_without_deleting(self):
         await registry.register_provider(100,'Исполнитель','+79991234567',True,self.db)
         item=await registry.add_equipment(100,'каток','Старая карточка','Москва','ЦАО',self.db)
@@ -75,3 +72,7 @@ if __name__ == "__main__":
         self.assertTrue(await registry.update_equipment(100,item,category=row['category'],description=row['description'],region=row['region'],area=row['area'],active=True,db_path=self.db))
         self.assertEqual(await registry.matching_providers('мини-погрузчик','Московская область','Химки',self.db),[100])
         self.assertEqual((await registry.list_equipment(100,self.db))[0]['id'],item)
+
+
+if __name__ == "__main__":
+    unittest.main()
