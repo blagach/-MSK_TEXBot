@@ -3,6 +3,10 @@ import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import patch
+from pathlib import Path
+import sqlite3
+import tempfile
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -25,6 +29,46 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
     def callback(self,data,message_id=44):
         self.message.message_id=message_id
         return SimpleNamespace(data=data,message=self.message,from_user=SimpleNamespace(id=12),answer=AsyncMock())
+
+    async def test_review_survives_sqlite_restart_without_submission_or_stale_send(self):
+        from draft_storage import SQLiteDraftStorage, draft_slot
+
+        path = Path(tempfile.mkdtemp(prefix='lead-preview-')) / 'isolated.sqlite'
+        saved = SQLiteDraftStorage(str(path))
+        await saved.init_schema()
+        active = FSMContext(saved, self.state.key)
+        await active.set_state(bot.LeadForm.review)
+        await active.set_data(dict(self.original))
+        self.message.answer.return_value = SimpleNamespace(message_id=901)
+        telegram = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(bot, 'submit_lead', new=AsyncMock()) as submit:
+            await bot.pause_form(self.message, active)
+            restarted = FSMContext(SQLiteDraftStorage(str(path)), active.key)
+            self.assertIsNone(await restarted.get_state())
+            self.assertTrue(await bot.resume_draft(self.message, restarted, 'lead'))
+            self.assertEqual(await restarted.get_state(), bot.LeadForm.review.state)
+            self.assertIsNone(await draft_slot(restarted, 'lead').get_state())
+            restored = await restarted.get_data()
+            for key, value in self.original.items():
+                if key != 'form_keyboard_id':
+                    self.assertEqual(restored[key], value, key)
+            self.assertEqual(restored['form_keyboard_id'], 901)
+            panel = self.message.answer.await_args
+            for value in ('мини-экскаватор', 'Москва', 'ЦАО', 'Адрес',
+                          'https://yandex.ru/maps/', '25.12.2099 09:00', 'Смена',
+                          'Описание', 'Вилы', 'Любая форма оплаты', '+79990000001'):
+                self.assertIn(value, panel.args[0])
+            actions = [b.callback_data for row in panel.kwargs['reply_markup'].inline_keyboard for b in row]
+            self.assertIn('lead_review:send', actions)
+            self.assertIn('lead_review:edit', actions)
+            stale = self.callback('lead_review:send', message_id=44)
+            await bot.lead_review_action(stale, restarted, telegram)
+            stale.answer.assert_awaited_once_with('Этот шаг уже неактуален.')
+            self.assertEqual(await restarted.get_data(), restored)
+            submit.assert_not_awaited()
+            telegram.send_message.assert_not_awaited()
+        with sqlite3.connect(path) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM lead_draft_submissions').fetchone()[0], 0)
     async def test_every_edit_field_enters_expected_step_and_preserves_all_values(self):
         for i,field in enumerate(bot.LEAD_EDIT_FIELDS):
             with self.subTest(field=field.state):
