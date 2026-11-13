@@ -139,12 +139,41 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_guides_search_and_training_do_not_create_records(self):
         message, state = self.actor(20)
+        illustrated = {"customer": {0, 2, 3, 4, 5}, "provider": {3, 5}}
+        # Publication of real phone captures is a separate owner decision.
+        # Route/keyboard coverage must also run without private screenshots.
+        assets = tempfile.TemporaryDirectory()
+        self.addCleanup(assets.cleanup)
+        asset_patcher = patch.object(support_ui, "ASSETS", Path(assets.name))
+        asset_patcher.start()
+        self.addCleanup(asset_patcher.stop)
+        import base64
+        fixture = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=')
+        for role, indexes in illustrated.items():
+            for index in indexes:
+                (Path(assets.name) / f"{role}-{index+1}.png").write_bytes(fixture)
         for role in ("customer", "provider"):
-            await self.help_action(message, state, f"guide:{role}:0")
-            self.assertIn(f"1/{len(support_ui.GUIDES[role])}", message.answer.await_args.args[0])
-            await self.help_action(message, state, f"guide:{role}:{len(support_ui.GUIDES[role])-1}")
-            buttons = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
-            self.assertIn("Завершить инструкцию", [row[0].text for row in buttons])
+            for index in range(len(support_ui.GUIDES[role])):
+                message.answer.reset_mock()
+                message.answer_photo.reset_mock()
+                await self.help_action(message, state, f"guide:{role}:{index}")
+                if index in illustrated[role]:
+                    message.answer.assert_not_awaited()
+                    message.answer_photo.assert_awaited_once()
+                    sent = message.answer_photo.await_args
+                    text = sent.kwargs["caption"]
+                    self.assertLessEqual(len(text), 1024)
+                    self.assertTrue(Path(sent.args[0].path).is_file())
+                else:
+                    message.answer_photo.assert_not_awaited()
+                    message.answer.assert_awaited_once()
+                    sent = message.answer.await_args
+                    text = sent.args[0]
+                self.assertIn(f"{index+1}/{len(support_ui.GUIDES[role])}", text)
+                labels = [button.text for row in sent.kwargs["reply_markup"].inline_keyboard for button in row]
+                if index:
+                    self.assertIn("⬅️ Назад", labels)
+                self.assertIn("Завершить инструкцию" if index == len(support_ui.GUIDES[role])-1 else "Далее ➡️", labels)
             for step in range(4):
                 await self.help_action(message, state, f"try:{role}:{step}:1")
             self.assertIn("Тренировка завершена", message.answer.await_args.args[0])

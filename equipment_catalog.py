@@ -33,11 +33,14 @@ def button_rows(labels, button):
     rows = []
     pair = []
     for index, label in enumerate(labels):
-        if len(label) > 21 and pair:
+        # The live phone review showed 17-character group names truncated in
+        # two columns once the icon and Telegram button padding were included.
+        wide = len(label) > 16
+        if wide and pair:
             rows.append(pair)
             pair = []
         pair.append(button(index, DISPLAY_LABELS.get(label, label[0].upper() + label[1:])))
-        if len(pair) == 2 or len(label) > 21:
+        if len(pair) == 2 or wide:
             rows.append(pair)
             pair = []
     if pair:

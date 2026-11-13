@@ -16,6 +16,21 @@ EXPECTED = {
 }
 
 class CatalogContractTests(unittest.TestCase):
+    def test_phone_truncated_groups_and_long_types_get_their_own_row(self):
+        labels=[name for name,_ in catalog.GROUPS]
+        rows=catalog.button_rows(labels,lambda index,text:(index,text))
+        for group in ('Краны и подъёмники','Коммунальная техника'):
+            index=labels.index(group)
+            row=next(row for row in rows if any(button[0]==index for button in row))
+            self.assertEqual(row,[(index,catalog.DISPLAY_LABELS[group])])
+        self.assertEqual([i for row in rows for i,_ in row],list(range(10)))
+        self.assertTrue(any(len(row)==2 for row in rows))
+        for _,kinds in catalog.GROUPS:
+            rows=catalog.button_rows(kinds,lambda index,text:(index,text))
+            for row in rows:
+                if any(len(kinds[index])>16 for index,_ in row):
+                    self.assertEqual(len(row),1)
+
     def test_exact_group_order_count_and_unique_positions(self):
         self.assertEqual(tuple(name for name, _ in catalog.GROUPS), tuple(name for name, _ in EXPECTED.values()))
         positions = [kind for _, kinds in catalog.GROUPS for kind in kinds]
