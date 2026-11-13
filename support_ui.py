@@ -159,12 +159,12 @@ async def show_ticket(message, ticket_id, user_id, admin, offset=0, origin=""):
     if len(rows) > HISTORY_PAGE:
         actions.append((("Более ранние сообщения", f"ticket:{ticket_id}:{offset + HISTORY_PAGE}{suffix}"),))
     if ticket["requester_id"] == user_id and ticket["status"] != "closed":
-        actions.append((("✉️ Написать сообщение", f"follow:{ticket_id}"),))
+        actions.append((("✉️ Написать сообщение", f"follow:{ticket_id}{suffix}"),))
     if ticket["requester_id"] == user_id:
         if ticket["status"] == "closed":
-            actions.append((("Открыть повторно", f"owner_reopen:{ticket_id}:{ticket['status_version']}"),))
+            actions.append((("Открыть повторно", f"owner_reopen:{ticket_id}:{ticket['status_version']}{suffix}"),))
         else:
-            actions.append((("Закрыть обращение", f"owner_close:{ticket_id}:{ticket['status_version']}"),))
+            actions.append((("Закрыть обращение", f"owner_close:{ticket_id}:{ticket['status_version']}{suffix}"),))
     if admin and ticket["status"] != "closed":
         if ticket["status"] == "new":
             actions.append((("Взять в работу", f"status:{ticket_id}:in_progress{suffix}"),))
@@ -300,7 +300,9 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         await ticket_list(message, None, status=parts[1], offset=int(parts[2]))
     elif action == "ticket" and len(parts) >= 3 and positive_id(parts[1]) and page_number(parts[2], HISTORY_PAGE) is not None:
         await show_ticket(message, int(parts[1]), user_id, admin, int(parts[2]), ticket_list_origin(parts[3:], admin))
-    elif action in {"owner_close", "owner_reopen", "owner_confirm"} and len(parts) == 3 and positive_id(parts[1]) and re.fullmatch(r"\d{1,18}", parts[2]):
+    elif action in {"owner_close", "owner_reopen", "owner_confirm"} and len(parts) >= 3 and positive_id(parts[1]) and re.fullmatch(r"\d{1,18}", parts[2]):
+        origin = ticket_list_origin(parts[3:], admin)
+        suffix = f":{origin}" if origin else ""
         ticket = await store.ticket(int(parts[1]), user_id)
         if ticket is None:
             await message.answer("Обращение недоступно.", reply_markup=keys(BACK))
@@ -310,8 +312,8 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
             return
         if action == "owner_close":
             await message.answer(f"Закрыть обращение №{ticket['id']}?", reply_markup=keys(
-                (("Подтвердить закрытие", f"owner_confirm:{ticket['id']}:{ticket['status_version']}"),),
-                (("Вернуться", f"ticket:{ticket['id']}:0"),),
+                (("Подтвердить закрытие", f"owner_confirm:{ticket['id']}:{ticket['status_version']}{suffix}"),),
+                (("Вернуться", f"ticket:{ticket['id']}:0{suffix}"),),
             ))
             return
         target = "closed" if action == "owner_confirm" else "new"
@@ -319,7 +321,7 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         if changed and target == "new":
             await notify_admins(bot, support_admin_ids, support_group_id, ticket["id"], ticket["kind"], service_owner_id)
         await message.answer("Статус обновлён." if changed else "Статус уже изменён.")
-        await show_ticket(message, ticket["id"], user_id, admin)
+        await show_ticket(message, ticket["id"], user_id, admin, origin=origin)
     elif action == "close" and len(parts) >= 2 and positive_id(parts[1]):
         origin = ticket_list_origin(parts[2:], admin)
         suffix = f":{origin}" if origin else ""
@@ -333,12 +335,13 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
             await admin_access.record(user_id, "support_status", target_id=int(parts[1]), details={"status": parts[2]})
         await message.answer(f"Статус обновлён: {STATUSES[parts[2]]}." if changed else "Статус уже изменён или обращение недоступно.")
         await show_ticket(message, int(parts[1]), user_id, admin, origin=ticket_list_origin(parts[3:], admin))
-    elif action == "follow" and len(parts) == 2 and positive_id(parts[1]):
+    elif action == "follow" and len(parts) >= 2 and positive_id(parts[1]):
         ticket = await store.ticket(int(parts[1]), user_id)
         if not ticket or ticket["status"] == "closed" or await state.get_state() is not None:
             await message.answer("Обращение недоступно или открыта другая анкета.")
             return
-        await state.set_data({"support_ticket": int(parts[1]), "support_nonce": uuid4().hex})
+        await state.set_data({"support_ticket": int(parts[1]), "support_nonce": uuid4().hex,
+                              "support_origin": ticket_list_origin(parts[2:], admin)})
         await state.set_state(Support.requester_reply)
         await message.answer("Введите сообщение для поддержки.", reply_markup=keys(BACK))
     elif action == "reply" and len(parts) >= 2 and positive_id(parts[1]):
@@ -427,8 +430,10 @@ async def requester_reply(message: Message, state: FSMContext, bot, support_admi
         return
     await state.clear()
     await notify_admins(bot, support_admin_ids, support_group_id, ticket_id, ticket["kind"], service_owner_id)
+    origin = data.get("support_origin")
+    suffix = f":{origin}" if origin else ""
     await message.answer("Сообщение сохранено в обращении.", reply_markup=keys(
-        (("Открыть обращение", f"ticket:{ticket_id}:0"),), BACK,
+        (("Открыть обращение", f"ticket:{ticket_id}:0{suffix}"),), BACK,
     ))
 
 

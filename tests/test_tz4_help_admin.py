@@ -680,6 +680,56 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         markup = admin.answer.await_args.kwargs["reply_markup"]
         self.assertIn("help:list:new:8", [b.callback_data for row in markup.inline_keyboard for b in row])
 
+    async def test_requester_actions_keep_second_ticket_page_without_losing_history(self):
+        for index in range(9):
+            await support_storage.create_ticket(20, 'help', f'page-{index}', f'Учебное сообщение {index}', None)
+        user, state = self.actor(20)
+
+        def actions():
+            return {b.text: b.callback_data.removeprefix('help:')
+                    for row in user.answer.await_args.kwargs['reply_markup'].inline_keyboard for b in row}
+
+        await self.help_action(user, state, 'mine:8')
+        ticket_action = next(value for value in actions().values() if value.startswith('ticket:'))
+        ticket = int(ticket_action.split(':')[1])
+        before = [(r['id'], r['text']) for r in await support_storage.history(ticket)]
+        await self.help_action(user, state, ticket_action)
+        self.assertEqual(actions()['⬅️ К обращениям'], 'mine:8')
+        await self.help_action(user, state, actions()['Закрыть обращение'])
+        cancel = actions()['Вернуться']
+        await self.help_action(user, state, cancel)
+        self.assertEqual((await support_storage.ticket(ticket))['status'], 'new')
+        self.assertEqual(actions()['⬅️ К обращениям'], 'mine:8')
+        await self.help_action(user, state, actions()['Закрыть обращение'])
+        await self.help_action(user, state, actions()['Подтвердить закрытие'])
+        self.assertEqual((await support_storage.ticket(ticket))['status'], 'closed')
+        self.assertEqual(actions()['⬅️ К обращениям'], 'mine:8')
+        self.telegram.send_message.assert_not_awaited()
+        await self.help_action(user, state, actions()['Открыть повторно'])
+        self.assertEqual(actions()['⬅️ К обращениям'], 'mine:8')
+        self.assertEqual(self.telegram.send_message.await_count, len(self.admins))
+        self.assertEqual([(r['id'], r['text']) for r in await support_storage.history(ticket)], before)
+        self.telegram.send_message.reset_mock()
+        await self.help_action(user, state, actions()['✉️ Написать сообщение'])
+        user.text = 'Учебное уточнение'
+        await support_ui.requester_reply(user, state, self.telegram, self.admins)
+        await self.help_action(user, state, actions()['Открыть обращение'])
+        self.assertEqual(actions()['⬅️ К обращениям'], 'mine:8')
+        self.assertEqual((await support_storage.ticket(ticket))['status'], 'new')
+        self.assertEqual(len(await support_storage.list_tickets(requester_id=20)), 9)
+        self.assertEqual(len(await support_storage.history(ticket)), 2)
+        self.assertEqual(self.telegram.send_message.await_count, len(self.admins))
+        outsider, outsider_state = self.actor(40)
+        version = (await support_storage.ticket(ticket))['status_version']
+        self.telegram.send_message.reset_mock()
+        await self.help_action(outsider, outsider_state, f'owner_confirm:{ticket}:{version}:mine:8')
+        self.assertEqual(outsider.answer.await_args.args[0], 'Обращение недоступно.')
+        self.assertEqual((await support_storage.ticket(ticket))['status'], 'new')
+        self.assertEqual(len(await support_storage.history(ticket)), 2)
+        self.telegram.send_message.assert_not_awaited()
+        await self.help_action(user, state, f'follow:{ticket}:list:new:8')
+        self.assertEqual((await state.get_data())['support_origin'], '')
+
     async def test_simultaneous_confirmations_are_idempotent(self):
         results = await asyncio.gather(*[
             support_storage.create_ticket(20, "help", "same", "Текст", None) for _ in range(2)
