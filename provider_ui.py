@@ -237,6 +237,9 @@ async def alert_preference_action(callback: CallbackQuery, state: FSMContext):
 
 @router.message(F.text == REGISTER_PROVIDER)
 async def begin_register(message: Message, state: FSMContext):
+    if await state.get_state() is not None:
+        await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
+        return
     await state.clear()
     await state.set_state(Register.consent)
     await message.answer(
@@ -391,6 +394,9 @@ async def machine_catalog(message, state, group=None):
 
 @router.message(F.text == "➕ Добавить технику")
 async def begin_machine(message: Message, state: FSMContext):
+    if await state.get_state() is not None:
+        await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
+        return
     await state.clear()
     await machine_catalog(message, state)
 

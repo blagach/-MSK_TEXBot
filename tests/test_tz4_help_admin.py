@@ -206,6 +206,43 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row[0], 0, table)
         self.telegram.send_message.assert_not_awaited()
 
+    async def test_provider_entry_buttons_cannot_reset_an_open_persistent_form(self):
+        drafts = bot.SQLiteDraftStorage(str(self.database))
+        await drafts.init_schema()
+        message, memory_state = self.actor(20)
+        state = FSMContext(drafts, memory_state.key)
+        message.answer.return_value = Record(message_id=800)
+        saved = {'category': 'мини-экскаватор', 'description': 'Учебная машина',
+                 'region': 'Москва', 'area': 'ЦАО', 'phone': '+79990000001',
+                 'machine_panel': 700, 'payment_selection': [payments.CASH]}
+        machine_states = (provider_ui.AddMachine.category, provider_ui.AddMachine.equipment_type,
+                          provider_ui.AddMachine.description, provider_ui.AddMachine.region,
+                          provider_ui.AddMachine.area, provider_ui.AddMachine.review,
+                          provider_ui.AlertPreferences.select)
+        for label, states in (
+            ('➕ Добавить технику', machine_states),
+            (provider_ui.REGISTER_PROVIDER, machine_states + tuple(provider_ui.Register.__all_states__)),
+        ):
+            for current in states:
+                with self.subTest(button=label, state=current.state):
+                    await state.set_state(current)
+                    await state.set_data(dict(saved))
+                    message.text = label
+                    message.answer.reset_mock()
+                    await provider_ui.router.propagate_event('message', message, state=state, raw_state=current.state)
+                    restored = FSMContext(bot.SQLiteDraftStorage(str(self.database)), state.key)
+                    self.assertEqual(await restored.get_state(), current.state)
+                    self.assertEqual(await restored.get_data(), saved)
+                    self.assertIn('/menu', message.answer.await_args.args[0])
+        self.assertEqual(await provider_registry.list_equipment(20, str(self.database)), [])
+        self.telegram.send_message.assert_not_awaited()
+        for label, expected in (('➕ Добавить технику', provider_ui.AddMachine.category),
+                                (provider_ui.REGISTER_PROVIDER, provider_ui.Register.consent)):
+            await state.clear()
+            message.text = label
+            await provider_ui.router.propagate_event('message', message, state=state, raw_state=None)
+            self.assertEqual(await state.get_state(), expected.state)
+
     async def test_machine_preview_requires_confirmation_and_duplicate_save_is_inactive(self):
         message, state = self.actor(20)
         message.message_id = 101
