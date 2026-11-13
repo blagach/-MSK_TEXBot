@@ -10,6 +10,7 @@ import provider_registry as registry
 import payment_preferences as payments
 import storage
 import equipment_catalog
+from draft_storage import draft_slot
 
 router = Router()
 router.message.filter(F.chat.type == "private")
@@ -43,7 +44,7 @@ def section_keyboard(*rows: tuple[str, ...]) -> ReplyKeyboardMarkup:
     )
 
 
-async def executor_keyboard(user_id: int, state: FSMContext) -> ReplyKeyboardMarkup:
+async def executor_keyboard(user_id: int, state: FSMContext, *, tools: bool = False) -> ReplyKeyboardMarkup:
     async with aiosqlite.connect(storage.DB_PATH) as db:
         async with db.execute(
             """SELECT (SELECT notifications_enabled FROM provider_profiles WHERE telegram_id=?),
@@ -59,6 +60,8 @@ async def executor_keyboard(user_id: int, state: FSMContext) -> ReplyKeyboardMar
         rows = [(REGISTER_PROVIDER,)]
         if legacy:
             rows.append((LEGACY_PROVIDER,))
+    if tools and notifications_enabled is not None:
+        rows.extend(((INVENTORY, "➕ Добавить технику"), ("👤 Мой профиль", PAYMENT_METHOD)))
     return section_keyboard(*rows, (HOME,))
 
 
@@ -89,10 +92,25 @@ def provider_tools_keyboard():
     )
 
 
+async def has_paused_provider_action(message: Message, state: FSMContext) -> bool:
+    """Do not open another form that would overwrite the shared provider draft."""
+    if not await draft_slot(state, "provider_action").get_state():
+        return False
+    import bot as app
+    await message.answer(
+        "У вас сохранено незавершённое действие исполнителя. Продолжите его и завершите "
+        "или отмените перед началом другого.",
+        reply_markup=section_keyboard((app.PROVIDER_ACTION_DRAFT,), (HOME,)),
+    )
+    return True
+
+
 @router.message(F.text.in_({MY_TECH, MY_REGIONS}))
 async def begin_alert_preferences(message: Message, state: FSMContext):
     if await state.get_state() is not None:
         await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
+        return
+    if await has_paused_provider_action(message, state):
         return
     async with aiosqlite.connect(storage.DB_PATH) as db:
         profile = await (await db.execute(
@@ -176,7 +194,7 @@ async def alert_preference_action(callback: CallbackQuery, state: FSMContext):
         await retire_inline_panel(callback.message, state, "alert_panel")
         await state.clear()
         await callback.message.answer("Настройки оставлены без изменений.",
-                                      reply_markup=await executor_keyboard(callback.from_user.id, state))
+                                      reply_markup=await executor_keyboard(callback.from_user.id, state, tools=True))
         return
     if action == "save":
         if not data["alert_categories"]:
@@ -204,7 +222,7 @@ async def alert_preference_action(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(
             "Настройки сохранены. Подходящие заявки будут приходить отдельными сообщениями. "
             "Уведомления зависят от сохранённого переключателя. Выбор видов не зависит от карточек отдельных машин.",
-            reply_markup=await executor_keyboard(callback.from_user.id, state),
+            reply_markup=await executor_keyboard(callback.from_user.id, state, tools=True),
         )
         return
     if kind == "categories" and action.startswith("group:") and action[6:].isdecimal():
@@ -239,6 +257,8 @@ async def alert_preference_action(callback: CallbackQuery, state: FSMContext):
 async def begin_register(message: Message, state: FSMContext):
     if await state.get_state() is not None:
         await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
+        return
+    if await has_paused_provider_action(message, state):
         return
     await state.clear()
     await state.set_state(Register.consent)
@@ -396,6 +416,8 @@ async def machine_catalog(message, state, group=None):
 async def begin_machine(message: Message, state: FSMContext):
     if await state.get_state() is not None:
         await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
+        return
+    if await has_paused_provider_action(message, state):
         return
     await state.clear()
     await machine_catalog(message, state)
@@ -575,6 +597,8 @@ async def machine_action(callback: CallbackQuery, state: FSMContext):
     action = parts[1]
     await callback.answer()
     if action == "edit":
+        if await has_paused_provider_action(callback.message, state):
+            return
         await state.update_data(edit_machine=item["id"], machine_active=item["active"],
                                 **{field: item[field] for field in ("category", "description", "region", "area")})
         await machine_edit_fields(callback.message, state)
@@ -720,6 +744,8 @@ async def edit_payment_methods(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Профиль недоступен.")
         return
     await callback.answer()
+    if await has_paused_provider_action(callback.message, state):
+        return
     await start_payment_selection(callback.message, state, callback.from_user.id)
 
 

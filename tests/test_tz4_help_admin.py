@@ -37,6 +37,98 @@ import support_ui
 
 
 class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def test_paused_provider_form_cannot_be_replaced_by_another_entry(self):
+        await provider_registry.register_provider(20, "Учебный профиль", "+79991234567", True, str(self.database))
+        machine = await provider_registry.add_equipment(20, "автокран", "Учебная техника", "Москва", "весь регион", str(self.database))
+        owner, original = self.actor(20)
+        owner.answer.return_value = Record(message_id=500)
+        owner.message_id = 500
+        backing = bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        cases = (
+            (provider_ui.Register.name, {"consent": True}),
+            (provider_ui.AddMachine.description, {"category": "автокран"}),
+            (provider_ui.AddMachine.description, {"category": "автокран", "edit_machine": machine}),
+            (provider_ui.AlertPreferences.select, {"alert_categories": ["автокран"], "alert_regions": ["Москва"], "alert_revision": 0, "alert_kind": "regions"}),
+            (provider_ui.Register.payment, {"payment_selection": [payments.CASH], "editing_payment": True}),
+        )
+        for step, expected in cases:
+            for entry in ("register", "add", "alerts", "edit", "payment"):
+                with self.subTest(step=step.state, data=expected, entry=entry):
+                    current = FSMContext(backing, original.key)
+                    await current.set_state(step)
+                    await current.set_data(expected)
+                    await bot.pause_form(owner, current)
+                    # Another form type can coexist without sharing the provider slot.
+                    lead = bot.draft_slot(current, "lead")
+                    await lead.set_state(bot.LeadForm.region)
+                    await lead.set_data({"equipment": "автокран"})
+                    restarted = bot.SQLiteDraftStorage(str(self.database))
+                    current = FSMContext(restarted, original.key)
+                    paused = bot.draft_slot(current, "provider_action")
+                    before = await paused.get_data()
+                    if entry == "register":
+                        await provider_ui.begin_register(owner, current)
+                    elif entry == "add":
+                        await provider_ui.begin_machine(owner, current)
+                    elif entry == "alerts":
+                        owner.text = provider_ui.MY_REGIONS
+                        await provider_ui.begin_alert_preferences(owner, current)
+                    elif entry == "edit":
+                        await provider_ui.machine_action(self.callback(owner, f"machine:edit:{machine}"), current)
+                    else:
+                        await provider_ui.edit_payment_methods(self.callback(owner, "provider_payment:edit"), current)
+                    self.assertIsNone(await current.get_state())
+                    self.assertEqual(await paused.get_state(), step.state)
+                    self.assertEqual(await paused.get_data(), before)
+                    self.assertIn(bot.PROVIDER_ACTION_DRAFT, [b.text for row in owner.answer.await_args.kwargs["reply_markup"].keyboard for b in row])
+                    await bot.pause_form(owner, current)  # Repeated /menu cannot replace the saved form.
+                    owner.text = bot.PROVIDER_ACTION_DRAFT
+                    await bot.resume_auxiliary_action(owner, current)
+                    self.assertEqual(await current.get_state(), step.state)
+                    for name, value in expected.items():
+                        self.assertEqual((await current.get_data())[name], value)
+                    self.assertIsNone(await paused.get_state())
+                    self.assertEqual(await lead.get_data(), {"equipment": "автокран"})
+                    await current.clear()
+        self.assertEqual(len(await provider_registry.list_equipment(20, str(self.database))), 1)
+        self.telegram.send_message.assert_not_awaited()
+
+    async def test_provider_tools_remain_reachable_after_resolving_paused_preferences(self):
+        await provider_registry.register_provider(20, "Учебный профиль", "+79991234567", True, str(self.database))
+        owner, original = self.actor(20)
+        owner.answer.return_value = Record(message_id=500)
+        owner.message_id = 500
+        backing = bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        state = FSMContext(backing, original.key)
+        for finish in ("cancel", "save"):
+            owner.text = provider_ui.MY_REGIONS
+            await provider_ui.begin_alert_preferences(owner, state)
+            # Supply a valid unsaved selection; persisted preferences must not change on pause.
+            await state.update_data(alert_categories=["автокран"], alert_regions=["Москва"])
+            persisted = await provider_registry.alert_preferences(20, str(self.database))
+            await provider_ui.alert_preference_action(self.callback(owner, "provider_alert:tools"), state)
+            await provider_ui.begin_machine(owner, state)
+            self.assertIsNone(await state.get_state())
+            self.assertEqual(await provider_registry.alert_preferences(20, str(self.database)), persisted)
+            state = FSMContext(bot.SQLiteDraftStorage(str(self.database)), original.key)
+            owner.text = bot.PROVIDER_ACTION_DRAFT
+            await bot.resume_auxiliary_action(owner, state)
+            await provider_ui.alert_preference_action(self.callback(owner, f"provider_alert:{finish}"), state)
+            self.assertIsNone(await state.get_state())
+            buttons = [b.text for row in owner.answer.await_args.kwargs["reply_markup"].keyboard for b in row]
+            self.assertIn("➕ Добавить технику", buttons)
+            if finish == "cancel":
+                self.assertEqual(await provider_registry.alert_preferences(20, str(self.database)), persisted)
+            else:
+                self.assertEqual((await provider_registry.alert_preferences(20, str(self.database)))["categories"], ["автокран"])
+            await provider_ui.begin_machine(owner, state)
+            self.assertEqual(await state.get_state(), provider_ui.AddMachine.category.state)
+            # Leave this synthetic form resolved before the next independent scenario.
+            await state.clear()
+        self.telegram.send_message.assert_not_awaited()
+
     async def asyncSetUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
