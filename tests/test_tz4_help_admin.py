@@ -37,6 +37,84 @@ import support_ui
 
 
 class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def test_production_main_passes_persistent_sqlite_storage_to_dispatcher(self):
+        await provider_registry.register_provider(20, "Учебный профиль", "+79990000001", True, str(self.database))
+        await provider_registry.add_equipment(20, "автокран", "Учебная техника", "Москва", "весь регион", str(self.database))
+        await admin_access.record(1, "test_preservation", target_id=20, result="ok")
+        backing = bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        independent = FSMContext(backing, StorageKey(bot_id=99, chat_id=30, user_id=30))
+        await independent.set_state(bot.LeadForm.region)
+        await independent.set_data({"equipment": "каток"})
+
+        async def rows():
+            async with aiosqlite.connect(self.database) as db:
+                names = [r[0] for r in await (await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                )).fetchall()]
+                return {n: sorted(await (await db.execute('SELECT * FROM "' + n + '"')).fetchall(), key=repr) for n in names}
+
+        before = await rows()
+        telegram = Record(set_my_commands=AsyncMock())
+        dispatcher = Record(start_polling=AsyncMock())
+        with patch.object(bot, "Bot", return_value=telegram), patch.object(
+            bot, "create_dispatcher", return_value=dispatcher,
+        ) as factory:
+            await bot.main()
+        drafts = factory.call_args.args[0]
+        self.assertIsInstance(drafts, bot.SQLiteDraftStorage)
+        self.assertEqual(drafts.db_path, str(self.database))
+        factory.assert_called_once_with(drafts)
+        dispatcher.start_polling.assert_awaited_once_with(telegram)
+        self.assertEqual(await rows(), before)
+        key = StorageKey(bot_id=99, chat_id=20, user_id=20)
+        state = FSMContext(drafts, key)
+        await state.set_state(provider_ui.Register.consent)
+        await state.set_data({"marker": "unsent-registration"})
+        recovered = FSMContext(bot.SQLiteDraftStorage(str(self.database)), key)
+        self.assertEqual(await recovered.get_state(), provider_ui.Register.consent.state)
+        self.assertEqual(await recovered.get_data(), {"marker": "unsent-registration"})
+        self.assertEqual(await independent.get_state(), bot.LeadForm.region.state)
+        self.assertEqual(await independent.get_data(), {"equipment": "каток"})
+
+    async def test_production_main_storage_failure_never_falls_back_or_creates_replacement(self):
+        missing = self.database.parent / "missing.sqlite"
+        corrupt = self.database.parent / "corrupt.sqlite"
+        corrupt.write_bytes(b"not a SQLite database")
+        empty = self.database.parent / "empty.sqlite"
+        async with aiosqlite.connect(empty):
+            pass
+        link = self.database.parent / "link.sqlite"
+        link.symlink_to(self.database)
+        original = self.database.read_bytes()
+        for path in (missing, self.database.parent, corrupt, empty, link, Path("relative.sqlite")):
+            with self.subTest(path=path.name), patch.object(storage, "DB_PATH", str(path)), patch.object(
+                bot, "Bot",
+            ) as telegram, patch.object(bot, "create_dispatcher") as factory:
+                with self.assertRaises((RuntimeError, aiosqlite.DatabaseError)):
+                    await bot.main()
+                telegram.assert_not_called()
+                factory.assert_not_called()
+        self.assertFalse(missing.exists())
+        for failing in ("init_db", "draft_schema"):
+            with self.subTest(failure=failing), patch.object(bot, "Bot") as telegram, patch.object(
+                bot, "create_dispatcher",
+            ) as factory:
+                target = patch.object(bot, "init_db", side_effect=aiosqlite.OperationalError("unavailable")) if failing == "init_db" else patch.object(
+                    bot.SQLiteDraftStorage, "init_schema", side_effect=aiosqlite.OperationalError("unavailable"),
+                )
+                with target, self.assertRaises(aiosqlite.OperationalError):
+                    await bot.main()
+                telegram.assert_not_called()
+                factory.assert_not_called()
+        with patch.object(bot.Path, "is_mount", return_value=False), patch.object(
+            bot.Path, "is_file", return_value=True,
+        ), patch.object(storage, "DB_PATH", "/var/data/bot.db"), patch.object(bot, "init_db") as initialize:
+            with self.assertRaisesRegex(RuntimeError, "not mounted"):
+                await bot.main()
+            initialize.assert_not_called()
+        self.assertEqual(self.database.read_bytes(), original)
+
     async def test_provider_resume_repeated_button_reopens_active_action_without_losing_data(self):
         backing = bot.SQLiteDraftStorage(str(self.database))
         await backing.init_schema()

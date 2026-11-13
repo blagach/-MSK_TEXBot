@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import aiosqlite
@@ -2029,7 +2030,20 @@ def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatch
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    database = Path(storage.DB_PATH)
+    if not database.is_absolute() or database.is_symlink() or not database.is_file():
+        raise RuntimeError("The configured existing SQLite database is required")
+    if database.parent == Path("/var/data") and not database.parent.is_mount():
+        raise RuntimeError("The persistent SQLite disk is not mounted")
+    async with aiosqlite.connect(database.as_uri() + "?mode=rw", uri=True) as probe:
+        await probe.execute("PRAGMA query_only=ON")
+        if not await (await probe.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='leads'",
+        )).fetchone():
+            raise RuntimeError("The configured SQLite database has no existing leads table")
     await init_db()
+    drafts = SQLiteDraftStorage(storage.DB_PATH)
+    await drafts.init_schema()
     bot = Bot(token=settings.token)
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
@@ -2037,7 +2051,7 @@ async def main() -> None:
         BotCommand(command="cancel", description="Отменить действие"),
         BotCommand(command="support", description="Помощь и поддержка"),
     ])
-    await create_dispatcher().start_polling(bot)
+    await create_dispatcher(drafts).start_polling(bot)
 
 
 if __name__ == "__main__":
