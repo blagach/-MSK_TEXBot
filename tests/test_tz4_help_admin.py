@@ -271,6 +271,75 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("\n✅ Активна",text)
         self.assertIn(values["description"],text)
 
+    async def test_equipment_owner_edit_route_restart_confirm_cancel_and_pause(self):
+        drafts = bot.SQLiteDraftStorage(str(self.database))
+        await drafts.init_schema()
+        message, memory_state = self.actor(20)
+        state = FSMContext(drafts, memory_state.key)
+        panel_ids = iter(range(500, 600))
+        message.answer.side_effect = lambda *args, **kwargs: Record(message_id=next(panel_ids))
+        for user in (20, 30):
+            await provider_registry.register_provider(user, 'Учебный исполнитель', '+79990000001', True, str(self.database))
+        item = await provider_registry.add_equipment(20, 'каток', 'Старое описание', 'Москва', 'ЦАО', str(self.database))
+        foreign = await provider_registry.add_equipment(30, 'автокран', 'Чужая карточка', 'Москва', 'ЦАО', str(self.database))
+        foreign_before = [dict(r) for r in await provider_registry.list_equipment(30, str(self.database))]
+
+        async def current():
+            return dict((await provider_registry.list_equipment(20, str(self.database)))[0])
+
+        async def action(handler, data):
+            message.message_id = (await state.get_data()).get('machine_panel', 499)
+            callback = self.callback(message, data)
+            await handler(callback, state)
+            return callback
+
+        await action(provider_ui.machine_action, f'machine:edit:{item}')
+        await action(provider_ui.machine_edit_field, 'machine_field:description')
+        message.text = 'Новое учебное описание'
+        await provider_ui.machine_description(message, state)
+        self.assertEqual((await current())['description'], 'Старое описание')
+        await action(provider_ui.machine_review, 'machine_review:edit')
+        await action(provider_ui.machine_edit_field, 'machine_field:region')
+        message.text = provider_registry.BOTH_REGIONS
+        await provider_ui.machine_region(message, state)
+        await action(provider_ui.machine_review, 'machine_review:edit')
+        await action(provider_ui.machine_edit_field, 'machine_field:category')
+        await action(provider_ui.machine_catalog_action, 'machine_catalog:1')
+        await action(provider_ui.machine_catalog_action, 'machine_catalog:0')
+        self.assertEqual((await current())['category'], 'каток')
+        await bot.pause_form(message, state)
+        state = FSMContext(bot.SQLiteDraftStorage(str(self.database)), state.key)
+        message.text = bot.PROVIDER_ACTION_DRAFT
+        await bot.resume_auxiliary_action(message, state)
+        self.assertEqual(await state.get_state(), provider_ui.AddMachine.review.state)
+        self.assertIn('Новое учебное описание', message.answer.await_args.args[0])
+        self.assertIn(provider_registry.BOTH_REGIONS, message.answer.await_args.args[0])
+        await action(provider_ui.machine_review, 'machine_review:save')
+        saved = await current()
+        for key, value in {'id': item, 'category': 'мини-погрузчик', 'description': 'Новое учебное описание',
+                           'region': provider_registry.BOTH_REGIONS, 'area': 'весь регион', 'active': 1}.items():
+            self.assertEqual(saved[key], value, key)
+        await action(provider_ui.machine_review, 'machine_review:save')
+        self.assertEqual(await current(), saved)
+        await action(provider_ui.machine_action, f'machine:edit:{item}')
+        await action(provider_ui.machine_edit_field, 'machine_field:description')
+        message.text = 'Отменённая правка'
+        await provider_ui.machine_description(message, state)
+        await action(provider_ui.machine_review, 'machine_review:edit')
+        await action(provider_ui.machine_edit_field, 'machine_field:cancel')
+        self.assertEqual(await current(), saved)
+        await action(provider_ui.machine_action, f'machine:pause:{item}')
+        self.assertEqual((await current())['active'], 0)
+        self.assertEqual(await provider_registry.matching_providers('мини-погрузчик', 'Москва', 'ЦАО', str(self.database)), [])
+        await action(provider_ui.machine_action, f'machine:activate:{item}')
+        self.assertEqual(await current(), saved)
+        self.assertEqual(await provider_registry.matching_providers('мини-погрузчик', 'Москва', 'ЦАО', str(self.database)), [20])
+        await action(provider_ui.machine_action, f'machine:edit:{foreign}')
+        self.assertIsNone(await state.get_state())
+        self.assertEqual([dict(r) for r in await provider_registry.list_equipment(30, str(self.database))], foreign_before)
+        self.assertEqual(len(await provider_registry.list_equipment(20, str(self.database))), 1)
+        self.telegram.send_message.assert_not_awaited()
+
     async def test_machine_old_panel_cannot_save_or_replace_preview(self):
         message,state=self.actor(20)
         message.message_id=100
