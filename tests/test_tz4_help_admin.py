@@ -37,6 +37,63 @@ import support_ui
 
 
 class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_resume_repeated_button_reopens_active_action_without_losing_data(self):
+        backing = bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        message, memory_state = self.actor(20)
+        message.answer.return_value = Record(message_id=500)
+        state = FSMContext(backing, memory_state.key)
+        message.text = bot.PROVIDER_ACTION_DRAFT
+        lead = bot.draft_slot(state, "lead")
+        await lead.set_state(bot.LeadForm.region)
+        await lead.set_data({"equipment": "автокран"})
+        for step, values in (
+            (provider_ui.AlertPreferences.select, {"alert_categories": ["автокран"],
+                "alert_regions": ["Москва"], "alert_revision": 0, "alert_kind": "categories", "alert_group": None}),
+            (provider_ui.Register.phone, {"consent": True, "name": "Учебный профиль"}),
+            (provider_ui.AddMachine.description, {"machine_edit_id": 7, "description": "Учебная техника"}),
+        ):
+            with self.subTest(step=step.state):
+                await state.clear()
+                paused = bot.draft_slot(state, "provider_action")
+                await paused.set_state(step)
+                await paused.set_data(values)
+                for attempt in range(3):
+                    message.answer.reset_mock()
+                    # Reopen SQLite storage as after a process restart.
+                    state = FSMContext(bot.SQLiteDraftStorage(str(self.database)), state.key)
+                    await bot.resume_auxiliary_action(message, state)
+                    self.assertEqual(await state.get_state(), step.state)
+                    self.assertIsNone(await paused.get_state())
+                    data = await state.get_data()
+                    for key, value in values.items():
+                        self.assertEqual(data[key], value)
+                    replies = message.answer.await_args_list
+                    self.assertFalse(any("Незавершённого действия нет" in call.args[0] for call in replies))
+                    keyboards = [call.kwargs["reply_markup"] for call in replies
+                                 if getattr(call.kwargs.get("reply_markup"), "keyboard", None)]
+                    self.assertTrue(keyboards)
+                    self.assertFalse(any(button.text == bot.PROVIDER_ACTION_DRAFT
+                                         for keyboard in keyboards for row in keyboard.keyboard for button in row))
+                    if step == provider_ui.Register.phone:
+                        self.assertTrue(any(button.text == provider_ui.CANCEL_REGISTRATION
+                                            for keyboard in keyboards for row in keyboard.keyboard for button in row))
+                    self.assertEqual(await lead.get_state(), bot.LeadForm.region.state)
+                    self.assertEqual(await lead.get_data(), {"equipment": "автокран"})
+        await state.clear()
+        message.answer.reset_mock()
+        await bot.resume_auxiliary_action(message, state)
+        reply = message.answer.await_args
+        self.assertEqual(reply.args[0], "Незавершённого действия нет.")
+        self.assertFalse(any(button.text == bot.PROVIDER_ACTION_DRAFT
+                             for row in reply.kwargs["reply_markup"].keyboard for button in row))
+        # A stale provider button cannot replace an unrelated active customer form.
+        await state.set_state(bot.LeadForm.region)
+        await state.set_data({"equipment": "каток", "marker": "independent"})
+        await bot.resume_auxiliary_action(message, state)
+        self.assertEqual(await state.get_state(), bot.LeadForm.region.state)
+        self.assertEqual(await state.get_data(), {"equipment": "каток", "marker": "independent"})
+
     async def test_early_registration_cancel_requires_confirmation_archives_and_releases_entry(self):
         backing = bot.SQLiteDraftStorage(str(self.database))
         await backing.init_schema()

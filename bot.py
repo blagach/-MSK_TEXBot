@@ -525,7 +525,17 @@ async def resume_auxiliary_action(message: Message, state: FSMContext):
     draft = draft_slot(state, kind)
     current = await draft.get_state()
     if not current:
-        await message.answer("Незавершённого действия нет.")
+        active = await state.get_state()
+        if provider and active in (*provider_ui.Register.__all_states_names__,
+                                   *provider_ui.AddMachine.__all_states_names__,
+                                   *provider_ui.AlertPreferences.__all_states_names__):
+            await message.answer("Действие исполнителя уже открыто. Продолжите на экране ниже.",
+                                 reply_markup=provider_ui.registration_keyboard() if active in
+                                 provider_ui.Register.__all_states_names__ else provider_ui.section_keyboard((provider_ui.HOME,)))
+            await provider_ui.resume_provider_step(message, state, active)
+        else:
+            await message.answer("Незавершённого действия нет.",
+                                 reply_markup=await menu_with_paused_actions(state) if not active else None)
         return
     await pause_form(message, state)
     if isinstance(state.storage, SQLiteDraftStorage):
@@ -545,6 +555,9 @@ async def resume_auxiliary_action(message: Message, state: FSMContext):
     elif closing:
         await show_closing_step(message, state)
     elif provider:
+        await message.answer("Продолжим сохранённое действие исполнителя.",
+                             reply_markup=provider_ui.registration_keyboard() if current in
+                             provider_ui.Register.__all_states_names__ else provider_ui.section_keyboard((provider_ui.HOME,)))
         await provider_ui.resume_provider_step(message, state, current)
     else:
         await support_ui.resume_support_step(message, state, current)
