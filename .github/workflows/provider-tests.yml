@@ -12,6 +12,8 @@ on:
       - bot.py
       - "admin_*.py"
       - "support_*.py"
+      - "sandbox_*.py"
+      - tests/test_local_sandbox.py
       - requirements.txt
       - tests/test_tz4_help_admin.py
       - provider_registry.py
