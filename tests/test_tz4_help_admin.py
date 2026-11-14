@@ -534,7 +534,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("⬅️ Назад", labels)
                 self.assertIn("Завершить инструкцию" if index == len(support_ui.GUIDES[role])-1 else "Далее ➡️", labels)
             for step in range(4):
-                await self.help_action(message, state, f"try:{role}:{step}:1")
+                # Helpers are retained for compatibility, not exposed to users.
+                await support_ui.show_training(message, role, step + 1)
             self.assertIn("Тренировка завершена", message.answer.await_args.args[0])
         await self.help_action(message, state, "search")
         message.text = "ОПЛАТА НДС"
@@ -547,17 +548,17 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_training_uses_contact_button_without_offer_or_contact_write(self):
         message, state = self.actor(20)
-        await self.help_action(message, state, "train:provider:0")
-        await self.help_action(message, state, "try:provider:0:1")
-        await self.help_action(message, state, "try:provider:1:1")
+        await support_ui.show_training(message, "provider", 0)
+        await support_ui.show_training(message, "provider", 1)
+        await support_ui.show_training(message, "provider", 2)
         rows = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
         self.assertEqual(rows[0][0].text, "📞 Получить контакт заказчика")
         self.assertEqual(rows[0][0].callback_data, "help:try:provider:2:1")
         self.assertIn("Длинный отклик не требуется", message.answer.await_args.args[0])
-        await self.help_action(message, state, "try:provider:2:1")
+        await support_ui.show_training(message, "provider", 3)
         rows = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
         self.assertEqual(rows[0][0].text, "Завершить тренировку")
-        await self.help_action(message, state, "try:provider:3:1")
+        await support_ui.show_training(message, "provider", 4)
         self.assertIn("Тренировка завершена", message.answer.await_args.args[0])
         async with aiosqlite.connect(self.database) as db:
             for table in ("leads", "offers", "customer_contact_access", "support_tickets"):
@@ -909,7 +910,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await self.help_action(user, state, "resources")
         rows = user.answer.await_args.kwargs["reply_markup"].inline_keyboard
         actions = {button.callback_data for row in rows for button in row}
-        self.assertTrue({"help:guides", "help:faq", "help:training", "help:new:bug"} <= actions)
+        self.assertEqual(actions, {"help:guides", "help:faq", "help:new:bug", "help:home"})
+        self.assertEqual([len(row) for row in rows], [1, 1, 1, 1])
 
     async def test_tz7_requester_closes_reopens_without_losing_history(self):
         ticket, _ = await support_storage.create_ticket(20, "help", "tz7-owner", "Вопрос", "photo")

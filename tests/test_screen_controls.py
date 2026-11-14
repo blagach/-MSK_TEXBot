@@ -73,8 +73,9 @@ class ScreenControlTests(unittest.IsolatedAsyncioTestCase):
         second = await self.show(keyboard('help:resources'))
         self.assertIn(first.message_id, [r.message_id for r in self.edits()])
         handler = AsyncMock()
-        await self.run_event(handler, self.callback(first.message_id, 'admin:role:moderator'))
-        handler.assert_not_awaited()
+        for action in ('admin:role:moderator', 'paused_action:provider_action'):
+            await self.run_event(handler, self.callback(first.message_id, action))
+            handler.assert_not_awaited()
         await self.run_event(handler, self.callback(second.message_id, 'help:resources'))
         handler.assert_awaited_once()
 
