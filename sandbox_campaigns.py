@@ -109,11 +109,18 @@ class SandboxCampaigns:
         if type(allowed) is not bool:
             raise ValueError('Consent must be explicit')
         with self.store.transaction() as db:
-            if not db.execute('SELECT 1 FROM sandbox_recipients WHERE id=?', (recipient,)).fetchone():
-                raise ValueError('Unknown recipient')
-            db.execute('UPDATE sandbox_recipients SET consent=? WHERE id=?', (int(allowed), recipient))
-            db.execute('INSERT INTO sandbox_consents(recipient,allowed,at,purpose) VALUES (?,?,?,?)',
-                       (recipient, int(allowed), now, 'marketing'))
+            self.record_consent(db, recipient, allowed, now)
+
+    @staticmethod
+    def record_consent(db, recipient, allowed, now):
+        instant(now)
+        if type(allowed) is not bool:
+            raise ValueError('Consent must be explicit')
+        if not db.execute('SELECT 1 FROM sandbox_recipients WHERE id=?', (recipient,)).fetchone():
+            raise ValueError('Unknown recipient')
+        db.execute('UPDATE sandbox_recipients SET consent=? WHERE id=?', (int(allowed), recipient))
+        db.execute('INSERT INTO sandbox_consents(recipient,allowed,at,purpose) VALUES (?,?,?,?)',
+                   (recipient, int(allowed), now, 'marketing'))
 
     @staticmethod
     def content(text, attachments):
@@ -272,7 +279,7 @@ class SandboxCampaigns:
                        (campaign, revision, actor, action, now))
             return True
 
-    def deliver_next(self, transport, now):
+    def deliver_next(self, transport, now, *, campaign=None):
         if type(transport) is not FakeTransport:
             raise TypeError('Only the local fake transport is permitted')
         instant(now)
@@ -283,7 +290,8 @@ class SandboxCampaigns:
                 JOIN sandbox_campaigns c ON c.id=q.campaign AND c.revision=q.revision
                 JOIN sandbox_campaign_revisions r ON r.campaign=q.campaign AND r.revision=q.revision
                 WHERE q.status='pending' AND c.state IN ('approved','running') AND c.run_at<=?
-                ORDER BY c.run_at,c.id,q.recipient LIMIT 1''', (now,)).fetchone()
+                AND (? IS NULL OR c.id=?)
+                ORDER BY c.run_at,c.id,q.recipient LIMIT 1''', (now, campaign, campaign)).fetchone()
             if not row:
                 return None
             recipient = db.execute('SELECT * FROM sandbox_recipients WHERE id=?', (row['recipient'],)).fetchone()

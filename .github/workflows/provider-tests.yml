@@ -14,6 +14,7 @@ on:
       - "support_*.py"
       - "sandbox_*.py"
       - tests/test_local_sandbox.py
+      - tests/test_sandbox_admin_ui.py
       - requirements.txt
       - tests/test_tz4_help_admin.py
       - provider_registry.py
