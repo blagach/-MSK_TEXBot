@@ -35,6 +35,11 @@ class FakeTransport:
         result = script.pop(0) if script else 'sent'
         if result in ('sent', 'uncertain'):
             self.possibly_delivered.append(recipient)
+        if isinstance(result, dict) and result.get('status') == 'rejected_429':
+            instant(result.get('retry_after'))
+            if result['retry_after'] <= 0 or set(result) != {'status', 'retry_after'}:
+                raise ValueError('Invalid explicit fake retry delay')
+            return result
         if result not in ('sent', 'uncertain', 'rejected_429', 'failed'):
             raise RuntimeError('Unexpected fake transport failure')
         return result
@@ -79,6 +84,10 @@ class SandboxCampaigns:
             );
             CREATE TABLE IF NOT EXISTS sandbox_campaign_runtime (id INTEGER PRIMARY KEY, next_send REAL NOT NULL);
             INSERT OR IGNORE INTO sandbox_campaign_runtime VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS sandbox_campaign_controls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, campaign TEXT NOT NULL REFERENCES sandbox_campaigns(id),
+                revision INTEGER NOT NULL, actor INTEGER NOT NULL, action TEXT NOT NULL, at REAL NOT NULL
+            );
         ''')
 
     def editor(self, actor):
@@ -231,6 +240,38 @@ class SandboxCampaigns:
                 self.finish(db, row['campaign'], row['revision'])
             return len(rows)
 
+    def pause(self, actor, campaign, revision, now):
+        """Stop new claims; already reserved fake I/O may still finish."""
+        return self._control(actor, campaign, revision, now, resume=False)
+
+    def resume(self, actor, campaign, revision, now):
+        return self._control(actor, campaign, revision, now, resume=True)
+
+    def _control(self, actor, campaign, revision, now, *, resume):
+        if actor != self.owner:
+            raise PermissionError('Owner control required')
+        instant(now)
+        with self.store.transaction() as db:
+            row = db.execute('SELECT * FROM sandbox_campaigns WHERE id=?', (campaign,)).fetchone()
+            if not row or row['revision'] != revision:
+                raise ValueError('Unknown campaign or stale revision')
+            if resume:
+                if row['state'] in ('approved', 'running'):
+                    return False
+                if row['state'] != 'paused':
+                    raise ValueError('Only an approved paused campaign can resume')
+                state, action = 'approved', 'resume'
+            else:
+                if row['state'] == 'paused':
+                    return False
+                if row['state'] not in ('approved', 'running'):
+                    raise ValueError('Only an approved active campaign can pause')
+                state, action = 'paused', 'pause'
+            db.execute('UPDATE sandbox_campaigns SET state=? WHERE id=?', (state, campaign))
+            db.execute('INSERT INTO sandbox_campaign_controls(campaign,revision,actor,action,at) VALUES (?,?,?,?,?)',
+                       (campaign, revision, actor, action, now))
+            return True
+
     def deliver_next(self, transport, now):
         if type(transport) is not FakeTransport:
             raise TypeError('Only the local fake transport is permitted')
@@ -259,10 +300,20 @@ class SandboxCampaigns:
         # Reservation is durable before the fake I/O; no SQLite transaction is
         # held while a transport is called. Unexpected failures leave it reserved.
         outcome = transport.send(row['recipient'], json.loads(row['payload']))
+        retry_after = 5
+        if isinstance(outcome, dict):
+            retry_after, outcome = outcome['retry_after'], outcome['status']
         with self.store.transaction() as db:
+            current = db.execute('SELECT status FROM sandbox_campaign_queue WHERE campaign=? AND revision=? AND recipient=?',
+                                 (row['campaign'], row['revision'], row['recipient'])).fetchone()[0]
+            if current != 'reserved':
+                # Explicit recovery may have marked the in-flight call unknown.
+                # A late return must not resurrect or requeue that reservation.
+                self.event(db, row, 'late_result_' + outcome, now)
+                return current
             if outcome == 'rejected_429' and row['retries'] == 0:
                 status = 'pending'
-                db.execute('UPDATE sandbox_campaign_runtime SET next_send=max(next_send,?) WHERE id=1', (now + 5,))
+                db.execute('UPDATE sandbox_campaign_runtime SET next_send=max(next_send,?) WHERE id=1', (now + retry_after,))
             else:
                 status = 'failed' if outcome == 'rejected_429' else outcome
             db.execute('UPDATE sandbox_campaign_queue SET status=?,retries=retries+? WHERE campaign=? AND revision=? AND recipient=?',

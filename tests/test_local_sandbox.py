@@ -222,3 +222,144 @@ class LocalSandboxTests(unittest.TestCase):
         with self.store.connection() as db:
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
             self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_verified_failure_retry_cancel_and_late_paid_never_grant_cancelled_orders(self):
+        order = self.order()
+        failed = self.provider.event(order, 'failed', 'failed-attempt')
+        self.assertTrue(self.pay.apply_event(self.provider, failed))
+        self.assertFalse(self.pay.apply_event(self.provider, failed))
+        self.assertEqual(self.pay.get_order(20, order['id'])['status'], 'failed')
+        self.assertEqual(self.order()['status'], 'failed')
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_rights'), 0)
+        self.assertTrue(self.pay.confirm(self.provider, self.provider.paid_event(order)))
+        self.assertEqual(self.pay.get_order(20, order['id'])['status'], 'paid')
+        with self.assertRaises(ValueError):
+            self.pay.cancel(20, order['id'], 'cancel-paid')
+        second = self.order('second')
+        with self.assertRaises(ValueError):
+            self.pay.cancel(21, second['id'], 'foreign')
+        self.assertTrue(self.pay.cancel(20, second['id'], 'cancel-second'))
+        self.assertFalse(self.pay.cancel(20, second['id'], 'cancel-second'))
+        with self.assertRaises(ValueError):
+            self.pay.cancel(20, order['id'], 'cancel-second')
+        with self.assertRaises(ValueError):
+            self.pay.confirm(self.provider, self.provider.paid_event(second))
+        self.assertEqual(self.pay.get_order(20, second['id'])['status'], 'cancelled')
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_rights'), 1)
+
+    def test_resource_reopen_rechecks_authorization_and_never_debits_twice_after_restart(self):
+        order = self.order(units=2, expires_at=1100)
+        self.pay.confirm(self.provider, self.provider.paid_event(order))
+        with self.assertRaises(PermissionError):
+            self.pay.access_resource(20, 'sample_feature', 'fixture-11', 1000, authorized=False)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            receipts = list(pool.map(lambda _: self.pay.access_resource(
+                20, 'sample_feature', 'fixture-11', 1000, authorized=True), range(2)))
+        self.assertEqual(sum(r[1] for r in receipts), 1)
+        reopened = SandboxPayments(SandboxStore(self.path))
+        self.assertEqual(reopened.access_resource(20, 'sample_feature', 'fixture-11', 1200, authorized=True),
+                         (order['id'], False))
+        with self.assertRaises(PermissionError):
+            reopened.access_resource(20, 'sample_feature', 'fixture-11', 1200, authorized=False)
+        self.assertIsNone(reopened.access_resource(21, 'sample_feature', 'fixture-11', 1000, authorized=True))
+        self.assertIsNone(reopened.access_resource(20, 'sample_feature', 'fixture-12', 1200, authorized=True))
+        self.assertEqual(self.scalar('SELECT remaining FROM sandbox_rights'), 1)
+
+    def test_full_fake_refund_is_atomic_idempotent_and_revokes_new_and_old_resource_receipts(self):
+        order = self.order()
+        self.pay.confirm(self.provider, self.provider.paid_event(order, 'paid'))
+        self.pay.access_resource(20, 'sample_feature', 'fixture-11', 1000, authorized=True)
+        refund = self.provider.event(order, 'refunded', 'refund')
+        with self.store.connection() as db:
+            db.execute("CREATE TRIGGER fail_refund BEFORE UPDATE OF remaining ON sandbox_rights "
+                       "BEGIN SELECT RAISE(ABORT,'fixture refund failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.pay.apply_event(self.provider, refund)
+        self.assertEqual(self.pay.get_order(20, order['id'])['status'], 'paid')
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_payment_refunds'), 0)
+        # Preserve this fault-injection fixture; use a separate order database
+        # for the successful path rather than removing the trigger or records.
+        fresh = SandboxPayments(SandboxStore.create(Path(self.temp.name)/'refund-success.sqlite'))
+        order = fresh.create_order(20, 'refund-order', 'sample_feature', 100, 2)
+        paid = self.provider.paid_event(order, 'paid-success')
+        fresh.confirm(self.provider, paid)
+        fresh.access_resource(20, 'sample_feature', 'fixture-11', 1000, authorized=True)
+        event = self.provider.event(order, 'refunded', 'refund-success')
+        self.assertTrue(fresh.apply_event(self.provider, event))
+        self.assertFalse(fresh.apply_event(self.provider, event))
+        self.assertFalse(fresh.apply_event(self.provider, self.provider.event(order, 'refunded', 'same-refund-new-event')))
+        self.assertFalse(fresh.confirm(self.provider, paid))
+        self.assertEqual(fresh.get_order(20, order['id'])['status'], 'refunded')
+        self.assertEqual(fresh.create_order(20, 'refund-order', 'sample_feature', 100, 2)['status'], 'refunded')
+        self.assertIsNone(fresh.access_resource(20, 'sample_feature', 'fixture-11', 1001, authorized=True))
+        self.assertIsNone(fresh.access_resource(20, 'sample_feature', 'fixture-12', 1001, authorized=True))
+        with self.assertRaises(ValueError):
+            fresh.confirm(self.provider, self.provider.paid_event(order, 'late-new-paid'))
+
+    def test_refund_and_cancel_event_identity_signature_and_order_scope_are_verified(self):
+        order = self.order()
+        with self.assertRaises(ValueError):
+            self.pay.apply_event(self.provider, self.provider.event(order, 'refunded'))
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_payment_events'), 0)
+        event = self.provider.event(order, 'cancelled', 'cancel-event')
+        with self.assertRaises(ValueError):
+            self.pay.apply_event(self.provider, {**event, 'status': 'refunded'})
+        with self.assertRaises(ValueError):
+            self.pay.confirm(self.provider, event)
+        self.assertTrue(self.pay.apply_event(self.provider, event))
+        self.assertFalse(self.pay.apply_event(self.provider, event))
+        self.assertEqual(self.pay.get_order(20, order['id'])['status'], 'cancelled')
+        with self.assertRaises(ValueError):
+            self.pay.get_order(21, order['id'])
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_rights'), 0)
+
+    def test_pause_resume_keep_approval_and_queue_and_recheck_consent_before_next_claim(self):
+        self.recipient(20); self.recipient(21)
+        campaign = self.campaign()
+        transport = FakeTransport()
+        with self.assertRaises(PermissionError):
+            self.campaigns.pause(2, campaign, 1, 1000)
+        self.assertTrue(self.campaigns.pause(1, campaign, 1, 1000))
+        self.assertFalse(self.campaigns.pause(1, campaign, 1, 1000))
+        reopened = SandboxCampaigns(SandboxStore(self.path), owner=1)
+        self.assertIsNone(reopened.deliver_next(transport, 1000))
+        with self.assertRaises(ValueError):
+            reopened.resume(1, campaign, 2, 1000)
+        self.campaigns.consent(20, False, 1000)
+        self.assertTrue(reopened.resume(1, campaign, 1, 1001))
+        self.assertFalse(reopened.resume(1, campaign, 1, 1001))
+        self.assertEqual(reopened.deliver_next(transport, 1001), 'excluded')
+        self.assertEqual(reopened.deliver_next(transport, 1001), 'sent')
+        self.assertEqual([r for r, _ in transport.calls], [21])
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_campaign_approvals'), 1)
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_campaign_controls'), 2)
+
+    def test_explicit_retry_after_survives_pause_restart_and_second_rejection_is_terminal(self):
+        self.recipient()
+        campaign = self.campaign()
+        transport = FakeTransport({20: [{'status': 'rejected_429', 'retry_after': 17},
+                                        {'status': 'rejected_429', 'retry_after': 30}]})
+        self.assertEqual(self.campaigns.deliver_next(transport, 1000), 'pending')
+        self.campaigns.pause(1, campaign, 1, 1001)
+        reopened = SandboxCampaigns(SandboxStore(self.path), owner=1)
+        reopened.resume(1, campaign, 1, 1002)
+        self.assertIsNone(reopened.deliver_next(transport, 1016))
+        self.assertEqual(reopened.deliver_next(transport, 1017), 'failed')
+        self.assertIsNone(reopened.deliver_next(transport, 1100))
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_late_return_after_explicit_uncertain_recovery_cannot_requeue_or_resend(self):
+        self.recipient()
+        campaign = self.campaign()
+        transport = FakeTransport({20: ['rejected_429', 'sent']})
+        original = transport.send
+        def recover_during_fake_io(recipient, payload):
+            result = original(recipient, payload)
+            self.assertEqual(self.campaigns.recover_reserved(1001), 1)
+            return result
+        transport.send = recover_during_fake_io
+        self.assertEqual(self.campaigns.deliver_next(transport, 1000), 'uncertain')
+        self.assertIsNone(self.campaigns.deliver_next(transport, 1100))
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(self.campaigns.report(1, campaign)[0]['status'], 'uncertain')
+        self.assertEqual(self.scalar('SELECT count(*) FROM sandbox_campaign_events'), 2)
