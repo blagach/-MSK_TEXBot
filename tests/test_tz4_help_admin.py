@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from uuid import uuid4
@@ -159,6 +160,62 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 await bot.main()
             initialize.assert_not_called()
         self.assertEqual(self.database.read_bytes(), original)
+
+    async def test_legacy_provider_menu_restart_and_stale_continue_preserve_independent_drafts(self):
+        backing = bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        message, memory_state = self.actor(20)
+        message.answer.return_value = Record(message_id=500)
+        state = FSMContext(backing, memory_state.key)
+        modern = bot.draft_slot(state, "provider_action")
+        await modern.set_state(provider_ui.Register.phone)
+        await modern.set_data({"consent": True, "name": "Новая регистрация"})
+        lead = bot.draft_slot(state, "lead")
+        await lead.set_state(bot.LeadForm.region)
+        await lead.set_data({"equipment": "автокран"})
+        with sqlite3.connect(self.database) as db:
+            db.execute("INSERT INTO providers VALUES (20,'Старая анкета','кран','Москва','+79990000000','fixture')")
+        async def business_rows():
+            async with aiosqlite.connect(self.database) as db:
+                schema = await (await db.execute("SELECT name,sql FROM sqlite_master ORDER BY name")).fetchall()
+                tables = [r[0] for r in await (await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name!='form_drafts'")).fetchall()]
+                rows = {n: await (await db.execute('SELECT * FROM "'+n+'"')).fetchall() for n in tables}
+                return schema, rows
+        before = await business_rows()
+        for step, values, prompt in (
+            (bot.ProviderForm.equipment, {}, "Какую технику"),
+            (bot.ProviderForm.location, {"equipment": "кран"}, "В каких районах"),
+            (bot.ProviderForm.phone, {"equipment": "кран", "location": "Москва"}, "Оставьте телефон"),
+        ):
+            with self.subTest(step=step.state):
+                await state.set_state(step)
+                await state.set_data(values)
+                await bot.show_main_menu(message, state)
+                self.assertIsNone(await state.get_state())
+                paused = bot.draft_slot(state, "legacy_provider")
+                self.assertEqual(await paused.get_state(), step.state)
+                self.assertEqual(await paused.get_data(), values)
+                self.assertIn("legacy_provider", dict(await bot.available_paused_actions(state)))
+                self.assertIn("provider_action", dict(await bot.available_paused_actions(state)))
+                state = FSMContext(bot.SQLiteDraftStorage(str(self.database)), state.key)
+                message.text = bot.LEGACY_PROVIDER_DRAFT
+                for restore in (bot.provider_start, bot.resume_auxiliary_action, bot.provider_start):
+                    message.answer.reset_mock()
+                    await restore(message, state)
+                    self.assertEqual(await state.get_state(), step.state)
+                    self.assertEqual(await state.get_data(), values)
+                    self.assertIn(prompt, message.answer.await_args.args[0])
+                    self.assertIsNone(await paused.get_state())
+                self.assertEqual(await modern.get_data(), {"consent": True, "name": "Новая регистрация"})
+                self.assertEqual(await modern.get_state(), provider_ui.Register.phone.state)
+                self.assertEqual(await lead.get_data(), {"equipment": "автокран"})
+                self.assertEqual(await business_rows(), before)
+        await state.set_state(bot.OfferForm.price)
+        await state.set_data({"lead_id": 1, "keep": "other form"})
+        await bot.resume_auxiliary_action(message, state)
+        self.assertEqual(await state.get_state(), bot.OfferForm.price.state)
+        self.assertEqual(await state.get_data(), {"lead_id": 1, "keep": "other form"})
 
     async def test_provider_resume_repeated_button_reopens_active_action_without_losing_data(self):
         backing = bot.SQLiteDraftStorage(str(self.database))

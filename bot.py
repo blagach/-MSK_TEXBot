@@ -182,6 +182,7 @@ FORM_STEPS = {step.state: step for step in (*LeadForm.__all_states__, *OfferForm
 LEAD_DRAFT = "▶️ Продолжить заявку"
 CANCEL_LEAD_DRAFT = "Отменить черновик"
 PROVIDER_ACTION_DRAFT = "▶️ Продолжить настройку исполнителя"
+LEGACY_PROVIDER_DRAFT = "▶️ Продолжить прежнюю анкету"
 SUPPORT_ACTION_DRAFT = "▶️ Продолжить обращение"
 CLOSING_ACTION_DRAFT = "▶️ Продолжить закрытие заявки"
 ADMIN_ACTION_DRAFT = "▶️ Продолжить настройку прав"
@@ -472,6 +473,8 @@ async def pause_form(message: Message, state: FSMContext) -> None:
     if current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__,
                    *provider_ui.AlertPreferences.__all_states_names__):
         kind = "provider_action"
+    elif current in ProviderForm.__all_states_names__:
+        kind = "legacy_provider"
     elif current in admin_ui.ManageAccess.__all_states_names__:
         kind = "admin_access"
     elif current in admin_ui.FindLead.__all_states_names__:
@@ -510,6 +513,7 @@ def auxiliary_specs():
     return (
         ("provider_action", PROVIDER_ACTION_DRAFT, (*provider_ui.Register.__all_states_names__,
          *provider_ui.AddMachine.__all_states_names__, *provider_ui.AlertPreferences.__all_states_names__), None),
+        ("legacy_provider", LEGACY_PROVIDER_DRAFT, ProviderForm.__all_states_names__, None),
         ("support_action", SUPPORT_ACTION_DRAFT, (support_ui.Support.compose.state,
          support_ui.Support.reply.state, support_ui.Support.requester_reply.state), None),
         ("lead_closing", CLOSING_ACTION_DRAFT, CloseLead.__all_states_names__, None),
@@ -573,7 +577,7 @@ async def paused_action(callback: CallbackQuery, state: FSMContext):
     await resume_auxiliary_kind(message, state, kind, callback.from_user.id)
 
 
-@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT, ADMIN_SEARCH_DRAFT, ADMIN_ACCESS_DRAFT, ADMIN_LEAD_SEARCH_DRAFT}))
+@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, LEGACY_PROVIDER_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT, ADMIN_SEARCH_DRAFT, ADMIN_ACCESS_DRAFT, ADMIN_LEAD_SEARCH_DRAFT}))
 async def resume_auxiliary_action(message: Message, state: FSMContext):
     # Keep older reply-keyboard labels as compatible aliases.
     kind = next((kind for kind, label, _, _ in auxiliary_specs() if label == message.text), None)
@@ -597,6 +601,7 @@ async def resume_auxiliary_kind(message: Message, state: FSMContext, kind: str, 
         await message.answer("Сохранённое действие не распознано. Черновик оставлен без изменений.")
         return
     provider = kind == "provider_action"
+    legacy_provider = kind == "legacy_provider"
     closing = kind == "lead_closing"
     admin_action = kind == "admin_action"
     admin_search = kind == "admin_search"
@@ -604,7 +609,9 @@ async def resume_auxiliary_kind(message: Message, state: FSMContext, kind: str, 
     admin_access_action = kind == "admin_access"
     if not current:
         active = await state.get_state()
-        if provider and active in (*provider_ui.Register.__all_states_names__,
+        if legacy_provider and active in ProviderForm.__all_states_names__:
+            await resume_legacy_provider_step(message, active)
+        elif provider and active in (*provider_ui.Register.__all_states_names__,
                                    *provider_ui.AddMachine.__all_states_names__,
                                    *provider_ui.AlertPreferences.__all_states_names__):
             await message.answer("Действие исполнителя уже открыто. Продолжите на экране ниже.",
@@ -632,6 +639,8 @@ async def resume_auxiliary_kind(message: Message, state: FSMContext, kind: str, 
         await admin_ui.resume_admin_step(message, state)
     elif closing:
         await show_closing_step(message, state)
+    elif legacy_provider:
+        await resume_legacy_provider_step(message, current)
     elif provider:
         await message.answer("Продолжим сохранённое действие исполнителя.",
                              reply_markup=provider_ui.registration_keyboard() if current in
@@ -639,6 +648,15 @@ async def resume_auxiliary_kind(message: Message, state: FSMContext, kind: str, 
         await provider_ui.resume_provider_step(message, state, current)
     else:
         await support_ui.resume_support_step(message, state, current)
+
+
+async def resume_legacy_provider_step(message: Message, current: str) -> None:
+    prompts = {
+        ProviderForm.equipment.state: "Какую технику вы предоставляете?",
+        ProviderForm.location.state: "В каких районах работаете?",
+        ProviderForm.phone.state: "Оставьте телефон для связи.",
+    }
+    await message.answer(prompts[current], reply_markup=provider_ui.section_keyboard((provider_ui.HOME,)))
 
 
 async def restore_form_step(message: Message, state: FSMContext, current: str) -> None:
@@ -1694,6 +1712,10 @@ async def submit_lead(message, customer, state, bot, data):
 
 @router.message(F.text == LEGACY_PROVIDER)
 async def provider_start(message: Message, state: FSMContext) -> None:
+    if (await state.get_state() in ProviderForm.__all_states_names__
+            or await draft_slot(state, "legacy_provider").get_state()):
+        await resume_auxiliary_kind(message, state, "legacy_provider", state.key.user_id)
+        return
     await pause_form(message, state)
     await state.set_state(ProviderForm.equipment)
     await message.answer("Какую технику вы предоставляете?", reply_markup=ReplyKeyboardRemove())
