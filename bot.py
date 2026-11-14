@@ -28,7 +28,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     User,
 )
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from dotenv import load_dotenv
 
 from draft_storage import SQLiteDraftStorage, draft_slot, offer_draft_ids, offer_draft_slot
@@ -1878,8 +1878,22 @@ async def admin_lead_id(callback: CallbackQuery, prefix: str):
 
 
 async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
-    if not settings.test_notification_provider_ids:
+    # Preserve the restricted test path. Production requires a verified scope
+    # bound to this Bot instance, never just an empty test allowlist.
+    scope = getattr(bot, "_provider_notification_scope", None)
+    production = (isinstance(scope, provider_dispatch.ProductionNotificationScope)
+                  and scope.bot_id == bot.id and scope.channel_id == settings.leads_channel_id
+                  and not settings.test_notification_provider_ids)
+    if not settings.test_notification_provider_ids and not production:
         return
+    if production:
+        async with aiosqlite.connect(storage.DB_PATH) as db:
+            published_here = await (await db.execute(
+                "SELECT 1 FROM lead_publications WHERE lead_id=? AND chat_id=?",
+                (lead["id"], scope.channel_id),
+            )).fetchone()
+        if not published_here:
+            return  # No test-channel or unconfirmed publication can fan out.
     routing = await lead_routing.get(lead["id"], storage.DB_PATH)
     if not routing:
         return
@@ -1890,19 +1904,40 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
         lead_id=lead["id"], **routing, work_date=lead["work_date"],
         details=lead["details"],
     )
-    for provider_id in recipients:
-        if provider_id not in settings.test_notification_provider_ids:
-            continue
-        still_eligible = await provider_dispatch.recipients_for_lead(**routing, db_path=storage.DB_PATH)
-        if provider_id not in still_eligible or not await notification_reservations.reserve(
-            lead["id"], provider_id, storage.DB_PATH,
-        ):
-            continue
-        delivered = await notify(bot, provider_id, public_text(text),
-                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead["id"], private=True)]]))
-        await notification_reservations.record_outcome(
-            lead["id"], provider_id, "confirmed" if delivered else "uncertain", storage.DB_PATH,
-        )
+    lock = scope.lock if production else asyncio.Lock()
+    async with lock:
+        for provider_id in recipients:
+            if not production and provider_id not in settings.test_notification_provider_ids:
+                continue
+            still_eligible = await provider_dispatch.recipients_for_lead(**routing, db_path=storage.DB_PATH)
+            if provider_id not in still_eligible or not await notification_reservations.reserve(
+                lead["id"], provider_id, storage.DB_PATH,
+            ):
+                continue
+            delivered = await send_provider_notification(bot, provider_id, public_text(text),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead["id"], private=True)]]))
+            await notification_reservations.record_outcome(
+                lead["id"], provider_id, "confirmed" if delivered else "uncertain", storage.DB_PATH,
+            )
+            if production:
+                # One shared production lock also paces concurrent publications.
+                await asyncio.sleep(1.05)
+
+
+async def send_provider_notification(telegram, recipient, text, **kwargs):
+    for attempt in range(2):
+        try:
+            await telegram.send_message(recipient, text, **kwargs)
+            return True
+        except TelegramRetryAfter as error:
+            # A 429 explicitly rejected this request. Only this definite rejection
+            # is retried once; timeout/network/unknown outcomes are never retried.
+            logging.warning("Provider notification rate limited")
+            await asyncio.sleep(max(1, error.retry_after))
+        except TelegramAPIError as error:
+            logging.warning("Provider notification not confirmed: %s", type(error).__name__)
+            return False
+    return False
 
 
 @router.callback_query(F.data.startswith("publish:"))
@@ -2045,6 +2080,11 @@ async def main() -> None:
     drafts = SQLiteDraftStorage(storage.DB_PATH)
     await drafts.init_schema()
     bot = Bot(token=settings.token)
+    bot._provider_notification_scope = await provider_dispatch.verify_production_scope(
+        bot, settings.bot_username, settings.leads_channel_id,
+        restricted_ids=settings.test_notification_provider_ids,
+        test_configured=bool(os.getenv("TEST_BOT_TOKEN") or os.getenv("TESTER_IDS")),
+    )
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="menu", description="Открыть меню"),

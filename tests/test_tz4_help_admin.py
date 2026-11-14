@@ -57,11 +57,13 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
         before = await rows()
         telegram = Record(set_my_commands=AsyncMock())
         dispatcher = Record(start_polling=AsyncMock())
-        with patch.object(bot, "Bot", return_value=telegram), patch.object(
+        with patch.object(bot.provider_dispatch, "verify_production_scope", new_callable=AsyncMock) as verify, patch.object(bot, "Bot", return_value=telegram), patch.object(
             bot, "create_dispatcher", return_value=dispatcher,
         ) as factory:
             await bot.main()
         drafts = factory.call_args.args[0]
+        verify.assert_awaited_once()
+        self.assertIs(telegram._provider_notification_scope, verify.return_value)
         self.assertIsInstance(drafts, bot.SQLiteDraftStorage)
         self.assertEqual(drafts.db_path, str(self.database))
         factory.assert_called_once_with(drafts)
