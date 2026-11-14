@@ -204,7 +204,7 @@ class LocalAdminUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.transport.calls), 1)
         self.assertEqual(self.transport.calls[0][1]['text'], 'Учебная кампания')
         with self.store.connection() as db:
-            self.assertEqual(db.execute('SELECT status FROM sandbox_campaign_queue WHERE campaign=?', (cid,)).fetchone()[0], 'reserved')
+            self.assertEqual(db.execute('SELECT status FROM sandbox_campaign_queue WHERE campaign=?', (cid,)).fetchone()[0], 'uncertain')
             self.assertEqual(db.execute('SELECT status FROM sandbox_campaign_queue WHERE campaign=?', (other,)).fetchone()[0], 'pending')
 
     async def test_real_session_and_live_transport_are_rejected_without_network(self):

@@ -1,7 +1,7 @@
-"""Persistent local administrative screens. No bot wiring, polling or network.
+"""Persistent TEST administrative screens, always using fake campaign delivery.
 
-Only the separate LocalPreviewSession below can render these screens through
-aiogram. All campaign delivery uses FakeTransport and all payment events TEST.
+Rendered locally by LocalPreviewSession, or by the explicitly verified isolated
+test adapter. No real payment provider or campaign sender is accepted.
 """
 import json
 import threading
@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from sandbox_campaigns import FakeTransport, SandboxCampaigns, moscow_instant
 from sandbox_payments import FakePaymentProvider, SandboxPayments, canonical, positive
 from sandbox_store import instant
+from sandbox_scheduler import SandboxScheduler
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class LocalAdmin:
         self.transport = transport if transport is not None else FakeTransport()
         if type(self.transport) is not FakeTransport:
             raise TypeError('Only FakeTransport is permitted')
+        self.scheduler = SandboxScheduler(self.campaigns, self.transport)
         self.provider = FakePaymentProvider()
         self.lock = threading.RLock()
         store.schema('''
@@ -47,6 +49,10 @@ class LocalAdmin:
             CREATE TABLE IF NOT EXISTS sandbox_consent_panels (
                 recipient INTEGER PRIMARY KEY REFERENCES sandbox_recipients(id),
                 nonce TEXT NOT NULL, panel_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS sandbox_admin_prompts (
+                actor INTEGER NOT NULL, message_id INTEGER NOT NULL, nonce TEXT NOT NULL,
+                PRIMARY KEY(actor,message_id)
             );
         ''')
 
@@ -107,6 +113,7 @@ class LocalAdmin:
         with self.store.transaction() as db:
             db.execute('UPDATE sandbox_admin_sessions SET prompt_id=? WHERE actor=? AND nonce=? AND busy=0',
                        (message_id, actor, nonce))
+            db.execute('INSERT OR IGNORE INTO sandbox_admin_prompts VALUES (?,?,?)', (actor, message_id, nonce))
 
     def render(self, actor):
         self.allowed(actor)
@@ -167,11 +174,13 @@ class LocalAdmin:
                       'cancelled': 'Тест: отменить заказ', 'refunded': 'Тест: полный возврат'}
             buttons = [button(labels[x], 'pask', x) for x in actions]
             buttons.extend((button('К списку платежей', 'payments'), home))
-            expires = (datetime.fromtimestamp(order['expires_at'], ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M МСК')
-                       if order['expires_at'] is not None else 'без ограничения')
+            expiry = order.get('grant_expires_at', order['expires_at'])
+            expires = (datetime.fromtimestamp(expiry, ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M МСК')
+                       if expiry is not None else 'после подтверждения' if order.get('duration') else 'без ограничения')
+            quota = ('Доступ на срок, без расхода квоты' if order.get('grant_mode') == 'period' else
+                     f"Квота: {order['units']}; остаток: {right['remaining'] if right else 0}")
             text = (f"Заказ {order['id']}\nСтатус: {status}\nПлательщик: {order['payer']}\n"
-                    f"Условная сумма: {order['amount']} TEST — не тариф\nКвота: {order['units']}"
-                    f"; остаток: {right['remaining'] if right else 0}\nСрок права: {expires}\n"
+                    f"Условная сумма: {order['amount']} TEST — не тариф\n{quota}\nСрок права: {expires}\n"
                     f"Последние события: {', '.join(r[0] for r in events) or 'нет'}")
             return Panel(text, tuple(buttons))
         if state == 'pconfirm':
@@ -203,6 +212,8 @@ class LocalAdmin:
                 raise ValueError('Кампания не найдена.')
             report = self.campaigns.report(actor, d['id'])
             buttons = []
+            if any(r['status'] == 'uncertain' for r in report):
+                buttons.append(button('Неопределённые результаты', 'quarantine'))
             if row['state'] in ('draft', 'approved'):
                 rev = str(row['revision'])
                 buttons.extend((button('Изменить текст', 'edit', rev), button('Добавить вложение', 'attach', rev),
@@ -223,6 +234,15 @@ class LocalAdmin:
             return Panel(f"Кампания {d['id']}\nРедакция: {row['revision']}; статус: {row['state']}\nВремя: {run_at}\n"
                          f"{summary}\nЖурнал: {', '.join(r[0] for r in events) or 'нет событий'}\n"
                          'sent означает ответ подставного транспорта, а не прочтение.', tuple(buttons))
+        if state == 'quarantine':
+            with self.store.connection() as db:
+                rows = db.execute('''SELECT q.revision,q.recipient,coalesce(x.reason,'historical_uncertain') AS reason
+                    FROM sandbox_campaign_queue q LEFT JOIN sandbox_campaign_quarantine x
+                    ON x.campaign=q.campaign AND x.revision=q.revision AND x.recipient=q.recipient
+                    WHERE q.campaign=? AND q.status='uncertain' ORDER BY q.revision,q.recipient LIMIT 10''', (d['id'],)).fetchall()
+            text = '\n'.join(f"r{r['revision']} · {r['recipient']} · {r['reason']}" for r in rows)
+            return Panel('Неопределённые результаты. Автоповтора нет.\n'+(text or 'Нет записей.'),
+                         (button('К кампании', 'camp', d['id']), home))
         if state == 'preview':
             p = d['preview']
             at = datetime.fromtimestamp(p['run_at'], ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M:%S МСК')
@@ -260,7 +280,7 @@ class LocalAdmin:
                     with self.store.connection() as db:
                         order = dict(db.execute('SELECT * FROM sandbox_orders WHERE id=?', (d['id'],)).fetchone())
                     event = self.provider.event(order, d['outcome'], f'ui:{actor}:{nonce}')
-                    self.payments.apply_event(self.provider, event)
+                    self.payments.apply_event(self.provider, event, now=now)
                     screen, d = 'pay', {'id': d['id']}
                 elif action == 'new':
                     screen, d = 'role', {}
@@ -274,6 +294,8 @@ class LocalAdmin:
                     screen, d = 'compose', {**d, 'categories': []}
                 elif action == 'cats':
                     screen = 'cats'
+                elif action == 'quarantine':
+                    screen = 'quarantine'
                 elif action in ('edit', 'attach', 'schedule', 'nomedia', 'pause', 'resume', 'step'):
                     with self.store.connection() as db:
                         row = dict(db.execute('SELECT * FROM sandbox_campaigns WHERE id=?', (d['id'],)).fetchone())
@@ -290,7 +312,8 @@ class LocalAdmin:
                         getattr(self.campaigns, action)(actor, d['id'], d['revision'], now)
                     elif action == 'step':
                         self.allowed(actor, finance=True)
-                        self.campaigns.deliver_next(self.transport, now, campaign=d['id'])
+                        if self.scheduler.tick(now, campaign=d['id'])['busy']:
+                            raise ValueError('Очередь уже обрабатывается; обновите отчёт.')
                 elif action == 'approve':
                     p = d['preview']
                     if p['run_at'] < now:

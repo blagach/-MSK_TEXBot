@@ -1,13 +1,14 @@
-"""An aiogram adapter with a non-network session; never a Telegram sender.
+"""Local aiogram adapter with an explicit opt-in isolated-test session guard.
 
-There is no polling entrypoint and no token/config import. Used only by local
-dispatcher acceptance tests with synthetic updates and owned sandbox SQLite.
+Default execution is network-free. A separately verified test scope permits
+interactive screens for approved testers, while campaign delivery remains fake.
+There is no separate polling entrypoint.
 """
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 
 class LocalPreviewSession(BaseSession):
@@ -41,15 +42,56 @@ def local_bot():
     return Bot('99:LOCAL_PREVIEW_ONLY', session=LocalPreviewSession())
 
 
-def local_dispatcher(admin, clock):
-    """Build standalone local routes; never add these to the deployed bot."""
+def local_dispatcher(admin, clock, *, checkout=None, business=None, scheduler_interval=None,
+                     dispatcher=None, admin_command='start', test_scope=None):
+    """Build local routes or attach them to the verified isolated test dispatcher."""
     router = Router(name='sandbox_local_admin')
-    dispatcher = Dispatcher()
+    dispatcher = dispatcher if dispatcher is not None else Dispatcher()
+    if test_scope is not None:
+        from sandbox_test_runtime import VerifiedTestScope
+        if type(test_scope) is not VerifiedTestScope or admin.store.test_scope is not test_scope:
+            raise RuntimeError('Only an authenticated feature sidecar can use a test Telegram session')
+    def permitted_session(bot, uid=None, chat=None):
+        if test_scope is not None:
+            test_scope.session(bot, uid, chat)
+        elif type(bot.session) is not LocalPreviewSession or bot.id != 99:
+            raise RuntimeError('A real Telegram session is forbidden')
+    if checkout is not None:
+        from sandbox_checkout_ui import checkout_router
+        dispatcher.include_router(checkout_router(checkout, clock, session_guard=permitted_session))
     dispatcher.include_router(router)
 
+    async def current_staff(uid):
+        if getattr(admin, 'before_action', None) is not None:
+            await admin.before_action()
+        if business is not None:
+            if business.owner != admin.owner:
+                raise RuntimeError('Local owner configuration mismatch')
+            _, permissions = await business.staff(uid)
+            admin.marketers.discard(uid)
+            if 'marketing' in permissions:
+                admin.marketers.add(uid)
+
+    if scheduler_interval is not None:
+        import asyncio
+        stop, task = asyncio.Event(), None
+        async def startup(bot):
+            nonlocal task
+            permitted_session(bot)
+            if task is not None and not task.done():
+                raise RuntimeError('The local scheduler is already running')
+            stop.clear()
+            task = asyncio.create_task(admin.scheduler.run(stop, clock, interval=scheduler_interval,
+                          before_tick=getattr(admin, 'before_action', None)))
+        async def shutdown():
+            stop.set()
+            if task is not None:
+                await task
+        dispatcher.startup.register(startup)
+        dispatcher.shutdown.register(shutdown)
+
     def actor(message, bot):
-        if type(bot.session) is not LocalPreviewSession or bot.id != 99:
-            raise RuntimeError('A real Telegram session is forbidden')
+        permitted_session(bot, message.from_user.id if message.from_user else None, message.chat)
         if (message.chat.type != 'private' or not message.from_user or message.from_user.is_bot
                 or message.chat.id != message.from_user.id):
             raise PermissionError('Only a private synthetic conversation is permitted')
@@ -65,14 +107,16 @@ def local_dispatcher(admin, clock):
             await message.answer(panel.preview_text, parse_mode=None)
         for item in panel.attachments:
             await getattr(message.bot, 'send_' + item['kind'])(chat_id=uid, **{item['kind']: item['token']})
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=label, callback_data=data)] for label, data in panel.buttons])
+        markup = (ForceReply(selective=True, input_field_placeholder='Ответ на текущий вопрос') if panel.expects_input else
+                  InlineKeyboardMarkup(inline_keyboard=[
+                      [InlineKeyboardButton(text=label, callback_data=data)] for label, data in panel.buttons]))
         sent = await message.answer(panel.text, reply_markup=markup, parse_mode=None)
         admin.set_prompt(uid, admin.session(uid)['nonce'], sent.message_id)
 
-    @router.message(CommandStart())
+    @router.message(Command(admin_command))
     async def start(message: Message, bot):
         uid = actor(message, bot)
+        await current_staff(uid)
         old = admin.session(uid)
         try:
             panel = admin.start(uid)
@@ -101,6 +145,8 @@ def local_dispatcher(admin, clock):
     @router.message(Command('consent'))
     async def consent(message: Message, bot):
         uid = actor(message, bot)
+        if getattr(admin, 'before_action', None) is not None:
+            await admin.before_action()
         try:
             await post_consent(message, uid)
         except ValueError as error:
@@ -108,9 +154,10 @@ def local_dispatcher(admin, clock):
 
     @router.callback_query(F.data.startswith('sc:'))
     async def consent_click(callback, bot):
-        if type(bot.session) is not LocalPreviewSession or bot.id != 99:
-            raise RuntimeError('A real Telegram session is forbidden')
         uid = callback.from_user.id
+        permitted_session(bot, uid, callback.message.chat if callback.message else None)
+        if getattr(admin, 'before_action', None) is not None:
+            await admin.before_action()
         if not callback.message or callback.message.chat.type != 'private' or callback.message.chat.id != uid:
             await callback.answer('Нет доступа.')
             return
@@ -129,14 +176,14 @@ def local_dispatcher(admin, clock):
     async def click(callback, bot):
         # Callback messages are authored by the bot; authorization always uses
         # callback.from_user rather than message.from_user.
-        if type(bot.session) is not LocalPreviewSession or bot.id != 99:
-            raise RuntimeError('A real Telegram session is forbidden')
         uid = callback.from_user.id
+        permitted_session(bot, uid, callback.message.chat if callback.message else None)
         if not callback.message or callback.message.chat.type != 'private' or callback.message.chat.id != uid:
             await callback.answer('Нет доступа.')
             return
         old = admin.session(uid)
         try:
+            await current_staff(uid)
             panel = admin.handle(uid, callback.data, clock())
         except (ValueError, PermissionError) as error:
             await callback.answer(str(error), show_alert=True)
@@ -149,9 +196,21 @@ def local_dispatcher(admin, clock):
         await callback.answer()
         await post(callback.message, panel, uid, old['prompt_id'] if old else None)
 
-    @router.message()
+    def local_form_input(message):
+        uid = message.from_user.id if message.from_user else None
+        if uid is None or (message.text or '').startswith('/'):
+            return False
+        if message.reply_to_message:
+            with admin.store.connection() as db:
+                if db.execute('SELECT 1 FROM sandbox_admin_prompts WHERE actor=? AND message_id=?',
+                              (uid, message.reply_to_message.message_id)).fetchone():
+                    return True
+        return False
+
+    @router.message(local_form_input)
     async def input_message(message: Message, bot):
         uid = actor(message, bot)
+        await current_staff(uid)
         old = admin.session(uid)
         if not old or not message.reply_to_message or message.reply_to_message.message_id != old['prompt_id']:
             await message.answer('Ответьте на последнее сообщение текущей формы.')

@@ -7,7 +7,11 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sandbox_payments import canonical, positive
-from sandbox_store import instant
+from sandbox_store import SandboxBusy, instant
+
+
+class FakeTransportFailure(RuntimeError):
+    pass
 
 
 def moscow_instant(text):
@@ -41,7 +45,9 @@ class FakeTransport:
                 raise ValueError('Invalid explicit fake retry delay')
             return result
         if result not in ('sent', 'uncertain', 'rejected_429', 'failed'):
-            raise RuntimeError('Unexpected fake transport failure')
+            if result == 'timeout':
+                raise TimeoutError('Fake transport timeout; result unknown')
+            raise FakeTransportFailure('Unexpected fake transport failure')
         return result
 
 
@@ -87,6 +93,11 @@ class SandboxCampaigns:
             CREATE TABLE IF NOT EXISTS sandbox_campaign_controls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, campaign TEXT NOT NULL REFERENCES sandbox_campaigns(id),
                 revision INTEGER NOT NULL, actor INTEGER NOT NULL, action TEXT NOT NULL, at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sandbox_campaign_quarantine (
+                campaign TEXT NOT NULL, revision INTEGER NOT NULL, recipient INTEGER NOT NULL,
+                reason TEXT NOT NULL, recorded_at REAL NOT NULL,
+                PRIMARY KEY(campaign,revision,recipient)
             );
         ''')
 
@@ -237,6 +248,11 @@ class SandboxCampaigns:
 
     def recover_reserved(self, now):
         """Explicit local recovery: ambiguous reservations are never requeued."""
+        with self.store.exclusive('campaign'):
+            return self._recover_reserved(now)
+
+    def _recover_reserved(self, now):
+        self.store.require_lock('campaign')
         instant(now)
         with self.store.transaction() as db:
             rows = db.execute("SELECT * FROM sandbox_campaign_queue WHERE status='reserved'").fetchall()
@@ -244,6 +260,7 @@ class SandboxCampaigns:
                 db.execute("UPDATE sandbox_campaign_queue SET status='uncertain' WHERE campaign=? AND revision=? AND recipient=?",
                            (row['campaign'], row['revision'], row['recipient']))
                 self.event(db, row, 'uncertain_after_restart', now)
+                self.quarantine(db, row, 'uncertain_after_restart', now)
                 self.finish(db, row['campaign'], row['revision'])
             return len(rows)
 
@@ -280,6 +297,14 @@ class SandboxCampaigns:
             return True
 
     def deliver_next(self, transport, now, *, campaign=None):
+        try:
+            with self.store.exclusive('campaign'):
+                return self._deliver_next(transport, now, campaign=campaign)
+        except SandboxBusy:
+            return None
+
+    def _deliver_next(self, transport, now, *, campaign=None):
+        self.store.require_lock('campaign')
         if type(transport) is not FakeTransport:
             raise TypeError('Only the local fake transport is permitted')
         instant(now)
@@ -327,8 +352,15 @@ class SandboxCampaigns:
             db.execute('UPDATE sandbox_campaign_queue SET status=?,retries=retries+? WHERE campaign=? AND revision=? AND recipient=?',
                        (status, int(outcome == 'rejected_429'), row['campaign'], row['revision'], row['recipient']))
             self.event(db, row, outcome, now)
+            if status == 'uncertain':
+                self.quarantine(db, row, 'transport_uncertain', now)
             self.finish(db, row['campaign'], row['revision'])
             return status
+
+    @staticmethod
+    def quarantine(db, row, reason, now):
+        db.execute('INSERT OR IGNORE INTO sandbox_campaign_quarantine VALUES (?,?,?,?,?)',
+                   (row['campaign'], row['revision'], row['recipient'], reason, now))
 
     def report(self, actor, campaign):
         self.editor(actor)

@@ -355,7 +355,9 @@ class LocalSandboxTests(unittest.TestCase):
         original = transport.send
         def recover_during_fake_io(recipient, payload):
             result = original(recipient, payload)
-            self.assertEqual(self.campaigns.recover_reserved(1001), 1)
+            # Fault-inject legacy/manual recovery under the held coordinator.
+            # The public recovery entry now rejects a concurrent sender.
+            self.assertEqual(self.campaigns._recover_reserved(1001), 1)
             return result
         transport.send = recover_during_fake_io
         self.assertEqual(self.campaigns.deliver_next(transport, 1000), 'uncertain')

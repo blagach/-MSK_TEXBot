@@ -15,6 +15,10 @@ on:
       - "sandbox_*.py"
       - tests/test_local_sandbox.py
       - tests/test_sandbox_admin_ui.py
+      - tests/test_sandbox_checkout_scheduler.py
+      - tests/test_sandbox_test_runtime.py
+      - render_test_start.py
+      - screen_controls.py
       - requirements.txt
       - tests/test_tz4_help_admin.py
       - provider_registry.py

@@ -2101,7 +2101,12 @@ async def check_user_access(handler, event, data):
     handler_module = getattr(getattr(data.get("handler"),"callback",None),"__module__","")
     support = callback.startswith("help:") or handler_module == "support_ui" or text.startswith("/support ")
     read_only = callback.startswith(("lc:open:", "lc:list:", "lc:offers:", "lc:myoffers:", "offer_call:"))
-    if navigation or support or read_only:
+    # The installed test lab rechecks actor/resource rights itself. An account
+    # restriction must not prevent its owner from refusing marketing messages
+    # or cancelling their own unpaid TEST order. This path is absent by default.
+    test_account_controls = data.get('test_feature_lab', False) and (
+        callback.startswith(('co:', 'sc:')) or text.split('@')[0] in ('/checkout', '/consent'))
+    if navigation or support or read_only or test_account_controls:
         return await handler(event, data)
     saved = await user_access.snapshot(event.from_user.id)
     operation = None
@@ -2121,11 +2126,12 @@ async def check_user_access(handler, event, data):
     return await handler(event, data)
 
 
-def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatcher:
+def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None, *, test_features=None) -> Dispatcher:
     dispatcher = Dispatcher(
         storage=fsm_storage or MemoryStorage(), events_isolation=SimpleEventIsolation(),
         support_admin_ids=settings.admin_ids, support_group_id=settings.support_group_id,
         service_owner_id=settings.owner_id,
+        test_feature_lab=test_features is not None,
     )
     dispatcher.startup.register(admin_access.recover_exports)
     controls = ScreenControls()
@@ -2136,6 +2142,11 @@ def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatch
     dispatcher.callback_query.outer_middleware(track_private_visitor)
     dispatcher.message.middleware(check_user_access)
     dispatcher.callback_query.middleware(check_user_access)
+    if test_features is not None:
+        from sandbox_test_runtime import TestFeatures
+        if type(test_features) is not TestFeatures:
+            raise RuntimeError('Only a verified isolated test feature lab may be installed')
+        test_features.install(dispatcher)
     dispatcher.include_router(router)
     dispatcher.include_router(provider_ui.router)
     dispatcher.include_router(support_ui.router)

@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import json
+from pathlib import Path
 from uuid import uuid4
 
 from sandbox_store import instant
@@ -83,35 +84,61 @@ class SandboxPayments:
                 order_id TEXT NOT NULL REFERENCES sandbox_orders(id),
                 PRIMARY KEY(payer,request_key)
             );
+            CREATE TABLE IF NOT EXISTS sandbox_right_policies (
+                order_id TEXT PRIMARY KEY REFERENCES sandbox_orders(id),
+                grant_mode TEXT NOT NULL CHECK(grant_mode IN ('quota','period')),
+                duration REAL
+            );
         ''')
 
-    def create_order(self, payer, request_key, capability, amount, units=1, expires_at=None, currency='TEST'):
+    def create_order(self, payer, request_key, capability, amount, units=1, expires_at=None, currency='TEST',
+                     *, grant_mode='quota', duration=None):
+        with self.store.transaction() as db:
+            return self.create_order_in(db, payer, request_key, capability, amount, units, expires_at, currency,
+                                        grant_mode=grant_mode, duration=duration)
+
+    def create_order_in(self, db, payer, request_key, capability, amount, units=1, expires_at=None, currency='TEST',
+                        *, grant_mode='quota', duration=None):
+        """Participate in the caller's owned sandbox transaction (checkout)."""
+        self.store.validate()
+        databases = db.execute('PRAGMA database_list').fetchall()
+        if not db.in_transaction or not any(r[1] == 'main' and Path(r[2]).resolve() == self.store.path for r in databases):
+            raise ValueError('An owned sandbox transaction is required')
         positive(payer); positive(amount); positive(units)
         if currency != 'TEST' or not request_key or not capability:
             raise ValueError('Only explicit TEST orders with a capability and request key are allowed')
         if expires_at is not None:
             expires_at = instant(expires_at)
+        if duration is not None:
+            duration = instant(duration)
+            if duration <= 0 or expires_at is not None:
+                raise ValueError('Use either absolute expiry or a positive grant duration')
+        if grant_mode not in ('quota', 'period') or (grant_mode == 'period' and (duration is None or units != 1)):
+            raise ValueError('A period grant needs a duration and one nonconsumable unit')
         payload = dict(payer=payer, capability=capability, amount=amount, currency=currency,
                        units=units, expires_at=expires_at)
+        if grant_mode != 'quota' or duration is not None:
+            payload.update(grant_mode=grant_mode, duration=duration)
         digest = hashlib.sha256(canonical(payload).encode()).hexdigest()
-        with self.store.transaction() as db:
-            old = db.execute('SELECT * FROM sandbox_orders WHERE payer=? AND request_key=?',
-                             (payer, request_key)).fetchone()
-            if old:
-                if old['payload_hash'] != digest:
-                    raise ValueError('Request key reused for a different order')
-                return self._order_view(db, old)
-            order_id = uuid4().hex
-            db.execute('INSERT INTO sandbox_orders VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                       (order_id, payer, request_key, capability, amount, currency, units, expires_at,
-                        'pending', 'fake_' + order_id, digest))
-            return dict(db.execute('SELECT * FROM sandbox_orders WHERE id=?', (order_id,)).fetchone())
+        old = db.execute('SELECT * FROM sandbox_orders WHERE payer=? AND request_key=?',
+                         (payer, request_key)).fetchone()
+        if old:
+            if old['payload_hash'] != digest:
+                raise ValueError('Request key reused for a different order')
+            return self._order_view(db, old)
+        order_id = uuid4().hex
+        db.execute('INSERT INTO sandbox_orders VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                   (order_id, payer, request_key, capability, amount, currency, units, expires_at,
+                    'pending', 'fake_' + order_id, digest))
+        if grant_mode != 'quota' or duration is not None:
+            db.execute('INSERT INTO sandbox_right_policies VALUES (?,?,?)', (order_id, grant_mode, duration))
+        return self._order_view(db, db.execute('SELECT * FROM sandbox_orders WHERE id=?', (order_id,)).fetchone())
 
-    def confirm(self, provider, event):
+    def confirm(self, provider, event, *, now=None):
         """Compatibility entrypoint: it accepts only a paid event."""
-        return self.apply_event(provider, event, expected_status='paid')
+        return self.apply_event(provider, event, expected_status='paid', now=now)
 
-    def apply_event(self, provider, event, expected_status=None):
+    def apply_event(self, provider, event, expected_status=None, *, now=None):
         if type(provider) is not FakePaymentProvider:
             raise TypeError('Only the fake provider is permitted')
         data = provider.verify(event)
@@ -152,8 +179,12 @@ class SandboxPayments:
                 return True
             if order['status'] == 'paid':
                 return False
+            policy = db.execute('SELECT duration FROM sandbox_right_policies WHERE order_id=?', (order['id'],)).fetchone()
+            expiry = order['expires_at']
+            if policy and policy[0] is not None:
+                expiry = instant(instant(now) + policy[0])
             db.execute('INSERT INTO sandbox_rights VALUES (?,?,?,?,?)',
-                       (order['id'], order['payer'], order['capability'], order['units'], order['expires_at']))
+                       (order['id'], order['payer'], order['capability'], order['units'], expiry))
             db.execute("UPDATE sandbox_orders SET status='paid' WHERE id=?", (order['id'],))
             return True
 
@@ -170,12 +201,14 @@ class SandboxPayments:
                 if db.execute('SELECT 1 FROM sandbox_payment_refunds WHERE order_id=?', (old[0],)).fetchone():
                     return None
                 return old[0], False
-            grant = db.execute('''SELECT order_id FROM sandbox_rights
-                WHERE payer=? AND capability=? AND remaining>0 AND (expires_at IS NULL OR expires_at>?)
-                ORDER BY expires_at IS NULL,expires_at,order_id LIMIT 1''', (payer, capability, now)).fetchone()
+            grant = db.execute('''SELECT r.order_id,coalesce(p.grant_mode,'quota') AS grant_mode FROM sandbox_rights r
+                LEFT JOIN sandbox_right_policies p ON p.order_id=r.order_id
+                WHERE r.payer=? AND r.capability=? AND r.remaining>0 AND (r.expires_at IS NULL OR r.expires_at>?)
+                ORDER BY r.expires_at IS NULL,r.expires_at,r.order_id LIMIT 1''', (payer, capability, now)).fetchone()
             if not grant:
                 return None
-            db.execute('UPDATE sandbox_rights SET remaining=remaining-1 WHERE order_id=?', (grant[0],))
+            if grant['grant_mode'] == 'quota':
+                db.execute('UPDATE sandbox_rights SET remaining=remaining-1 WHERE order_id=?', (grant[0],))
             db.execute('INSERT INTO sandbox_usages VALUES (?,?,?,?)', (payer, capability, request_key, grant[0]))
             return grant[0], True
 
@@ -192,6 +225,10 @@ class SandboxPayments:
         # Keep the original paid capture as history; refund is a separate,
         # durable financial event. Every order read uses this effective state.
         result = dict(row)
+        policy = db.execute('SELECT grant_mode,duration FROM sandbox_right_policies WHERE order_id=?', (row['id'],)).fetchone()
+        if policy:
+            right = db.execute('SELECT expires_at FROM sandbox_rights WHERE order_id=?', (row['id'],)).fetchone()
+            result.update(grant_mode=policy[0], duration=policy[1], grant_expires_at=right[0] if right else None)
         if db.execute('SELECT 1 FROM sandbox_payment_refunds WHERE order_id=?', (row['id'],)).fetchone():
             result['status'] = 'refunded'
         elif row['status'] == 'pending':
