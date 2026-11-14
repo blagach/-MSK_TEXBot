@@ -192,6 +192,16 @@ PAUSED_ACTIONS = "🗂 Незавершённые действия"
 CUSTOMER_ROLE = "📋 Я заказчик"
 PROVIDER_ROLE = "🚜 Я исполнитель"
 MY_LEADS = "📋 Мои заявки"
+WELCOME_TEXT = (
+    "👋 Добро пожаловать в MSK TEXBot!\n\n"
+    "Строительная спецтехника в Москве и Московской области.\n\n"
+    "📋 Заказчику — разместите заявку с видом техники, местом и временем работ. "
+    "Подходящие исполнители смогут связаться с вами.\n\n"
+    "🚜 Исполнителю — добавьте технику, выберите регионы и подписки, чтобы получать "
+    "подходящие заявки и открывать контакты заказчиков.\n\n"
+    "Выберите свою роль. Её можно сменить через главное меню. Если нужна помощь — "
+    "нажмите «Помощь / Поддержка»."
+)
 OFFER_EDIT_FIELDS = {
     "price": ("💰 Стоимость", OfferForm.price),
     "comment": ("📋 Условия", OfferForm.comment),
@@ -981,7 +991,7 @@ async def open_offer(message: Message, state: FSMContext, lead_id: int | None, u
 async def start(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await message.answer(
-        "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
+        WELCOME_TEXT,
         reply_markup=await menu_with_paused_actions(state),
     )
 

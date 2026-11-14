@@ -28,6 +28,97 @@ import support_ui
 
 
 class AuxiliaryMenuTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_and_repeated_start_keep_approved_welcome_and_all_independent_drafts(self):
+        from contextlib import ExitStack
+        from aiogram import Bot
+        from aiogram.methods import SendMessage
+        from aiogram.types import Update
+
+        approved = (
+            '👋 Добро пожаловать в MSK TEXBot!\n\n'
+            'Строительная спецтехника в Москве и Московской области.\n\n'
+            '📋 Заказчику — разместите заявку с видом техники, местом и временем работ. '
+            'Подходящие исполнители смогут связаться с вами.\n\n'
+            '🚜 Исполнителю — добавьте технику, выберите регионы и подписки, чтобы получать '
+            'подходящие заявки и открывать контакты заказчиков.\n\n'
+            'Выберите свою роль. Её можно сменить через главное меню. Если нужна помощь — '
+            'нажмите «Помощь / Поддержка».'
+        )
+        sent, sequence = [], 100
+        actor = {'id': 20, 'is_bot': False, 'first_name': 'Учебный пользователь'}
+        chat = {'id': 20, 'type': 'private'}
+        _, state = self.actor(20)
+        async def transport(telegram, method, **kwargs):
+            nonlocal sequence
+            if isinstance(method, SendMessage):
+                sent.append(method)
+                sequence += 1
+                return Message(message_id=sequence, date=1, chat=chat)
+            self.assertEqual(method.__api_method__, 'editMessageReplyMarkup')
+            return True
+        def update():
+            nonlocal sequence
+            sequence += 1
+            return Update.model_validate({'update_id': sequence, 'message': {
+                'message_id': sequence, 'date': 1, 'chat': chat, 'from': actor, 'text': '/start'}})
+
+        async with Bot('99:TEST') as telegram:
+            with ExitStack() as stack:
+                for router in (bot.router, provider_ui.router, support_ui.router, admin_ui.router):
+                    stack.enter_context(patch.object(router, '_parent_router', None))
+                stack.enter_context(patch.object(telegram.session, 'make_request', side_effect=transport))
+                dispatcher = bot.create_dispatcher(self.backing)
+                await dispatcher.feed_update(telegram, update())
+                self.assertEqual(sent[-1].text, approved)
+                self.assertEqual([b.text for row in sent[-1].reply_markup.keyboard for b in row],
+                                 [bot.CUSTOMER_ROLE, bot.PROVIDER_ROLE, support_ui.HELP_LABEL])
+                with sqlite3.connect(self.path) as db:
+                    for table in ('provider_profiles', 'provider_equipment', 'leads', 'offers'):
+                        self.assertEqual(db.execute('SELECT count(*) FROM '+table).fetchone()[0], 0)
+                await self.seed(state)
+                before = await self.draft_rows(state)
+                form = {'support_kind': 'help', 'support_nonce': 'saved', 'support_text': 'Сохранённый текст'}
+                await state.set_state(support_ui.Support.compose)
+                await state.set_data(form)
+                await provider_registry.register_provider(21, 'Учебный профиль', '+79990000000', True, self.path)
+                await provider_registry.add_equipment(21, 'каток', 'Учебная машина', 'Москва', 'весь регион', self.path)
+                with sqlite3.connect(self.path) as db:
+                    db.execute("INSERT INTO leads(id,customer_id,customer_name,equipment,place,work_date,details,phone,status,created_at) "
+                               "VALUES (11,20,'Учебный','каток','Москва','завтра','','+79990000000','published','fixture')")
+                    db.execute("INSERT INTO offers(lead_id,provider_id,provider_name,username,price,comment,phone,created_at,delivery_status) "
+                               "VALUES (11,21,'Учебный','','10000','','+79990000000','fixture','unconfirmed')")
+                    db.execute("INSERT INTO provider_notification_reservations VALUES (11,21,'uncertain')")
+                from render_test_backup import backup_database, verify_preserved_rows
+                snapshot, restored = Path(self.temp.name)/'snapshot.sqlite', Path(self.temp.name)/'restored.sqlite'
+                source_rows = self.all_rows()
+                backup_database(Path(self.path), snapshot)
+                backup_database(snapshot, restored)
+                verify_preserved_rows(snapshot, restored)
+                # Exercise the candidate on a restored copy, leaving source and
+                # snapshot unchanged, including historical uncertain outcomes.
+                with patch.object(storage, 'DB_PATH', str(restored)), patch.object(self.backing, 'db_path', str(restored)):
+                    await bot.init_db()
+                    with patch.object(self, 'path', str(restored)):
+                        self.assertEqual(self.all_rows(), source_rows)
+                    for _ in range(2):
+                        await dispatcher.feed_update(telegram, update())
+                        self.assertEqual(sent[-1].text, approved)
+                        self.assertTrue(sent[-1].reply_markup.is_persistent)
+                        self.assertIn(bot.PAUSED_ACTIONS, [b.text for row in sent[-1].reply_markup.keyboard for b in row])
+                        self.assertIsNone(await state.get_state())
+                        self.assertEqual(await self.draft_rows(state), before)
+                        support = bot.draft_slot(state, 'support_action')
+                        self.assertEqual(await support.get_state(), support_ui.Support.compose.state)
+                        self.assertEqual(await support.get_data(), form)
+                    with patch.object(self, 'path', str(restored)):
+                        schema, copied = self.all_rows()
+                    self.assertEqual(schema, source_rows[0])
+                    for name, rows in source_rows[1].items():
+                        if name != 'form_drafts':
+                            self.assertEqual(copied[name], rows, name)
+                self.assertEqual(self.all_rows(), source_rows)
+                verify_preserved_rows(Path(self.path), snapshot)
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
