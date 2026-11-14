@@ -13,6 +13,8 @@ on:
       - "admin_*.py"
       - "support_*.py"
       - "sandbox_*.py"
+      - "assets/help/v6/**"
+      - tests/test_help_v6_assets.py
       - tests/test_local_sandbox.py
       - tests/test_sandbox_admin_ui.py
       - tests/test_sandbox_checkout_scheduler.py

@@ -10,7 +10,7 @@ from datetime import datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sandbox_campaigns import FakeTransport, SandboxCampaigns, moscow_instant
+from sandbox_campaigns import EMPTY_RECIPIENTS, FakeTransport, SandboxCampaigns, moscow_instant
 from sandbox_payments import FakePaymentProvider, SandboxPayments, canonical, positive
 from sandbox_store import instant
 from sandbox_scheduler import SandboxScheduler
@@ -292,10 +292,11 @@ class LocalAdmin:
         if state == 'preview':
             p = d['preview']
             at = datetime.fromtimestamp(p['run_at'], ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M:%S МСК')
-            buttons = [button('Подтвердить кампанию', 'approve')] if actor == self.owner else []
+            buttons = [button('Подтвердить кампанию', 'approve')] if actor == self.owner and p['recipients'] else []
+            empty_note = '' if p['recipients'] else '\n'+EMPTY_RECIPIENTS
             buttons.extend((button('К кампании', 'camp', p['campaign']), home))
             return Panel(f"Предпросмотр r{p['revision']}. Адресатов: {len(p['recipients'])}.\n"
-                         f"Отправка: {at}\nТолько подставной транспорт. Подтверждает владелец.", tuple(buttons),
+                         f"Отправка: {at}\nТолько подставной транспорт. Подтверждает владелец.{empty_note}", tuple(buttons),
                          preview_text=p['payload']['text'], attachments=tuple(p['payload']['attachments']))
         raise ValueError('Неизвестный экран; операция не будет повторена.')
 
@@ -304,6 +305,10 @@ class LocalAdmin:
         with self.lock:
             self.allowed(actor)
             s = self.session(actor)
+            if (s and s['screen']=='preview' and not s['busy']
+                    and callback == f"sb:{s['nonce']}:approve:"
+                    and not json.loads(s['data'])['preview']['recipients']):
+                raise ValueError(EMPTY_RECIPIENTS)
             if not s or callback not in {b[1] for b in self.render(actor).buttons}:
                 raise ValueError('Кнопка устарела или действие не разрешено.')
             _, nonce, action, value = callback.split(':', 3)

@@ -90,6 +90,24 @@ class LocalAdminUITests(unittest.IsolatedAsyncioTestCase):
             return {r[0]: db.execute('SELECT * FROM '+r[0]+' ORDER BY rowid').fetchall()
                     for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
 
+    async def test_empty_preview_explains_refusal_in_russian_without_approving_or_changing_campaign(self):
+        from sandbox_campaigns import EMPTY_RECIPIENTS
+        cid=self.admin.campaigns.draft(1,'Условный пустой черновик',('provider',),('Москва',))
+        preview=self.admin.campaigns.preview(1,cid,2000)
+        self.admin.save(1,'preview',{'preview':preview})
+        panel=self.admin.render(1)
+        self.assertIn('Нет получателей с действующим согласием',panel.text)
+        self.assertFalse(any('Подтвердить кампанию'==text for text,_ in panel.buttons))
+        before=self.rows()
+        with self.assertRaisesRegex(ValueError,'Нет получателей'):
+            self.admin.campaigns.approve(1,cid,1,preview['approval_token'],2000)
+        stale=f"sb:{self.admin.session(1)['nonce']}:approve:"
+        with self.assertRaisesRegex(ValueError,'Нет получателей'):
+            self.admin.handle(1,stale,1000)
+        self.assertEqual(self.rows(),before)
+        self.assertEqual(self.transport.calls,[])
+        self.assertNotIn('Empty recipient',EMPTY_RECIPIENTS)
+
     async def test_payment_admin_confirmation_refund_replay_and_permissions(self):
         order = self.admin.payments.create_order(20, 'fixture', 'sample_feature', 100, 2, 5000)
         await self.message('/start')

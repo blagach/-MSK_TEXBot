@@ -1,0 +1,105 @@
+{
+  "source_filename": "MSK_TEXBot_User_Guide_v6.pdf",
+  "source_library_id": "libfile_f27da8818a648191ae55c687e45ee35b",
+  "source_sha256": "7543cd95cf64888648131ea2485757317f92a3395919917b5547d2fea85be7e6",
+  "source_unchanged": true,
+  "render": "vector PDF pages, RGB, 216dpi, no crop or rescale of old bitmaps",
+  "pages": [
+    {
+      "file": "customer-1.png",
+      "pdf_page": 2,
+      "width": 1170,
+      "height": 1998,
+      "bytes": 132145,
+      "sha256": "edd3d8eab6561d033768b068748588c2e80e51b9b42394854bf1c14cf31fa584"
+    },
+    {
+      "file": "customer-2.png",
+      "pdf_page": 3,
+      "width": 1170,
+      "height": 2889,
+      "bytes": 198220,
+      "sha256": "88b667dcc45f9b51ffa966ec6966130df6b10c9a033d9cd074e4c0f01768334e"
+    },
+    {
+      "file": "customer-3.png",
+      "pdf_page": 4,
+      "width": 1170,
+      "height": 2256,
+      "bytes": 160386,
+      "sha256": "5c0ac30698675c6282488d271f6e19bc73b1ed7b44b3d2a08a1754136db4ec1b"
+    },
+    {
+      "file": "customer-4.png",
+      "pdf_page": 5,
+      "width": 1170,
+      "height": 2622,
+      "bytes": 175243,
+      "sha256": "83e538cd1a01ebb20187d21754eb8e54f5b99598a951636418b0073f4c798c30"
+    },
+    {
+      "file": "customer-5.png",
+      "pdf_page": 6,
+      "width": 1170,
+      "height": 2640,
+      "bytes": 167978,
+      "sha256": "4235d0dd59253b13132200ed708369ed5c15d9e89e9e501e66e9e768a63e0bd8"
+    },
+    {
+      "file": "customer-6.png",
+      "pdf_page": 7,
+      "width": 1170,
+      "height": 2760,
+      "bytes": 177113,
+      "sha256": "95c66fbf1f59c24fd49b95462e15aa29a2ec494ca15227bddf5170c6130d7376"
+    },
+    {
+      "file": "provider-1.png",
+      "pdf_page": 8,
+      "width": 1170,
+      "height": 3225,
+      "bytes": 236106,
+      "sha256": "b2ece90482a9e4313eb194ef0a02e7664ab8e53cf0acab90cbc6f97bf4986b4d"
+    },
+    {
+      "file": "provider-2.png",
+      "pdf_page": 9,
+      "width": 1170,
+      "height": 3090,
+      "bytes": 221113,
+      "sha256": "95ae7148c6b6234a965d76cd6053ba6e63a0622bfc5aeb07d43cf59b016013df"
+    },
+    {
+      "file": "provider-3.png",
+      "pdf_page": 10,
+      "width": 1170,
+      "height": 2433,
+      "bytes": 170311,
+      "sha256": "42760e4d661ea178ea4af51b62e02bbbfee73560112549ce2e8fbd4184d1a317"
+    },
+    {
+      "file": "provider-4.png",
+      "pdf_page": 11,
+      "width": 1170,
+      "height": 2952,
+      "bytes": 216453,
+      "sha256": "fe125c5b1fa5c6f91eb4fca3ad462ed6f44bc9917e267b3433d45ad8fd3bbec4"
+    },
+    {
+      "file": "provider-5.png",
+      "pdf_page": 12,
+      "width": 1170,
+      "height": 2478,
+      "bytes": 169447,
+      "sha256": "e95986293ab1e52910644162d5aba5519c83773f42decf6f5bdea46a1d7c46f9"
+    },
+    {
+      "file": "provider-6.png",
+      "pdf_page": 13,
+      "width": 1170,
+      "height": 2496,
+      "bytes": 160168,
+      "sha256": "74c7f5d99901822659d0a21e656a77a177f9c2cee99454dfd5621b6800cfa6d2"
+    }
+  ]
+}
