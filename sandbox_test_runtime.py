@@ -169,7 +169,7 @@ class TestFeatures:
                                (uuid4().hex[:12], uid))
                     db.execute('UPDATE sandbox_checkout_ui SET nonce=? WHERE payer=? AND busy=0', (uuid4().hex[:12], uid))
                     db.execute('UPDATE sandbox_consent_panels SET nonce=? WHERE recipient=?', (uuid4().hex[:12], uid))
-            if command in ('/lab', '/checkout', '/consent') and state is not None and await state.get_state():
+            if (command in ('/lab', '/checkout', '/consent') or getattr(event, 'data', None)=='lab:campaigns') and state is not None and await state.get_state():
                 from bot import pause_form
                 await pause_form(event, state)
             return await handler(event, data)

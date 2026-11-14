@@ -119,11 +119,26 @@ def local_dispatcher(admin, clock, *, checkout=None, business=None, scheduler_in
         await current_staff(uid)
         old = admin.session(uid)
         try:
-            panel = admin.start(uid)
+            panel = admin.start(uid, home=admin_command == 'lab')
         except PermissionError as error:
             await message.answer(str(error))
             return
         await post(message, panel, uid, old['prompt_id'] if old else None)
+
+    if test_scope is not None:
+        @router.callback_query(F.data == 'lab:campaigns')
+        async def campaign_entry(callback, bot):
+            uid = callback.from_user.id
+            permitted_session(bot, uid, callback.message.chat if callback.message else None)
+            await current_staff(uid)
+            old = admin.session(uid)
+            try:
+                panel = admin.open_section(uid, 'campaigns')
+            except PermissionError as error:
+                await callback.answer(str(error), show_alert=True)
+                return
+            await callback.answer()
+            await post(callback.message, panel, uid, old['prompt_id'] if old else None)
 
     async def post_consent(message, uid):
         with admin.store.connection() as db:

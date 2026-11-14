@@ -50,6 +50,11 @@ class LocalAdmin:
                 recipient INTEGER PRIMARY KEY REFERENCES sandbox_recipients(id),
                 nonce TEXT NOT NULL, panel_id INTEGER
             );
+            CREATE TABLE IF NOT EXISTS sandbox_admin_saved_input (
+                id TEXT PRIMARY KEY, actor INTEGER NOT NULL, screen TEXT NOT NULL,
+                data TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(actor,screen,data)
+            );
             CREATE TABLE IF NOT EXISTS sandbox_admin_prompts (
                 actor INTEGER NOT NULL, message_id INTEGER NOT NULL, nonce TEXT NOT NULL,
                 PRIMARY KEY(actor,message_id)
@@ -96,7 +101,31 @@ class LocalAdmin:
                 nonce=excluded.nonce,busy=0,prompt_id=NULL''',
                        (actor, screen, canonical(data), uuid4().hex[:12]))
 
-    def start(self, actor):
+    def open_section(self, actor, section='home'):
+        """Explicit navigation; archive incomplete input, never replay operations."""
+        if section not in ('home', 'payments', 'campaigns'):
+            raise ValueError('Unknown laboratory section')
+        with self.lock:
+            self.allowed(actor, finance=section == 'payments')
+            current = self.session(actor)
+            if current and current['busy']:
+                return self.render(actor)  # Preserve the unknown operation barrier.
+            with self.store.transaction() as db:
+                if current and current['screen'] in (
+                    'role','region','categories','cats','compose','edit','attach','schedule','preview','pconfirm'
+                ):
+                    db.execute("""INSERT INTO sandbox_admin_saved_input(id,actor,screen,data)
+                        VALUES (?,?,?,?) ON CONFLICT(actor,screen,data) DO UPDATE SET active=1""",
+                        (uuid4().hex, actor, current['screen'], current['data']))
+                db.execute("""INSERT INTO sandbox_admin_sessions VALUES (?,?,?, ?,0,NULL)
+                    ON CONFLICT(actor) DO UPDATE SET screen=excluded.screen,data=excluded.data,
+                    nonce=excluded.nonce,busy=0,prompt_id=NULL""",
+                    (actor, section, '{}', uuid4().hex[:12]))
+            return self.render(actor)
+
+    def start(self, actor, *, home=False):
+        if home:
+            return self.open_section(actor)
         with self.lock:
             self.allowed(actor)
             with self.store.transaction() as db:
@@ -131,6 +160,9 @@ class LocalAdmin:
                          'Проверьте карточку и журнал перед новым действием.', (home,))
         if state == 'home':
             rows = [button('Кампании', 'campaigns'), button('Согласия: сводка', 'consents')]
+            with self.store.connection() as db:
+                if db.execute('SELECT 1 FROM sandbox_admin_saved_input WHERE actor=? AND active=1', (actor,)).fetchone():
+                    rows.append(button('Незавершённый ввод', 'saved_inputs'))
             if actor == self.owner:
                 rows.insert(0, button('Платежи — TEST', 'payments'))
             return Panel('Локальный тестовый контур. Реальные деньги и сообщения отключены.', tuple(rows))
@@ -139,6 +171,20 @@ class LocalAdmin:
                 counts = dict(db.execute('SELECT consent,count(*) FROM sandbox_recipients GROUP BY consent'))
             return Panel(f"Согласились: {counts.get(1, 0)}. Без согласия/отказались: {counts.get(0, 0)}. "
                          'Администратор не может дать согласие за получателя.', (home,))
+        if state == 'saved_inputs':
+            page = d.get('page', 0)
+            with self.store.connection() as db:
+                rows = db.execute('SELECT * FROM sandbox_admin_saved_input WHERE actor=? AND active=1 ORDER BY rowid DESC LIMIT 9 OFFSET ?',
+                                  (actor, page*8)).fetchall()
+            labels = {'role':'Получатели','region':'Регионы','categories':'Виды техники',
+                      'cats':'Ввод видов','compose':'Текст кампании','edit':'Редактирование текста',
+                      'attach':'Вложение','schedule':'Расписание','preview':'Предпросмотр','pconfirm':'TEST-подтверждение'}
+            buttons = [button(labels[r['screen']], 'restore_input', r['id']) for r in rows[:8]]
+            if page:
+                buttons.append(button('Предыдущая страница', 'page', str(page-1)))
+            if len(rows)>8:
+                buttons.append(button('Следующая страница', 'page', str(page+1)))
+            return Panel('Сохранённый лабораторный ввод. Возобновление не выполняет отправку или оплату.', tuple(buttons+[home]))
         if state in ('payments', 'campaigns'):
             finance = state == 'payments'
             self.allowed(actor, finance=finance)
@@ -264,10 +310,19 @@ class LocalAdmin:
             self._claim(actor, nonce, action, now)
             d, screen = json.loads(s['data']), s['screen']
             try:
-                if action in ('home', 'payments', 'campaigns', 'consents'):
+                if action in ('home', 'payments', 'campaigns', 'consents', 'saved_inputs'):
                     if action == 'payments':
                         self.allowed(actor, finance=True)
                     screen, d = action, {}
+                elif action == 'restore_input':
+                    with self.store.connection() as db:
+                        saved = db.execute('SELECT * FROM sandbox_admin_saved_input WHERE id=? AND actor=? AND active=1',
+                                           (value,actor)).fetchone()
+                    if not saved:
+                        raise ValueError('Сохранённый ввод недоступен.')
+                    if saved['screen']=='pconfirm':
+                        self.allowed(actor, finance=True)
+                    screen,d = saved['screen'],json.loads(saved['data'])
                 elif action == 'page':
                     d['page'] = int(value)
                 elif action in ('pay', 'camp'):
@@ -323,6 +378,9 @@ class LocalAdmin:
                 else:
                     raise ValueError('Неизвестное действие.')
                 self.save(actor, screen, d)
+                if action == 'restore_input':
+                    with self.store.transaction() as db:
+                        db.execute('UPDATE sandbox_admin_saved_input SET active=0 WHERE id=? AND actor=?', (value,actor))
                 return self.render(actor)
             except (ValueError, PermissionError):
                 self.save(actor, s['screen'], json.loads(s['data']))

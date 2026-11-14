@@ -290,7 +290,7 @@ async def admin_target(message: Message, state: FSMContext, support_admin_ids, s
 
 
 @router.callback_query(F.data.startswith("admin:"))
-async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMContext = None, service_owner_id=None):
+async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMContext = None, service_owner_id=None, test_feature_lab=False):
     message = callback.message
     if (
         not isinstance(message, Message)
@@ -352,9 +352,15 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
                              "Финансовый учёт, тарифы, платёжная песочница и возвраты ещё требуют реализации; "
                              "этот экран не принимает оплату и не изменяет доступ пользователей.",reply_markup=keyboard(HOME))
     elif action == "marketing":
-        await message.answer("Рассылки\nОтправка отключена. Сообщения пользователям не отправляются.\n"
-                             "Кампании, согласия, расписание и подтверждение владельцем требуют отдельной реализации "
-                             "после сверки полного маркетингового ТЗ-6.",reply_markup=keyboard(HOME))
+        text = "Рассылки\nОтправка отключена. Сообщения пользователям не отправляются.\n"
+        rows = (HOME,)
+        if test_feature_lab:
+            text += "Для изолированной проверки доступен лабораторный раздел кампаний. Транспорт подставной; реальные рассылки отключены."
+            rows = ((("🧪 Лабораторные кампании", "lab:campaigns"),), HOME)
+        else:
+            text += ("Кампании, согласия, расписание и подтверждение владельцем требуют отдельной реализации "
+                     "после сверки полного маркетингового ТЗ-6.")
+        await message.answer(text, reply_markup=keyboard(*rows))
     elif action.startswith("admins:"):
         after = min(int(action.split(":")[1]), 2**63 - 1)
         page = await admin_access.administrator_page(support_admin_ids, service_owner_id, after=after, limit=11)
