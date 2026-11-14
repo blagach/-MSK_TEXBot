@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 
-PREFIXES = ("admin:", "paused_action:", "sb:", "co:", "sc:", "provider_alert:", "registration_cancel:", "provider_payment:",
+PREFIXES = ("admin:", "paused_action:", "sb:", "co:", "sc:", "lab:", "provider_alert:", "registration_cancel:", "provider_payment:",
             "machine:", "machine_catalog:", "machine_review:", "machine_field:", "provider_legacy:",
             "form_nav:", "cancel_lead_draft:", "offer_draft:", "lead_step:",
             "lead_attachment:", "lead_review:", "lead_close:", "offer_step:")
