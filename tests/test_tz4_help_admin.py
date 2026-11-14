@@ -37,6 +37,49 @@ import support_ui
 
 
 class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_help_action_cannot_reopen_compose_after_main_menu(self):
+        from contextlib import ExitStack
+        from aiogram import Bot
+        from aiogram.methods import SendMessage
+        from aiogram.types import Message, Update
+
+        requests = []
+        sequence = 100
+        actor = {'id': 20, 'is_bot': False, 'first_name': 'Тест'}
+        chat = {'id': 20, 'type': 'private'}
+        async def transport(_bot, method, **kwargs):
+            nonlocal sequence
+            requests.append(method)
+            if isinstance(method, SendMessage):
+                sequence += 1
+                return Message(message_id=sequence, date=1, chat=chat)
+            self.assertIn(method.__api_method__, {'answerCallbackQuery', 'editMessageReplyMarkup'})
+            return True
+        def message(text):
+            nonlocal sequence
+            sequence += 1
+            return Update.model_validate({'update_id': sequence, 'message': {
+                'message_id': sequence, 'date': 1, 'chat': chat, 'from': actor, 'text': text}})
+
+        backing = bot.SQLiteDraftStorage(str(self.database))
+        await backing.init_schema()
+        key = StorageKey(bot_id=99, chat_id=20, user_id=20)
+        async with Bot('99:TEST') as telegram:
+            with ExitStack() as stack:
+                for item in (bot.router, provider_ui.router, support_ui.router, admin_ui.router):
+                    stack.enter_context(patch.object(item, '_parent_router', None))
+                stack.enter_context(patch.object(telegram.session, 'make_request', side_effect=transport))
+                dispatcher = bot.create_dispatcher(backing)
+                await dispatcher.feed_update(telegram, message('/support'))
+                old_panel = sequence
+                await dispatcher.feed_update(telegram, message('/menu'))
+                await dispatcher.feed_update(telegram, Update.model_validate({'update_id': sequence + 1, 'callback_query': {
+                    'id': 'stale', 'from': actor, 'chat_instance': 'test', 'data': 'help:new:bug',
+                    'message': {'message_id': old_panel, 'date': 1, 'chat': chat}}}))
+                self.assertIsNone(await backing.get_state(key))
+                self.assertTrue(any(r.__api_method__ == 'editMessageReplyMarkup' and r.message_id == old_panel for r in requests))
+                self.assertTrue(any(r.__api_method__ == 'answerCallbackQuery' and 'устарел' in (r.text or '') for r in requests))
+
     async def test_production_main_passes_persistent_sqlite_storage_to_dispatcher(self):
         await provider_registry.register_provider(20, "Учебный профиль", "+79990000001", True, str(self.database))
         await provider_registry.add_equipment(20, "автокран", "Учебная техника", "Москва", "весь регион", str(self.database))
@@ -830,7 +873,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(method, SendMessage):
                 delivered.append(method)
                 return Message(message_id=500 + len(delivered), date=stamp, chat=chat(method.chat_id))
-            self.assertEqual(method.__api_method__, "answerCallbackQuery")
+            self.assertIn(method.__api_method__, {"answerCallbackQuery", "editMessageReplyMarkup"})
             return True
 
         fsm = bot.SQLiteDraftStorage(str(self.database))
@@ -1631,7 +1674,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(method,SendMessage):
                 messages.append(method)
                 return Message(message_id=500+len(messages),date=stamp,chat=chat)
-            self.assertEqual(method.__api_method__,'answerCallbackQuery')
+            self.assertIn(method.__api_method__,{'answerCallbackQuery','editMessageReplyMarkup'})
             return True
         backing=bot.SQLiteDraftStorage(str(self.database))
         await backing.init_schema()

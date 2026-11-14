@@ -39,6 +39,7 @@ import user_access
 import equipment_catalog
 import support_storage
 import support_ui
+from screen_controls import ScreenControls
 import storage
 import provider_registry
 import provider_ui
@@ -2051,6 +2052,10 @@ def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None) -> Dispatch
         service_owner_id=settings.owner_id,
     )
     dispatcher.startup.register(admin_access.recover_exports)
+    controls = ScreenControls()
+    dispatcher.startup.register(controls.install)
+    dispatcher.message.outer_middleware(controls)
+    dispatcher.callback_query.outer_middleware(controls)
     dispatcher.message.outer_middleware(track_private_visitor)
     dispatcher.callback_query.outer_middleware(track_private_visitor)
     dispatcher.message.middleware(check_user_access)
