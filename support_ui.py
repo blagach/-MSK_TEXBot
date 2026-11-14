@@ -25,7 +25,7 @@ router.callback_query.filter(F.message.chat.type == "private")
 HELP_LABEL = "❓ Помощь / Поддержка"
 KINDS = {"help": "Вопрос", "bug": "Ошибка"}
 STATUSES = {"new": "Новое", "in_progress": "В работе", "closed": "Закрыто"}
-ASSETS = Path(__file__).resolve().parent / "assets" / "help"
+ASSETS = Path(__file__).resolve().parent / "assets" / "help" / "v6"
 TICKET_PAGE = 8
 HISTORY_PAGE = 6
 DELIVERY = {

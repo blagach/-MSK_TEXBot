@@ -1,0 +1,40 @@
+{
+  "source_sha256": "e5b0f8c75cff2b0ad541d0f6363d4773b7bc21f461686675109db79c2e1fe205",
+  "source_unchanged": true,
+  "original_tables": 26,
+  "original_schemas_and_business_rows_preserved": true,
+  "expected_runtime_change": "global fake rate-limit next_send",
+  "financial_tables_exact": true,
+  "payment_status": "paid",
+  "remaining": 3,
+  "original_campaign": "draft",
+  "synthetic_campaign_report": [
+    {
+      "revision": 1,
+      "status": "excluded",
+      "recipients": 1
+    },
+    {
+      "revision": 1,
+      "status": "sent",
+      "recipients": 1
+    }
+  ],
+  "fake_calls": 1,
+  "telegram_calls": 0,
+  "restart_no_repeat": true,
+  "future_schedule_pause_optout": true,
+  "integrity_check": "ok",
+  "foreign_key_violations": 0,
+  "snapshot": {
+    "bytes": 208896,
+    "sha256": "e2c311e03ca2401b86c3d836b5178592d620495f068b89a747916a5d5dd48413"
+  },
+  "restored_sha256": "2063dcad3b7bb756b5cbf8f3d4b8fe49d04fdff2a0a60c420056cbb627715187",
+  "scope": "Isolated previously obtained test sidecar copy; not a fresh live Render snapshot",
+  "restored_sha256_note": "After synthetic rehearsal, not the pristine restore",
+  "local_regression": {
+    "tests": 383,
+    "result": "success"
+  }
+}

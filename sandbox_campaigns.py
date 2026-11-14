@@ -10,6 +10,9 @@ from sandbox_payments import canonical, positive
 from sandbox_store import SandboxBusy, instant
 
 
+EMPTY_RECIPIENTS = ('Нет получателей с действующим согласием для выбранного сегмента. '
+                    'Подтвердить кампанию нельзя. Измените сегмент или сохраните черновик.')
+
 class FakeTransportFailure(RuntimeError):
     pass
 
@@ -224,7 +227,7 @@ class SandboxCampaigns:
             if row['state'] != 'draft' or token != expected:
                 raise ValueError('Preview or audience changed; confirmation required again')
             if not view['recipients']:
-                raise ValueError('Empty recipient snapshot cannot be approved')
+                raise ValueError(EMPTY_RECIPIENTS)
             for recipient in view['recipients']:
                 db.execute("INSERT INTO sandbox_campaign_queue(campaign,revision,recipient,status) VALUES (?,?,?,'pending')",
                            (campaign, revision, recipient))
