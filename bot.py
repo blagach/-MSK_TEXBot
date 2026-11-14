@@ -188,9 +188,20 @@ ADMIN_ACTION_DRAFT = "▶️ Продолжить настройку прав"
 ADMIN_SEARCH_DRAFT = "▶️ Продолжить поиск пользователя"
 ADMIN_LEAD_SEARCH_DRAFT = "▶️ Продолжить поиск заявки"
 ADMIN_ACCESS_DRAFT = "▶️ Продолжить изменение доступа"
+PAUSED_ACTIONS = "🗂 Незавершённые действия"
 CUSTOMER_ROLE = "📋 Я заказчик"
 PROVIDER_ROLE = "🚜 Я исполнитель"
 MY_LEADS = "📋 Мои заявки"
+WELCOME_TEXT = (
+    "👋 Добро пожаловать в MSK TEXBot!\n\n"
+    "Строительная спецтехника в Москве и Московской области.\n\n"
+    "📋 Заказчику — разместите заявку с видом техники, местом и временем работ. "
+    "Подходящие исполнители смогут связаться с вами.\n\n"
+    "🚜 Исполнителю — добавьте технику, выберите регионы и подписки, чтобы получать "
+    "подходящие заявки и открывать контакты заказчиков.\n\n"
+    "Выберите свою роль. Её можно сменить через главное меню. Если нужна помощь — "
+    "нажмите «Помощь / Поддержка»."
+)
 OFFER_EDIT_FIELDS = {
     "price": ("💰 Стоимость", OfferForm.price),
     "comment": ("📋 Условия", OfferForm.comment),
@@ -495,37 +506,102 @@ async def pause_form(message: Message, state: FSMContext) -> None:
     await state.clear()
 
 
+def auxiliary_specs():
+    return (
+        ("provider_action", PROVIDER_ACTION_DRAFT, (*provider_ui.Register.__all_states_names__,
+         *provider_ui.AddMachine.__all_states_names__, *provider_ui.AlertPreferences.__all_states_names__), None),
+        ("support_action", SUPPORT_ACTION_DRAFT, (support_ui.Support.compose.state,
+         support_ui.Support.reply.state, support_ui.Support.requester_reply.state), None),
+        ("lead_closing", CLOSING_ACTION_DRAFT, CloseLead.__all_states_names__, None),
+        ("admin_action", ADMIN_ACTION_DRAFT, admin_ui.ManageAdmins.__all_states_names__, "roles"),
+        ("admin_search", ADMIN_SEARCH_DRAFT, admin_ui.FindUser.__all_states_names__, "users"),
+        ("admin_access", ADMIN_ACCESS_DRAFT, admin_ui.ManageAccess.__all_states_names__, "access"),
+        ("admin_lead_search", ADMIN_LEAD_SEARCH_DRAFT, admin_ui.FindLead.__all_states_names__, "moderate"),
+    )
+
+
+async def available_paused_actions(state):
+    actions = []
+    for kind, label, states, permission in auxiliary_specs():
+        current = await draft_slot(state, kind).get_state()
+        if current not in states:
+            continue
+        if kind == "support_action" and current == support_ui.Support.reply.state:
+            permission = "support"
+        if permission and not await admin_allowed(state.key.user_id, permission):
+            continue
+        actions.append((kind, label))
+    return actions
+
+
 async def menu_with_paused_actions(state):
-    rows = []
-    for kind, label in (("provider_action", PROVIDER_ACTION_DRAFT), ("support_action", SUPPORT_ACTION_DRAFT),
-                        ("lead_closing", CLOSING_ACTION_DRAFT), ("admin_action", ADMIN_ACTION_DRAFT), ("admin_search", ADMIN_SEARCH_DRAFT), ("admin_access", ADMIN_ACCESS_DRAFT), ("admin_lead_search", ADMIN_LEAD_SEARCH_DRAFT)):
-        if await draft_slot(state, kind).get_state():
-            rows.append((label,))
+    actions = await available_paused_actions(state)
+    # Preserve the accepted single-draft entry; group only multiple auxiliaries.
+    rows = [(PAUSED_ACTIONS,)] if len(actions) > 1 else [(label,) for _, label in actions]
     return main_menu(await admin_allowed(state.key.user_id, "panel"), rows)
+
+
+@router.message(F.text == PAUSED_ACTIONS)
+async def show_paused_actions(message: Message, state: FSMContext):
+    if await state.get_state() is not None:
+        await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
+        return
+    actions = await available_paused_actions(state)
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"paused_action:{kind}")] for kind, label in actions]
+    rows.append([InlineKeyboardButton(text=OFFER_HOME, callback_data="paused_action:home")])
+    await message.answer("Выберите незавершённое действие. Черновики сохранены." if actions
+                         else "Доступных незавершённых действий нет. Черновики не изменены.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("paused_action:"))
+async def paused_action(callback: CallbackQuery, state: FSMContext):
+    message = callback.message
+    if (not isinstance(message, Message) or message.chat.type != "private"
+            or message.chat.id != callback.from_user.id or await state.get_state() is not None):
+        await callback.answer("Этот экран уже неактуален.")
+        return
+    kind = callback.data.removeprefix("paused_action:")
+    if kind == "home":
+        await callback.answer()
+        await show_main_menu(message, state)
+        return
+    if kind not in dict(await available_paused_actions(state)):
+        await callback.answer("Действие больше недоступно. Откройте список заново.")
+        return
+    await callback.answer()
+    await resume_auxiliary_kind(message, state, kind, callback.from_user.id)
 
 
 @router.message(F.text.in_({PROVIDER_ACTION_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT, ADMIN_SEARCH_DRAFT, ADMIN_ACCESS_DRAFT, ADMIN_LEAD_SEARCH_DRAFT}))
 async def resume_auxiliary_action(message: Message, state: FSMContext):
-    provider = message.text == PROVIDER_ACTION_DRAFT
-    closing = message.text == CLOSING_ACTION_DRAFT
-    admin_action = message.text == ADMIN_ACTION_DRAFT
-    admin_search = message.text == ADMIN_SEARCH_DRAFT
-    admin_lead_search = message.text == ADMIN_LEAD_SEARCH_DRAFT
-    admin_access_action = message.text == ADMIN_ACCESS_DRAFT
-    kind = "admin_action" if admin_action else ("lead_closing" if closing else ("provider_action" if provider else "support_action"))
-    if admin_search:
-        kind = "admin_search"
-    if admin_access_action:
-        kind = "admin_access"
-    if admin_lead_search:
-        kind = "admin_lead_search"
-    if (admin_action or admin_search or admin_access_action or admin_lead_search) and not await admin_allowed(
-        message.from_user.id, "moderate" if admin_lead_search else ("access" if admin_access_action else ("users" if admin_search else "roles")),
-    ):
-        await message.answer("Нет доступа.")
+    # Keep older reply-keyboard labels as compatible aliases.
+    kind = next((kind for kind, label, _, _ in auxiliary_specs() if label == message.text), None)
+    await resume_auxiliary_kind(message, state, kind, message.from_user.id)
+
+
+async def resume_auxiliary_kind(message: Message, state: FSMContext, kind: str, user_id: int):
+    specs = {spec[0]: spec for spec in auxiliary_specs()}
+    if kind not in specs:
+        await message.answer("Незавершённого действия нет.")
         return
+    _, _, states, permission = specs[kind]
     draft = draft_slot(state, kind)
     current = await draft.get_state()
+    if kind == "support_action" and current == support_ui.Support.reply.state:
+        permission = "support"
+    if permission and not await admin_allowed(user_id, permission):
+        await message.answer("Нет доступа.")
+        return
+    if current and current not in states:
+        await message.answer("Сохранённое действие не распознано. Черновик оставлен без изменений.")
+        return
+    provider = kind == "provider_action"
+    closing = kind == "lead_closing"
+    admin_action = kind == "admin_action"
+    admin_search = kind == "admin_search"
+    admin_lead_search = kind == "admin_lead_search"
+    admin_access_action = kind == "admin_access"
     if not current:
         active = await state.get_state()
         if provider and active in (*provider_ui.Register.__all_states_names__,
@@ -915,7 +991,7 @@ async def open_offer(message: Message, state: FSMContext, lead_id: int | None, u
 async def start(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await message.answer(
-        "Здравствуйте! Здесь можно быстро оставить заявку на аренду строительной или дорожной техники в Москве и МО.",
+        WELCOME_TEXT,
         reply_markup=await menu_with_paused_actions(state),
     )
 

@@ -209,6 +209,15 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
         return
     parts = callback.data.split(":")[1:]
     action = parts[0]
+    if action in {"training", "train", "try"}:
+        # Retain the training helpers/data, but disable all old user entry points.
+        # This also protects messages sent before screen lifecycle tracking.
+        await callback.answer("Тренировочный раздел больше недоступен.")
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError as error:
+            logging.warning("Could not retire training keyboard: %s", type(error).__name__)
+        return
     admin = await admin_access.allowed(user_id, "support", support_admin_ids, service_owner_id)
     if action in {"queue", "list", "status", "reply", "close"} and not admin:
         await callback.answer("Нет доступа.", show_alert=True)
@@ -222,7 +231,7 @@ async def support_action(callback: CallbackQuery, state: FSMContext, bot, suppor
     elif parts == ["resources"]:
         await message.answer("Как пользоваться сервисом", reply_markup=keys(
             (("📖 Инструкции по ролям", "guides"),),
-            (("❔ Частые вопросы", "faq"), ("🎓 Попробовать на примере", "training")),
+            (("❔ Частые вопросы", "faq"),),
             (("🐞 Сообщить об ошибке", "new:bug"),), BACK,
         ))
     elif parts in (["guides"], ["training"]):
