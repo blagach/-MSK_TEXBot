@@ -28,9 +28,13 @@ class TestConfiguration:
     channel_id: int
     testers: frozenset[int]
     support_group_id: int | None = None
+    feature_lab_enabled: bool = False
 
 
 def read_test_configuration(env: Mapping[str, str]) -> TestConfiguration:
+    feature_lab = env.get('MSK_TEST_FEATURE_LAB', '0')
+    if feature_lab not in ('0', '1'):
+        raise IsolationError('MSK_TEST_FEATURE_LAB must be explicitly 0 or 1')
     if any(env.get(name) for name in (
         "BOT_TOKEN", "BOT_USERNAME", "ADMIN_IDS", "LEADS_CHANNEL_ID", "PAYMENT_URL",
         "TEST_NOTIFICATION_PROVIDER_IDS", "DATABASE_URL", "SUPPORT_GROUP_ID", "SERVICE_OWNER_ID",
@@ -49,7 +53,7 @@ def read_test_configuration(env: Mapping[str, str]) -> TestConfiguration:
         raise IsolationError("Invalid test account or channel IDs") from None
     if support_group_id is not None and (support_group_id >= 0 or support_group_id == channel_id):
         raise IsolationError("The support group must be separate from the test channel")
-    return TestConfiguration(token, admin_id, channel_id, testers, support_group_id)
+    return TestConfiguration(token, admin_id, channel_id, testers, support_group_id, feature_lab == '1')
 
 
 def test_database_path(disk: Path = DISK) -> Path:
@@ -78,7 +82,8 @@ async def start() -> None:
             raise
 
     async with Bot(token=config.token) as telegram:
-        verify_identity(await telegram.get_me(), TEST_BOT)
+        identity = await telegram.get_me()
+        verify_identity(identity, TEST_BOT)
         if (await telegram.get_webhook_info()).url:
             raise IsolationError("The test bot has an active webhook")
         telegram.session.middleware(guard.outgoing)
@@ -113,14 +118,25 @@ async def start() -> None:
         if backup_path is not None:
             checked = await asyncio.to_thread(verify_preserved_rows, backup_path, database)
             logging.info("Test SQLite live migration verified; %s source tables preserved", checked)
-        dispatcher = app.create_dispatcher(drafts)
+        if config.feature_lab_enabled:
+            from sandbox_test_runtime import VerifiedTestScope, TestFeatures
+            scope = VerifiedTestScope(telegram, identity, config.admin_id, config.testers, database)
+            features = TestFeatures(scope)
+            dispatcher = app.create_dispatcher(drafts, test_features=features)
+        else:
+            dispatcher = app.create_dispatcher(drafts)
         dispatcher.update.outer_middleware(guard.incoming)
-        await telegram.set_my_commands([
+        commands = [
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="menu", description="Восстановить кнопки и продолжить анкету"),
             BotCommand(command="cancel", description="Отменить текущую анкету"),
             BotCommand(command="support", description="Помощь и поддержка"),
-        ], scope=BotCommandScopeAllPrivateChats())
+        ]
+        if config.feature_lab_enabled:
+            commands.extend((BotCommand(command='lab', description='Тестовые платежи и кампании'),
+                             BotCommand(command='checkout', description='Учебное оформление TEST'),
+                             BotCommand(command='consent', description='Согласие на тестовые кампании')))
+        await telegram.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
         await telegram.set_chat_menu_button(menu_button=MenuButtonCommands())
         logging.info("Starting isolated @%s at %s", TEST_BOT, os.getenv("RENDER_GIT_COMMIT", "local"))
         polling = asyncio.create_task(dispatcher.start_polling(
