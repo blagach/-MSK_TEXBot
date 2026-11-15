@@ -59,7 +59,7 @@ class LeadEditingFieldsTests(unittest.IsolatedAsyncioTestCase):
                           'Описание', 'Вилы', 'Любая форма оплаты', '+79990000001'):
                 self.assertIn(value, panel.args[0])
             actions = [b.callback_data for row in panel.kwargs['reply_markup'].inline_keyboard for b in row]
-            self.assertIn('lead_review:send', actions)
+            self.assertIn('lead_review:publish', actions)
             self.assertIn('lead_review:edit', actions)
             stale = self.callback('lead_review:send', message_id=44)
             await bot.lead_review_action(stale, restarted, telegram)

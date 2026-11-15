@@ -78,7 +78,7 @@ async def transition(lead_id, expected, target):
         return cursor.rowcount == 1
 
 
-async def finish_publication(lead_id, chat_id, message_id):
+async def finish_publication(lead_id, chat_id, message_id, *, actor_id=None, automatic=False):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute(
@@ -88,6 +88,12 @@ async def finish_publication(lead_id, chat_id, message_id):
             raise ValueError("Lead is not awaiting publication")
         await db.execute("INSERT INTO lead_publications VALUES (?, ?, ?)", (lead_id, chat_id, message_id))
         await lead_journey.record_event(db, lead_id, "published")
+        if actor_id is not None:
+            await db.execute(
+                "INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at) VALUES (?,?,?,?,?,?)",
+                (actor_id, "lead_auto_publish" if automatic else "lead_publish", lead_id,
+                 "success", "{}", datetime.now(timezone.utc).isoformat()),
+            )
         await db.commit()
 
 
