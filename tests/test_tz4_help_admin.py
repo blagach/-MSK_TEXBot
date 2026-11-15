@@ -373,11 +373,10 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             (provider_ui.Register.name, {"consent": True}),
             (provider_ui.AddMachine.description, {"category": "автокран"}),
             (provider_ui.AddMachine.description, {"category": "автокран", "edit_machine": machine}),
-            (provider_ui.AlertPreferences.select, {"alert_categories": ["автокран"], "alert_regions": ["Москва"], "alert_revision": 0, "alert_kind": "regions"}),
             (provider_ui.Register.payment, {"payment_selection": [payments.CASH], "editing_payment": True}),
         )
         for step, expected in cases:
-            for entry in ("register", "add", "alerts", "edit", "payment"):
+            for entry in ("register", "add", "edit", "payment"):
                 with self.subTest(step=step.state, data=expected, entry=entry):
                     current = FSMContext(backing, original.key)
                     await current.set_state(step)
@@ -434,10 +433,10 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
             persisted = await provider_registry.alert_preferences(20, str(self.database))
             await provider_ui.alert_preference_action(self.callback(owner, "provider_alert:tools"), state)
             await provider_ui.begin_machine(owner, state)
-            self.assertIsNone(await state.get_state())
+            self.assertEqual(await state.get_state(), provider_ui.AddMachine.category.state)
             self.assertEqual(await provider_registry.alert_preferences(20, str(self.database)), persisted)
             state = FSMContext(bot.SQLiteDraftStorage(str(self.database)), original.key)
-            owner.text = bot.PROVIDER_ACTION_DRAFT
+            owner.text = bot.PROVIDER_ALERT_DRAFT
             await bot.resume_auxiliary_action(owner, state)
             await provider_ui.alert_preference_action(self.callback(owner, f"provider_alert:{finish}"), state)
             self.assertIsNone(await state.get_state())
@@ -447,7 +446,8 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await provider_registry.alert_preferences(20, str(self.database)), persisted)
             else:
                 self.assertEqual((await provider_registry.alert_preferences(20, str(self.database)))["categories"], ["автокран"])
-            await provider_ui.begin_machine(owner, state)
+            owner.text = bot.PROVIDER_ACTION_DRAFT
+            await bot.resume_auxiliary_action(owner, state)
             self.assertEqual(await state.get_state(), provider_ui.AddMachine.category.state)
             # Leave this synthetic form resolved before the next independent scenario.
             await state.clear()

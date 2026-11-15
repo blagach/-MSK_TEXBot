@@ -130,7 +130,12 @@ class CompleteTZ5Tests(unittest.IsolatedAsyncioTestCase):
                 await provider_ui.machine_catalog(provider_chat, provider, index)
                 customer_rows = keyboard(customer_chat)
                 provider_rows = keyboard(provider_chat)
-                self.assertEqual(customer_rows[:-1], provider_rows[:-1])
+                self.assertEqual([text for row in customer_rows[:-1] for text in row],
+                                 [equipment_catalog.DISPLAY_LABELS[kind] for kind in labels])
+                self.assertEqual([text for row in provider_rows[:-1] for text in row],
+                                 [kind[0].upper() + kind[1:] for kind in labels])
+                self.assertEqual([len(row) for row in customer_rows[:-1]],
+                                 [len(row) for row in provider_rows[:-1]])
                 self.assertEqual(len([button for row in provider_rows[:-1] for button in row]), len(labels))
                 self.assertTrue(all(1 <= len(row) <= 2 for row in provider_rows))
                 self.assertEqual(customer_rows[-1][0], "⬅️ К категориям")
