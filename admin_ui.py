@@ -15,6 +15,7 @@ import support_storage
 import admin_access
 import user_access
 import equipment_catalog
+import lead_publication
 
 router = Router()
 router.callback_query.filter(F.message.chat.type == "private")
@@ -96,6 +97,8 @@ def audit_line(row):
     actions = {"role_changed": "Изменение прав", "admin_denied": "Отказ в доступе",
                "admin_view": "Просмотр раздела", "lead_view": "Просмотр заявки",
                "lead_publish": "Публикация заявки", "lead_reject": "Отклонение заявки",
+               "lead_auto_claim": "Начало автопубликации", "lead_auto_publish": "Автопубликация заявки",
+               "lead_publication": "Исход публикации", "autopublish_mode": "Режим автопубликации",
                "lead_close": "Закрытие заявки", "support_reply": "Сохранение ответа поддержки",
                "support_delivery": "Отправка ответа поддержки", "user_search": "Поиск пользователей",
                "user_profile": "Просмотр профиля", "user_access": "Изменение доступа",
@@ -103,7 +106,8 @@ def audit_line(row):
     results = {"success": "Успешно", "denied": "Запрещено", "conflict": "Конфликт версий",
                "not_changed": "Без изменения", "accepted": "Запрос принят", "pending": "Ожидается ответ Telegram", "saved": "Сохранено в истории",
                "sent": "Отправку подтвердил Telegram", "failed": "Ошибка отправки",
-               "uncertain": "Отправка не подтверждена"}
+               "uncertain": "Отправка не подтверждена", "rejected": "Telegram отклонил отправку",
+               "enabled": "Включена", "paused": "Приостановлена"}
     text = (f"#{row['id']} · {row['created_at']} (UTC) · пользователь {row['actor_id']}\n"
             f"{actions.get(row['action'], row['action'])} · объект {row['target_id'] or '—'} · "
             f"{results.get(row['result'], row['result'])}")
@@ -318,6 +322,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         permission = "roles"
     if action.startswith(("role:", "confirm:", "role_cancel:")):
         permission = "roles"
+    if action == "autopublish" or re.fullmatch(r"autopublish:(pick|apply):[01]:[0-9]{1,18}", action):
+        permission = "roles"
     if permission is None or not await admin_access.allowed(
         callback.from_user.id, permission, support_admin_ids, service_owner_id,
     ):
@@ -346,7 +352,40 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
     elif action == "service_settings":
         await message.answer("Параметры сервиса\nБесплатный режим. Реальные платежи не подключены.\n"
                              f"Общий каталог: {len(equipment_catalog.GROUPS)} групп, {len(equipment_catalog.TYPES)} позиций.\n"
-                             "Смена платного режима и отправка рассылок здесь пока недоступны.",reply_markup=keyboard(HOME))
+                             "Смена платного режима и отправка рассылок здесь пока недоступны.",
+                             reply_markup=keyboard((("Автопубликация заявок", "admin:autopublish"),), HOME))
+    elif action == "autopublish":
+        current = await lead_publication.mode()
+        enabled, revision = current["enabled"], current["revision"]
+        await message.answer(
+            "Автопубликация заявок: " + ("включена." if enabled else "приостановлена.") +
+            "\nОбычные новые заявки публикуются после проверки полей. На паузе они направляются администратору. "
+            "Ранее сохранённые заявки автоматически не публикуются. Уже начатая отправка может завершиться.",
+            reply_markup=keyboard((("Приостановить" if enabled else "Включить",
+                                    f"admin:autopublish:pick:{int(not enabled)}:{revision}"),), HOME),
+        )
+    elif action.startswith("autopublish:"):
+        _, stage, target, revision = action.split(":")
+        if callback.from_user.id != service_owner_id:
+            await callback.answer("Только владелец может менять автопубликацию.", show_alert=True)
+            return
+        current = await lead_publication.mode()
+        if current["revision"] != int(revision):
+            await message.answer("Настройка уже изменилась. Откройте актуальный экран.",
+                                 reply_markup=keyboard((("Автопубликация", "admin:autopublish"),), HOME))
+            return
+        if stage == "pick":
+            await message.answer(
+                "Подтвердите " + ("включение" if target == "1" else "паузу") +
+                " автопубликации новых заявок. Старые заявки не будут отправлены автоматически.",
+                reply_markup=keyboard((("Подтвердить", f"admin:autopublish:apply:{target}:{revision}"),),
+                                      (("Отмена", "admin:autopublish"),)),
+            )
+        else:
+            changed = await lead_publication.set_mode(callback.from_user.id, service_owner_id,
+                                                       target == "1", int(revision))
+            await message.answer("Настройка сохранена." if changed else "Настройка уже изменилась.",
+                                 reply_markup=keyboard((("Автопубликация", "admin:autopublish"),), HOME))
     elif action == "finance":
         await message.answer("Финансы\nСервис бесплатный. Реальные платежи не подключены.\n"
                              "Финансовый учёт, тарифы, платёжная песочница и возвраты ещё требуют реализации; "

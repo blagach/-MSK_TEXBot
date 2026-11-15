@@ -35,7 +35,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             )
             await db.commit()
         self.state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=20, user_id=20))
-        self.telegram = SimpleNamespace(send_message=AsyncMock(), edit_message_reply_markup=AsyncMock())
+        self.telegram = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(
+            chat=SimpleNamespace(id=bot.settings.leads_channel_id), message_id=99)), edit_message_reply_markup=AsyncMock())
         self.message = MagicMock(spec=Message)
         self.message.chat = SimpleNamespace(id=20, type="private")
         self.message.bot = self.telegram
@@ -101,7 +102,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
     async def submit_lead_review(self):
         prompt = (await self.state.get_data())["form_keyboard_id"]
         callback = self.step("send", prompt)
-        callback.data = "lead_review:send"
+        callback.data = "lead_review:publish"
         await bot.lead_review_action(callback, self.state, self.telegram)
 
     async def skip_lead_optional(self):
@@ -526,6 +527,8 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await legacy.get_state(), bot.OfferForm.comment.state)
 
     async def test_skip_description_publish_and_open_offer_from_button(self):
+        # Preserve legacy/manual fallback coverage; automatic delivery has its own integration tests.
+        await bot.lead_publication.set_mode(1, 1, False, 0)
         await bot.lead_start(self.message, self.state)
         await self.pick_lead_option(0)
         await self.pick_lead_option(0)

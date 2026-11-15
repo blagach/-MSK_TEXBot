@@ -51,6 +51,7 @@ import lead_routing
 import moderation_history
 import lead_moderation
 import lead_shadow_review
+import lead_publication
 import payment_preferences
 
 load_dotenv()
@@ -431,7 +432,7 @@ async def show_lead_step(message: Message, state: FSMContext, step: State, **fie
         rows.append([InlineKeyboardButton(text="Готово", callback_data="lead_attachment:done"),
                      InlineKeyboardButton(text="Не требуется", callback_data="lead_attachment:none")])
     if step == LeadForm.review:
-        rows = [[InlineKeyboardButton(text="✅ Отправить на модерацию", callback_data="lead_review:send")],
+        rows = [[InlineKeyboardButton(text="✅ Опубликовать заявку", callback_data="lead_review:publish")],
                 [InlineKeyboardButton(text="✏️ Изменить данные", callback_data="lead_review:edit")]]
     if step == LeadForm.edit:
         rows = equipment_catalog.button_rows(
@@ -1587,7 +1588,7 @@ class ExpiredLeadDate(ValueError):
     pass
 
 
-async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[int, bool]:
+async def save_lead_from_draft(customer: User, phone: str, data: dict, *, enforce_limits=False) -> tuple[int, bool]:
     draft_id = data.get("draft_id")
     async with aiosqlite.connect(storage.DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -1602,11 +1603,14 @@ async def save_lead_from_draft(customer: User, phone: str, data: dict) -> tuple[
             work_datetime.parse_work_datetime(data.get("work_date", ""))
         except (ValueError, AttributeError):
             raise ExpiredLeadDate("Укажите будущую дату и время по Москве. Черновик сохранён.")
+        lead_publication.validate(data, phone)
+        if enforce_limits:
+            await lead_publication.guard_submission(db, customer.id, data)
         cursor = await db.execute(
             """INSERT INTO leads(customer_id, customer_name, equipment, place, work_date, details, phone, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (customer.id, customer.full_name, data["equipment"], data["place"], data["work_date"],
-             data["details"], phone, datetime.now(timezone.utc).isoformat()),
+             data.get("details", ""), phone, datetime.now(timezone.utc).isoformat()),
         )
         lead_id = cursor.lastrowid
         await payment_preferences.write_lead(db, lead_id, data.get("payment_method") or payment_preferences.ANY)
@@ -1667,6 +1671,10 @@ async def lead_review_action(callback: CallbackQuery, state: FSMContext, bot: Bo
     if step == LeadForm.review and action == "edit":
         await show_lead_step(callback.message, state, LeadForm.edit)
     elif step == LeadForm.review and action == "send":
+        # Old confirmation promised moderation, not immediate publication.
+        await callback.message.answer("Порядок публикации обновлён. Проверьте карточку и нажмите «Опубликовать заявку».")
+        await show_lead_step(callback.message, state, LeadForm.review)
+    elif step == LeadForm.review and action == "publish":
         await submit_lead(callback.message, callback.from_user, state, bot, data)
     elif step == LeadForm.edit and action.isascii() and action.isdecimal() and len(action) <= 2:
         fields = tuple(LEAD_EDIT_FIELDS)
@@ -1680,7 +1688,7 @@ async def submit_lead(message, customer, state, bot, data):
         await message.answer("Создание заявок ограничено. Черновик сохранён; обратитесь в поддержку.")
         return
     try:
-        lead_id, created = await save_lead_from_draft(customer, data["phone"], data)
+        lead_id, created = await save_lead_from_draft(customer, data.get("phone", ""), data, enforce_limits=True)
     except user_access.AccessDenied:
         await message.answer("Создание заявок ограничено. Черновик сохранён; обратитесь в поддержку.")
         return
@@ -1688,13 +1696,44 @@ async def submit_lead(message, customer, state, bot, data):
         await message.answer(str(exc))
         await show_lead_step(message, state, LeadForm.date, lead_editing=LeadForm.date.state)
         return
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
     if not created:
         await clear_form_keyboard(message, state)
         await state.clear()
-        await message.answer(f"Заявка №{lead_id} уже сохранена.", reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
+        saved = await get_lead(lead_id)
+        await message.answer(f"Заявка №{lead_id} уже сохранена. Статус: {LEAD_STATUS.get(saved['status'], saved['status'])}.",
+                             reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
         return
     lead = await get_lead(lead_id)
-    # Shadow evaluation only: never changes the manual approval workflow.
+    await clear_form_keyboard(message, state)
+    await state.clear()
+    try:
+        claimed = await lead_publication.claim_new(lead_id, customer.id)
+    except user_access.AccessDenied:
+        await message.answer(f"Заявка №{lead_id} сохранена, но публикация запрещена текущими ограничениями. Обратитесь в поддержку.")
+        return
+    if claimed:
+        result = await publish_claimed_lead(bot, lead, actor_id=customer.id, automatic=True)
+        text = {
+            "published": f"✅ Заявка №{lead_id} опубликована. Она доступна в «Мои заявки».",
+            "rejected": f"Заявка №{lead_id} сохранена. Telegram отклонил публикацию; передали её администратору для проверки.",
+            "uncertain": f"Заявка №{lead_id} сохранена. Результат публикации пока неизвестен; повтор заблокирован. Обратитесь в поддержку.",
+        }[result]
+        try:
+            await message.answer(text, reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
+        except TelegramAPIError as exc:
+            logging.warning("Automatic publication acknowledgement not confirmed: %s", type(exc).__name__)
+        if result != "published":
+            await alert_publication_review(bot, lead, text)
+        return
+    current = await get_lead(lead_id)
+    if current["status"] != "new":
+        await message.answer(f"Заявка №{lead_id} сохранена. Статус: {LEAD_STATUS.get(current['status'], current['status'])}.",
+                             reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
+        return
+    # Paused fallback: the retained shadow result is informational, never a send command.
     shadow = await lead_shadow_review.evaluate(
         customer.id, equipment=data["equipment"],
         region=data["region"], area=data["area"], place=data["place"],
@@ -1708,9 +1747,7 @@ async def submit_lead(message, customer, state, bot, data):
     ]])
     for admin_id in await admin_recipients("moderate"):
         await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
-    await clear_form_keyboard(message, state)
-    await state.clear()
-    await message.answer("Спасибо! Проверим заявку и передадим её подходящим исполнителям.", reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
+    await message.answer(f"Автопубликация временно приостановлена. Заявка №{lead_id} сохранена и направлена на проверку.", reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
 
 
 @router.message(F.text == LEGACY_PROVIDER)
@@ -2042,6 +2079,50 @@ async def send_provider_notification(telegram, recipient, text, **kwargs):
     return False
 
 
+async def publish_claimed_lead(bot, lead, *, actor_id, automatic=False):
+    """One claimed publication; ambiguous send/commit never restores retryability."""
+    lead_id = lead["id"]
+    markup = InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead_id)]])
+    try:
+        sent = await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        # Explicit rejection: Telegram did not accept the message, retry is safe.
+        await storage.transition(lead_id, "publishing", "new")
+        await admin_access.record(actor_id, "lead_publication", target_id=lead_id, result="rejected")
+        return "rejected"
+    except TelegramAPIError:
+        # Timeout/network failure may happen AFTER Telegram accepted the message.
+        # Keep publishing across restarts; never retry blindly and duplicate a lead.
+        await admin_access.record(actor_id, "lead_publication", target_id=lead_id, result="uncertain")
+        return "uncertain"
+    try:
+        await storage.finish_publication(lead_id, sent.chat.id, sent.message_id,
+                                         actor_id=actor_id, automatic=automatic)
+    except Exception as exc:
+        logging.error("Publication receipt could not be committed: %s", type(exc).__name__)
+        return "uncertain"
+    if not automatic:
+        await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
+        await notify(bot, lead["customer_id"], f"Ваша заявка №{lead_id} опубликована.")
+    try:
+        await notify_test_providers(bot, lead)
+    except Exception as exc:
+        # Publication is committed. Never republish to retry an interrupted fanout.
+        logging.error("Published lead notification fanout interrupted: %s", type(exc).__name__)
+    return "published"
+
+
+async def alert_publication_review(bot, lead, text):
+    markup = None
+    if (await get_lead(lead["id"]))["status"] == "new":
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead['id']}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead['id']}"),
+        ]])
+    for admin_id in await admin_recipients("moderate"):
+        await notify(bot, admin_id, text + "\n\n" + lead_text(lead, True), reply_markup=markup)
+
+
 @router.callback_query(F.data.startswith("publish:"))
 async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
     lead_id = await admin_lead_id(callback, "publish:")
@@ -2055,25 +2136,12 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
     except TelegramAPIError:
         logging.warning("Cannot acknowledge publication callback for lead %s", lead_id)
     lead = await get_lead(lead_id)
-    markup = InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead_id)]])
-    try:
-        sent = await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
-    except (TelegramBadRequest, TelegramForbiddenError):
-        # Explicit rejection: Telegram did not accept the message, retry is safe.
-        await storage.transition(lead_id, "publishing", "new")
-        await notify(bot, callback.from_user.id, "Telegram отклонил публикацию. Проверьте права и повторите.")
-        return
-    except TelegramAPIError:
-        # Timeout/network failure may happen AFTER Telegram accepted the message.
-        # Keep publishing across restarts; never retry blindly and duplicate a lead.
+    result = await publish_claimed_lead(bot, lead, actor_id=callback.from_user.id)
+    if result != "published":
         await notify(bot, callback.from_user.id,
+                     "Telegram отклонил публикацию. Проверьте права и повторите." if result == "rejected" else
                      "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
         return
-    await storage.finish_publication(lead_id, sent.chat.id, sent.message_id)
-    await admin_access.record(callback.from_user.id, "lead_publish", target_id=lead_id)
-    await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
-    await notify(bot, lead["customer_id"], f"Ваша заявка №{lead_id} опубликована.")
-    await notify_test_providers(bot, lead)
     if callback.message:
         try:
             await callback.message.edit_text("✅ Заявка опубликована.\n\n" + lead_text(lead, True))

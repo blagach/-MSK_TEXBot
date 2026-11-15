@@ -22,6 +22,8 @@ class LeadJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.db_patch = patch.object(storage, "DB_PATH", self.tmp.name + "/journey.sqlite")
         self.db_patch.start()
         await bot.init_db()
+        # Keep coverage of the explicitly paused/manual fallback and old records.
+        await bot.lead_publication.set_mode(1, 1, False, 0)
         self.fake_bot = SimpleNamespace(send_message=AsyncMock(
             return_value=SimpleNamespace(chat=SimpleNamespace(id=-100123), message_id=87)))
         self.state = SimpleNamespace(
@@ -73,6 +75,7 @@ class LeadJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.fake_bot.send_message.reset_mock()
         await bot.publish_lead(self.callback(f"publish:{first}"), self.fake_bot)
         self.fake_bot.send_message.assert_not_awaited()
+        self.state.get_data.return_value["place"] = "TEST другой адрес"
         second = await self.create_lead()
         self.assertEqual((await bot.get_lead(second))["status"], "new")
         decision = lead_moderation.assess(
