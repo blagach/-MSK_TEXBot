@@ -110,10 +110,9 @@ async def has_paused_provider_action(message: Message, state: FSMContext) -> boo
 
 @router.message(F.text.in_({MY_TECH, MY_REGIONS}))
 async def begin_alert_preferences(message: Message, state: FSMContext):
-    if await state.get_state() is not None:
+    current = await state.get_state()
+    if current is not None and current not in (*AddMachine.__all_states_names__, AlertPreferences.select.state):
         await message.answer("Сначала завершите открытое действие или сохраните его через /menu.")
-        return
-    if await has_paused_provider_action(message, state):
         return
     async with aiosqlite.connect(storage.DB_PATH) as db:
         profile = await (await db.execute(
@@ -123,13 +122,43 @@ async def begin_alert_preferences(message: Message, state: FSMContext):
         await message.answer("Сначала зарегистрируйтесь; заблокированный профиль недоступен.",
                              reply_markup=await executor_keyboard(message.from_user.id, state))
         return
+    import bot as app
+    legacy = draft_slot(state, "provider_action")
+    alerts = draft_slot(state, "provider_alert")
+    # Older releases stored subscriptions alongside registration/inventory.
+    # Move only that legacy subscription slot; never overwrite another draft.
+    if await legacy.get_state() == AlertPreferences.select.state:
+        if await alerts.get_state():
+            await message.answer("Сохранены две настройки подписок. Черновики оставлены без изменений; обратитесь в поддержку.")
+            return
+        if isinstance(state.storage, SQLiteDraftStorage):
+            await state.storage.transfer(legacy.key, alerts.key)
+        else:
+            await alerts.set_data(await legacy.get_data())
+            await alerts.set_state(AlertPreferences.select)
+            await legacy.clear()
+    kind = "regions" if message.text == MY_REGIONS else "categories"
+    if current == AlertPreferences.select.state:
+        await show_alert_preferences(message, state, kind)
+        return
+    if current in AddMachine.__all_states_names__:
+        if await legacy.get_state():
+            await message.answer("Обнаружены два действия с техникой. Черновики оставлены без изменений; обратитесь в поддержку.")
+            return
+        await app.pause_form(message, state)
+    if await alerts.get_state():
+        if await alerts.get_state() != AlertPreferences.select.state:
+            await message.answer("Сохранённая настройка подписок не распознана. Черновик оставлен без изменений.")
+            return
+        await alerts.update_data(alert_kind=kind, alert_group=None)
+        await app.resume_auxiliary_kind(message, state, "provider_alert", message.from_user.id)
+        return
     current = await registry.alert_preferences(message.from_user.id, storage.DB_PATH)
     await state.set_data({
         "alert_categories": current["categories"], "alert_regions": current["regions"],
         "alert_revision": current["revision"],
     })
     await state.set_state(AlertPreferences.select)
-    kind = "regions" if message.text == MY_REGIONS else "categories"
     await message.answer("Настройки получения заявок. Сохранённые карточки техники доступны ниже.",
                          reply_markup=section_keyboard((HOME,)))
     await show_alert_preferences(message, state, kind)
@@ -147,9 +176,13 @@ async def show_alert_preferences(message, state, kind, group=None):
         rows.append([InlineKeyboardButton(text="Оба региона", callback_data="provider_alert:both")])
         prompt = "📍 В каких регионах получать заявки?\nВыберите Москву, Московскую область или оба региона."
     elif group is None:
+        selected = data.get("alert_categories", [])
         rows = equipment_catalog.button_rows(
             tuple(name for name, _ in equipment_catalog.GROUPS),
-            lambda index, label: InlineKeyboardButton(text=label, callback_data=f"provider_alert:group:{index}"),
+            lambda index, label: InlineKeyboardButton(
+                text=("✅ " if any(kind in selected for kind in equipment_catalog.GROUPS[index][1]) else "") + label,
+                callback_data=f"provider_alert:group:{index}",
+            ),
         )
         prompt = "🚜 На какую технику получать заявки?\nВыберите один или несколько видов техники."
     else:
@@ -157,9 +190,10 @@ async def show_alert_preferences(message, state, kind, group=None):
         selected = data.get("alert_categories", [])
         rows = equipment_catalog.button_rows(
             labels, lambda index, label: InlineKeyboardButton(
-                text=f"{'✅' if labels[index] in selected else '⬜'} {label}",
+                text=("✅ " if labels[index] in selected else "") + label,
                 callback_data=f"provider_alert:type:{index}",
             ),
+            plain_types=True,
         )
         rows.append([InlineKeyboardButton(text="⬅️ К категориям", callback_data="provider_alert:back")])
         prompt = "🚜 На какую технику получать заявки?\nВыберите один или несколько видов техники."
@@ -171,6 +205,10 @@ async def show_alert_preferences(message, state, kind, group=None):
                + ". Новые настройки применяются после сохранения."
                + "\nРегионы: " + (", ".join(data.get("alert_regions", [])) or "не выбраны")
                + "\nПосле сохранения заявки подбираются по всему выбранному региону.")
+    selected_names = [value[0].upper() + value[1:]
+                      for value in data.get("alert_categories", [])]
+    prompt += "\n\nВыбранные виды техники:\n" + ("\n".join("• " + name for name in selected_names)
+                                                  or "Пока не выбраны")
     sent = await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await state.update_data(alert_panel=sent.message_id)
 
@@ -490,6 +528,7 @@ async def machine_catalog(message, state, group=None):
         labels = equipment_catalog.GROUPS[group][1]
     rows = equipment_catalog.button_rows(
         labels, lambda index, label: InlineKeyboardButton(text=label, callback_data=f"machine_catalog:{index}"),
+        plain_types=group is not None,
     )
     if group is not None:
         rows.append([InlineKeyboardButton(text="⬅️ К категориям", callback_data="machine_catalog:back")])

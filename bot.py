@@ -182,6 +182,7 @@ FORM_STEPS = {step.state: step for step in (*LeadForm.__all_states__, *OfferForm
 LEAD_DRAFT = "▶️ Продолжить заявку"
 CANCEL_LEAD_DRAFT = "Отменить черновик"
 PROVIDER_ACTION_DRAFT = "▶️ Продолжить настройку исполнителя"
+PROVIDER_ALERT_DRAFT = "▶️ Продолжить настройку подписок"
 LEGACY_PROVIDER_DRAFT = "▶️ Продолжить прежнюю анкету"
 SUPPORT_ACTION_DRAFT = "▶️ Продолжить обращение"
 CLOSING_ACTION_DRAFT = "▶️ Продолжить закрытие заявки"
@@ -470,8 +471,9 @@ def form_kind(current: str | None) -> str | None:
 async def pause_form(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
     kind = form_kind(current)
-    if current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__,
-                   *provider_ui.AlertPreferences.__all_states_names__):
+    if current in provider_ui.AlertPreferences.__all_states_names__:
+        kind = "provider_alert"
+    elif current in (*provider_ui.Register.__all_states_names__, *provider_ui.AddMachine.__all_states_names__):
         kind = "provider_action"
     elif current in ProviderForm.__all_states_names__:
         kind = "legacy_provider"
@@ -513,6 +515,7 @@ def auxiliary_specs():
     return (
         ("provider_action", PROVIDER_ACTION_DRAFT, (*provider_ui.Register.__all_states_names__,
          *provider_ui.AddMachine.__all_states_names__, *provider_ui.AlertPreferences.__all_states_names__), None),
+        ("provider_alert", PROVIDER_ALERT_DRAFT, provider_ui.AlertPreferences.__all_states_names__, None),
         ("legacy_provider", LEGACY_PROVIDER_DRAFT, ProviderForm.__all_states_names__, None),
         ("support_action", SUPPORT_ACTION_DRAFT, (support_ui.Support.compose.state,
          support_ui.Support.reply.state, support_ui.Support.requester_reply.state), None),
@@ -577,7 +580,7 @@ async def paused_action(callback: CallbackQuery, state: FSMContext):
     await resume_auxiliary_kind(message, state, kind, callback.from_user.id)
 
 
-@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, LEGACY_PROVIDER_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT, ADMIN_SEARCH_DRAFT, ADMIN_ACCESS_DRAFT, ADMIN_LEAD_SEARCH_DRAFT}))
+@router.message(F.text.in_({PROVIDER_ACTION_DRAFT, PROVIDER_ALERT_DRAFT, LEGACY_PROVIDER_DRAFT, SUPPORT_ACTION_DRAFT, CLOSING_ACTION_DRAFT, ADMIN_ACTION_DRAFT, ADMIN_SEARCH_DRAFT, ADMIN_ACCESS_DRAFT, ADMIN_LEAD_SEARCH_DRAFT}))
 async def resume_auxiliary_action(message: Message, state: FSMContext):
     # Keep older reply-keyboard labels as compatible aliases.
     kind = next((kind for kind, label, _, _ in auxiliary_specs() if label == message.text), None)
@@ -600,7 +603,7 @@ async def resume_auxiliary_kind(message: Message, state: FSMContext, kind: str, 
     if current and current not in states:
         await message.answer("Сохранённое действие не распознано. Черновик оставлен без изменений.")
         return
-    provider = kind == "provider_action"
+    provider = kind in {"provider_action", "provider_alert"}
     legacy_provider = kind == "legacy_provider"
     closing = kind == "lead_closing"
     admin_action = kind == "admin_action"

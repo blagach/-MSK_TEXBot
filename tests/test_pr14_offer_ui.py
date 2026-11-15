@@ -697,7 +697,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await self.preference_action("region:0")
         await bot.show_main_menu(self.message, self.state)
         self.state = self.reopen_sqlite_state()
-        self.message.text = bot.PROVIDER_ACTION_DRAFT
+        self.message.text = bot.PROVIDER_ALERT_DRAFT
         await bot.resume_auxiliary_action(self.message, self.state)
         self.assertEqual((await self.state.get_data())["alert_regions"], ["Московская область"])
         await self.preference_action("cancel")
@@ -711,7 +711,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
                       bot.provider_ui.PAYMENT_METHOD):
             self.assertIn(label, tools)
         self.assertNotIn(bot.MY_OFFERS, tools)
-        self.assertIsNotNone(await bot.draft_slot(self.state, "provider_action").get_state())
+        self.assertIsNotNone(await bot.draft_slot(self.state, "provider_alert").get_state())
 
     async def test_alert_preferences_detect_concurrent_changes_without_losing_draft(self):
         await bot.provider_registry.register_provider(20, "Исполнитель", "+79990000001", True, storage.DB_PATH)

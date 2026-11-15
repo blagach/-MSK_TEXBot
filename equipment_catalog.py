@@ -29,7 +29,7 @@ LEGACY_ALIASES = {"каток": "дорожный каток"}
 TYPES = frozenset(kind for _, kinds in GROUPS for kind in kinds) | LEGACY_ALIASES.keys()
 
 
-def button_rows(labels, button):
+def button_rows(labels, button, *, plain_types=False):
     rows = []
     pair = []
     for index, label in enumerate(labels):
@@ -39,7 +39,9 @@ def button_rows(labels, button):
         if wide and pair:
             rows.append(pair)
             pair = []
-        pair.append(button(index, DISPLAY_LABELS.get(label, label[0].upper() + label[1:])))
+        text = (label[0].upper() + label[1:] if plain_types
+                else DISPLAY_LABELS.get(label, label[0].upper() + label[1:]))
+        pair.append(button(index, text))
         if len(pair) == 2 or wide:
             rows.append(pair)
             pair = []
