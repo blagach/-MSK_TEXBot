@@ -47,6 +47,7 @@ from provider_ui import AVAILABLE_LEADS, LEGACY_PROVIDER, MY_OFFERS, OFFER_DRAFT
 import provider_dispatch
 import notification_reservations
 import lead_journey
+import lead_delivery_guard
 import lead_routing
 import moderation_history
 import lead_moderation
@@ -265,7 +266,7 @@ async def reveal_customer_contact(callback: CallbackQuery) -> None:
         await callback.answer("Заявка недоступна", show_alert=True)
         return
     try:
-        phone = await customer_contacts.open_contact(storage.DB_PATH, callback.from_user.id, lead_id)
+        phone = await customer_contacts.open_contact(storage.DB_PATH, callback.from_user.id, lead_id, active_only=True)
     except PermissionError as exc:
         await callback.answer(str(exc), show_alert=True)
         return
@@ -949,7 +950,7 @@ async def start_offer(message: Message, state: FSMContext, command: CommandObjec
         if message.chat.type != "private":
             return
         try:
-            phone = await customer_contacts.open_contact(storage.DB_PATH, message.from_user.id, contact_id)
+            phone = await customer_contacts.open_contact(storage.DB_PATH, message.from_user.id, contact_id, active_only=True)
         except PermissionError as exc:
             await message.answer(str(exc))
             return
@@ -1194,7 +1195,16 @@ async def lead_card_action(callback: CallbackQuery, state: FSMContext, bot: Bot)
     elif action == "close" and lead["status"] == "published":
         await pause_form(message, state)
         await state.set_state(CloseLead.reason)
-        await state.update_data(closing_lead=lead_id)
+        await state.update_data(closing_lead=lead_id, closing_action="close")
+        await show_closing_step(message, state)
+    elif action == "restore" and admin and lead["status"] == "closed" and len(parts) == 4:
+        revision, _ = await lead_journey.moderation_snapshot(storage.DB_PATH, lead_id)
+        if parts[3] != str(revision):
+            await message.answer("Состояние заявки изменилось. Откройте её карточку заново.")
+            return
+        await pause_form(message, state)
+        await state.set_state(CloseLead.reason)
+        await state.update_data(closing_lead=lead_id, closing_action="restore", closing_revision=revision)
         await show_closing_step(message, state)
     elif action == "repeat" and owner:
         if form_kind(await state.get_state()) == "lead" or await draft_slot(state, "lead").get_state():
@@ -1219,6 +1229,9 @@ async def show_customer_lead(message, lead, owner, admin, admin_back=None):
         rows.append([lead_key("Повторить заявку", f"repeat:{lead_id}")])
     if status == "published":
         rows.append([lead_key("Закрыть заявку", f"close:{lead_id}")])
+    revision, history = await lead_journey.moderation_snapshot(storage.DB_PATH, lead_id)
+    if admin and status == "closed":
+        rows.append([lead_key("Восстановить заявку", f"restore:{lead_id}:{revision}")])
     if admin and status == "new":
         rows.append([InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
                      InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}")])
@@ -1229,6 +1242,14 @@ async def show_customer_lead(message, lead, owner, admin, admin_back=None):
                               (lead_id,)) as cursor:
             closing = await cursor.fetchone()
     closing_text = f"\nПричина закрытия: {closing[0] or 'не указана'}" if closing else ""
+    latest_close = next((r for r in history if r['action'] == 'lead_close' and lead_journey.audit_reason(r) is not None), None)
+    if latest_close:
+        closing_text = f"\nПричина последнего закрытия: {lead_journey.audit_reason(latest_close) or 'не указана'}"
+    if admin and history:
+        await message.answer("Последние действия (полная история — в журнале):\n" + "\n".join(
+            f"{r['created_at']} (UTC) · {r['actor_id']} · "
+            f"{'Восстановление' if r['action']=='lead_restore' else 'Закрытие'} · "
+            f"{str(lead_journey.audit_reason(r) or 'не указана')[:120]}" for r in history))
     await message.answer(f"{lead_text(lead, True)}\nСтатус: {LEAD_STATUS.get(status, status)}{closing_text}",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1263,18 +1284,20 @@ async def show_customer_offers(message, lead, before):
 async def show_closing_step(message, state):
     await clear_form_keyboard(message, state)
     data = await state.get_data()
+    restoring = data.get('closing_action') == 'restore'
+    verb = 'Восстановить' if restoring else 'Закрыть'
     if await state.get_state() == CloseLead.confirm.state:
         rows = [
-            [InlineKeyboardButton(text="✅ Подтвердить закрытие", callback_data="lead_close:send")],
+            [InlineKeyboardButton(text="✅ Подтвердить восстановление" if restoring else "✅ Подтвердить закрытие", callback_data="lead_close:send")],
             [InlineKeyboardButton(text="✏️ Изменить причину", callback_data="lead_close:edit"),
              InlineKeyboardButton(text="Отмена", callback_data="lead_close:cancel")],
             [InlineKeyboardButton(text=OFFER_HOME, callback_data="lead_close:home")],
         ]
         await send_form_panel(message, state,
-                              f"Закрыть заявку №{data['closing_lead']}?\nПричина: {data.get('closing_reason') or 'не указана'}", rows)
+                              f"{verb} заявку №{data['closing_lead']}?\nПричина: {data.get('closing_reason') or 'не указана'}", rows)
     else:
-        await send_form_panel(message, state, "Причина закрытия необязательна. Напишите её или нажмите «Без причины».", [
-            [InlineKeyboardButton(text="Без причины", callback_data="lead_close:skip")],
+        await send_form_panel(message, state, "Укажите причину восстановления. Уведомления повторно не отправляются." if restoring else "Причина закрытия необязательна. Напишите её или нажмите «Без причины».", [
+            *([] if restoring else [[InlineKeyboardButton(text="Без причины", callback_data="lead_close:skip")]]),
             [InlineKeyboardButton(text="Отмена", callback_data="lead_close:cancel"),
              InlineKeyboardButton(text=OFFER_HOME, callback_data="lead_close:home")],
         ])
@@ -1306,6 +1329,9 @@ async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bo
         await callback.answer("Этот шаг уже неактуален.")
         return
     if action == "skip":
+        if data.get('closing_action') == 'restore':
+            await callback.answer("Укажите причину восстановления.")
+            return
         await callback.answer()
         await state.update_data(closing_reason="")
         await state.set_state(CloseLead.confirm)
@@ -1326,11 +1352,24 @@ async def close_lead_confirmation(callback: CallbackQuery, state: FSMContext, bo
         await state.clear()
         await message.answer("Закрытие отменено.", reply_markup=main_menu(await admin_allowed(user_id, "panel")))
         return
+    if data.get('closing_action') == 'restore':
+        try:
+            changed = await lead_journey.restore_closed(storage.DB_PATH, lead_id, user_id,
+                data.get('closing_reason', ''), data.get('closing_revision'),
+                legacy_admins=settings.admin_ids, owner_id=settings.owner_id)
+        except (PermissionError, ValueError) as exc:
+            await message.answer(str(exc))
+            return
+        await state.clear()
+        await message.answer(f"Заявка №{lead_id} восстановлена. Повторные уведомления не отправлялись." if changed
+            else "Восстановление не выполнено: заявка изменилась, доступ ограничен или включена пауза. Откройте карточку заново.",
+            reply_markup=main_menu(await admin_allowed(user_id, 'panel')))
+        return
     changed = await lead_journey.change_lifecycle(
         storage.DB_PATH, lead_id, user_id, admin=await admin_allowed(user_id, "moderate"), reason=data.get("closing_reason", ""),
     )
-    await admin_access.record(user_id, "lead_close", target_id=lead_id,
-                              result="success" if changed else "not_changed")
+    if not changed:
+        await admin_access.record(user_id, "lead_close", target_id=lead_id, result="not_changed")
     await state.clear()
     notice = ""
     if changed:
@@ -2004,6 +2043,9 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
     current = await get_lead(lead["id"])
     if not current or current["status"] != "published":
         return
+    status, revision = await lead_journey.delivery_snapshot(storage.DB_PATH, lead['id'])
+    if status != 'published':
+        return
     routing = await lead_routing.get(lead["id"], storage.DB_PATH)
     if not routing:
         return
@@ -2024,20 +2066,34 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
                 lead["id"], provider_id, storage.DB_PATH,
             ):
                 continue
-            delivered = await send_provider_notification(bot, provider_id, public_text(text),
+            await send_provider_notification(bot, provider_id, public_text(text), lead_id=lead['id'], revision=revision,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead["id"], private=True)]]))
-            await notification_reservations.record_outcome(
-                lead["id"], provider_id, "confirmed" if delivered else "uncertain", storage.DB_PATH,
-            )
             if production:
                 # One shared production lock also paces concurrent publications.
                 await asyncio.sleep(1.05)
 
 
-async def send_provider_notification(telegram, recipient, text, **kwargs):
+async def send_provider_notification(telegram, recipient, text, *, lead_id=None, revision=None, **kwargs):
     for attempt in range(2):
         try:
-            await telegram.send_message(recipient, text, **kwargs)
+            async with (lead_delivery_guard.for_lead(storage.DB_PATH, lead_id) if lead_id else asyncio.Lock()):
+                if lead_id and not await notification_reservations.may_send(lead_id, recipient, storage.DB_PATH, revision):
+                    return None  # Terminal cancellation, not an uncertain send.
+                try:
+                    await telegram.send_message(recipient, text, **kwargs)
+                except TelegramRetryAfter:
+                    if lead_id:
+                        async with aiosqlite.connect(storage.DB_PATH) as db:
+                            await notification_reservations.audit_delivery_in(db, lead_id, recipient,
+                                'provider_notification_rejected', 'rejected', reason='telegram_429')
+                            await db.commit()
+                    raise
+                except BaseException:
+                    if lead_id:
+                        await notification_reservations.record_outcome(lead_id, recipient, 'uncertain', storage.DB_PATH)
+                    raise
+                if lead_id:
+                    await notification_reservations.record_outcome(lead_id, recipient, 'confirmed', storage.DB_PATH)
             return True
         except TelegramRetryAfter as error:
             # A 429 explicitly rejected this request. Only this definite rejection
@@ -2047,6 +2103,12 @@ async def send_provider_notification(telegram, recipient, text, **kwargs):
         except TelegramAPIError as error:
             logging.warning("Provider notification not confirmed: %s", type(error).__name__)
             return False
+    if lead_id:
+        async with lead_delivery_guard.for_lead(storage.DB_PATH, lead_id):
+            async with aiosqlite.connect(storage.DB_PATH) as db:
+                await db.execute('BEGIN IMMEDIATE')
+                await notification_reservations.cancel_in(db, lead_id, recipient, actor_id=0, reason='rate_limit_exhausted')
+                await db.commit()
     return False
 
 

@@ -9,7 +9,7 @@ async def init_schema(path):
             phone TEXT NOT NULL, PRIMARY KEY(provider_id,lead_id))''')
         await db.commit()
 
-async def open_contact(path, provider_id, lead_id, *, saved_only=False):
+async def open_contact(path, provider_id, lead_id, *, saved_only=False, active_only=False):
     async with aiosqlite.connect(path) as db:
         if not saved_only:
             await db.execute('BEGIN IMMEDIATE')
@@ -18,6 +18,10 @@ async def open_contact(path, provider_id, lead_id, *, saved_only=False):
         profile=await (await db.execute('SELECT blocked FROM provider_profiles WHERE telegram_id=?',(provider_id,))).fetchone()
         if not profile or profile[0]:
             raise PermissionError('Сначала зарегистрируйтесь как исполнитель.')
+        if active_only:
+            current = await (await db.execute('SELECT status FROM leads WHERE id=?',(lead_id,))).fetchone()
+            if not current or current[0] != 'published':
+                raise PermissionError('Заявка недоступна: закрыта или снята с публикации.')
         old=await (await db.execute('SELECT phone FROM customer_contact_access WHERE provider_id=? AND lead_id=?',(provider_id,lead_id))).fetchone()
         if old:
             return old[0]

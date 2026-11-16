@@ -112,8 +112,11 @@ class ProviderDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(c.execute('SELECT provider_id,status FROM provider_notification_reservations').fetchall(),[(101,"uncertain")])
             self.assertEqual(c.execute('SELECT delivery_status FROM offers WHERE id=?',(historical,)).fetchone(),("unconfirmed",))
         after = self.rows()
+        self.assertEqual(after['admin_action_log'][:len(before['admin_action_log'])],before['admin_action_log'])
+        self.assertEqual([r[2] for r in after['admin_action_log'][len(before['admin_action_log']):]],
+                         ['provider_notification_queued','provider_notification_attempt'])
         for table in before:
-            if table != "provider_notification_reservations":
+            if table not in {"provider_notification_reservations", "admin_action_log"}:
                 self.assertEqual(after[table],before[table],table)
         for category,region,expected in (("самосвал","Москва",[101,102]),("автокран","Московская область",[101,103])):
             self.telegram.send_message.reset_mock()

@@ -99,7 +99,12 @@ def audit_line(row):
                "lead_publish": "Публикация заявки", "lead_reject": "Отклонение заявки",
                "lead_auto_claim": "Начало автопубликации", "lead_auto_publish": "Автопубликация заявки",
                "lead_publication": "Исход публикации", "autopublish_mode": "Режим автопубликации",
-               "lead_close": "Закрытие заявки", "support_reply": "Сохранение ответа поддержки",
+               "lead_close": "Закрытие заявки", "lead_restore": "Восстановление заявки",
+               "provider_notification_cancelled": "Отмена уведомления до отправки",
+               "provider_notification_queued": "Резервирование уведомления",
+               "provider_notification_attempt": "Начало отправки уведомления",
+               "provider_notification_rejected": "Telegram отклонил уведомление (429)",
+               "support_reply": "Сохранение ответа поддержки",
                "support_delivery": "Отправка ответа поддержки", "user_search": "Поиск пользователей",
                "user_profile": "Просмотр профиля", "user_access": "Изменение доступа",
                "support_status": "Статус обращения", "export_sent": "Выгрузка XLSX", "export_sending": "Начало отправки XLSX", "export_requested": "Запрос XLSX", "export_delivery": "Отправка XLSX"}
@@ -107,7 +112,7 @@ def audit_line(row):
                "not_changed": "Без изменения", "accepted": "Запрос принят", "pending": "Ожидается ответ Telegram", "saved": "Сохранено в истории",
                "sent": "Отправку подтвердил Telegram", "failed": "Ошибка отправки",
                "uncertain": "Отправка не подтверждена", "rejected": "Telegram отклонил отправку",
-               "enabled": "Включена", "paused": "Приостановлена"}
+               "enabled": "Включена", "paused": "Приостановлена", "cancelled": "Отменено до отправки"}
     text = (f"#{row['id']} · {row['created_at']} (UTC) · пользователь {row['actor_id']}\n"
             f"{actions.get(row['action'], row['action'])} · объект {row['target_id'] or '—'} · "
             f"{results.get(row['result'], row['result'])}")
@@ -117,6 +122,10 @@ def audit_line(row):
         return text
     if isinstance(details,dict) and row["action"]=="user_access" and row["result"]=="success":
         text += f"\n{scope_text(details.get('previous',[]))} → {scope_text(details.get('scopes',[]))}\nПричина: {str(details.get('reason','—'))[:120]}"
+    if isinstance(details, dict) and row['action'] in {'lead_close', 'lead_restore', 'provider_notification_cancelled'}:
+        text += f"\nПричина: {str(details.get('reason') or 'не указана')[:500]}"
+        if row['action'] == 'provider_notification_cancelled':
+            text += f" · Получатель: {details.get('provider_id')}"
     if isinstance(details,dict) and row["action"]=="export_delivery":
         text += f"\nЭтап: {details.get('stage','sending')} · причина: {details.get('error_code','—')}"
     if isinstance(details, dict) and row['action'] == "support_delivery":
