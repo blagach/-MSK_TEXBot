@@ -122,7 +122,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             finished.set()
 
         async def poll(*args, **kwargs):
-            middleware = self.telegram.session.middleware.call_args.args[0]
+            middleware = next(c.args[0] for c in self.telegram.session.middleware.call_args_list
+                              if getattr(c.args[0], "__name__", "") == "prevent_duplicate_polling")
             request = AsyncMock(side_effect=TelegramConflictError(
                 method=MagicMock(), message="another poller",
             ))

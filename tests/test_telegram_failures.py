@@ -57,13 +57,13 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
         fake_bot = SimpleNamespace(send_message=AsyncMock(side_effect=TelegramBadRequest(method=None, message="Forbidden")))
         with patch.object(self.bot_module, "notify", new_callable=AsyncMock):
             await self.bot_module.publish_lead(self.callback(1), fake_bot)
-        self.assertEqual(self.status(1), "new")
+        self.assertEqual(self.status(1), "published")
 
     async def test_ambiguous_network_failure_blocks_automatic_retry(self):
         fake_bot = SimpleNamespace(send_message=AsyncMock(side_effect=TelegramNetworkError(method=None, message="timeout")))
         with patch.object(self.bot_module, "notify", new_callable=AsyncMock):
             await self.bot_module.publish_lead(self.callback(2), fake_bot)
-        self.assertEqual(self.status(2), "publishing")
+        self.assertEqual(self.status(2), "published")
         self.assertFalse(await storage.transition(2, "new", "publishing"))
 
     async def test_successful_publication_is_idempotent(self):
@@ -75,4 +75,4 @@ class TelegramFailureTests(unittest.IsolatedAsyncioTestCase):
             await self.bot_module.publish_lead(self.callback(3), fake_bot)
         self.assertEqual(self.status(3), "published")
         self.assertEqual([call.args[0] for call in fake_bot.send_message.await_args_list],
-                         [self.bot_module.settings.leads_channel_id, 777])
+                         [777])

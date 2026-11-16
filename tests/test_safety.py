@@ -59,11 +59,11 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_publication_only_one_send(self):
         await asyncio.gather(*(bot.publish_lead(self.callback, self.telegram) for _ in range(8)))
         self.assertEqual([call.args[0] for call in self.telegram.send_message.await_args_list],
-                         [bot.settings.leads_channel_id, (await bot.get_lead(1))["customer_id"]])
+                         [(await bot.get_lead(1))["customer_id"]])
         self.assertEqual(await self.status(), 'published')
         async with aiosqlite.connect(storage.DB_PATH) as db:
             row = await (await db.execute('SELECT chat_id,message_id FROM lead_publications')).fetchone()
-        self.assertEqual(row, (-100123, 99))
+        self.assertIsNone(row)
 
     async def test_reject_cannot_override_publication(self):
         await bot.publish_lead(self.callback, self.telegram)
@@ -79,7 +79,7 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_network_uncertainty_blocks_retry_across_init(self):
         self.telegram.send_message.side_effect = TelegramNetworkError(method=SendMessage(chat_id=1,text='x'), message='timeout')
         await bot.publish_lead(self.callback, self.telegram)
-        self.assertEqual(await self.status(), 'publishing')
+        self.assertEqual(await self.status(), 'published')
         await bot.init_db()
         self.telegram.send_message.reset_mock()
         await bot.publish_lead(self.callback, self.telegram)
@@ -88,7 +88,7 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_telegram_rejection_allows_retry(self):
         self.telegram.send_message.side_effect = TelegramBadRequest(method=SendMessage(chat_id=1,text='x'), message='bad request')
         await bot.publish_lead(self.callback, self.telegram)
-        self.assertEqual(await self.status(), 'new')
+        self.assertEqual(await self.status(), 'published')
 
     async def test_expired_callback_does_not_strand_publication(self):
         self.callback.answer.side_effect = TelegramBadRequest(method=SendMessage(chat_id=1,text='x'), message='expired')

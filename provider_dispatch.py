@@ -25,16 +25,30 @@ async def verify_production_scope(telegram, username, channel_id, *, restricted_
     if (identity.is_bot is not True or (identity.username or "").casefold() != "msk_texbot"
             or type(identity.id) is not int or identity.id != telegram.id):
         raise RuntimeError("Unexpected production bot identity")
-    channel = await telegram.get_chat(channel_id)
-    if (channel.id != channel_id or channel.type != "channel"
-            or (channel.username or "").casefold() != "zayavki_specteh_msk"):
-        raise RuntimeError("Unexpected production notification channel")
-    member = await telegram.get_chat_member(channel_id, identity.id)
-    if member.status != "creator" and not (
-        member.status == "administrator" and getattr(member, "can_post_messages", False) is True
-    ):
-        raise RuntimeError("Production bot cannot publish in its channel")
+    # Kept as legacy configuration metadata only. Notification authority is
+    # the verified bot, never membership or a message in an information channel.
     return ProductionNotificationScope(identity.id, channel_id)
+
+
+class PrivateDeliveryOnly:
+    """Defense in depth for this application, not the separate content bot.
+
+    Preserve the separately validated private support group. All channel
+    writes, including edits to historical lead posts, are rejected locally.
+    """
+    def __init__(self, support_group_id=None):
+        self.support_group_id = support_group_id
+
+    async def __call__(self, make_request, bot, method):
+        if method.__api_method__.startswith('get'):
+            return await make_request(bot, method)
+        destination = getattr(method, 'chat_id', None)
+        if destination is not None:
+            private = type(destination) is int and destination > 0
+            support = (self.support_group_id is not None and destination == self.support_group_id)
+            if not private and not support:
+                raise RuntimeError('Channel writes are disabled: leads live inside the bot')
+        return await make_request(bot, method)
 
 
 async def recipients_for_lead(*, category, region, area, db_path=provider_registry.DEFAULT_DB_PATH):

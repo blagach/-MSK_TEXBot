@@ -62,20 +62,24 @@ class LeadJourneyTests(unittest.IsolatedAsyncioTestCase):
         first = await self.create_lead()
         self.assertEqual((await bot.get_lead(first))["status"], "new")
         # New customer: only admin notifications; no channel publication.
-        self.assertEqual(self.fake_bot.send_message.await_count, len(bot.settings.admin_ids))
+        self.assertEqual(self.fake_bot.send_message.await_count, 0)
         self.assertTrue(all(call.args[0] in bot.settings.admin_ids
                             for call in self.fake_bot.send_message.await_args_list))
         self.fake_bot.send_message.reset_mock()
+        mode = await bot.lead_publication.mode()
+        await bot.lead_publication.set_mode(1,1,True,mode["revision"])
         await bot.publish_lead(self.callback(f"publish:{first}"), self.fake_bot)
         self.assertEqual((await bot.get_lead(first))["status"], "published")
         self.assertTrue(await moderation_history.approved_before(501, storage.DB_PATH))
         channel_call = self.fake_bot.send_message.await_args_list[0]
-        self.assertEqual(channel_call.args[0], bot.settings.leads_channel_id)
+        self.assertEqual(channel_call.args[0], 501)
         self.assertNotIn("+79991234567", channel_call.args[1])
         self.fake_bot.send_message.reset_mock()
         await bot.publish_lead(self.callback(f"publish:{first}"), self.fake_bot)
         self.fake_bot.send_message.assert_not_awaited()
         self.state.get_data.return_value["place"] = "TEST другой адрес"
+        mode = await bot.lead_publication.mode()
+        await bot.lead_publication.set_mode(1,1,False,mode["revision"])
         second = await self.create_lead()
         self.assertEqual((await bot.get_lead(second))["status"], "new")
         decision = lead_moderation.assess(

@@ -57,7 +57,7 @@ async def executor_keyboard(user_id: int, state: FSMContext, *, tools: bool = Fa
 
     if notifications_enabled is not None:
         notifications = NOTIFICATIONS_ON if notifications_enabled else NOTIFICATIONS_OFF
-        rows = [(MY_TECH, MY_REGIONS), (notifications,)]
+        rows = [(MY_TECH, MY_REGIONS), (notifications,), (AVAILABLE_LEADS,)]
 
     else:
         rows = [(REGISTER_PROVIDER,)]
@@ -379,7 +379,7 @@ async def begin_register(message: Message, state: FSMContext):
     await state.set_state(Register.consent)
     await message.answer(
         "Для регистрации сохраняем имя или название компании, телефон, "
-        "Telegram ID и сведения о технике. Телефон не публикуем в канале. "
+        "Telegram ID и сведения о технике. Телефон не показываем в общей карточке. "
         "Согласны на обработку этих данных для подбора заявок? Ответьте «Да» или «Нет».",
         reply_markup=registration_keyboard(),
     )

@@ -3,6 +3,7 @@ import asyncio
 import importlib
 import logging
 import os
+import provider_dispatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -104,6 +105,7 @@ async def start() -> None:
         if config.support_group_id is not None:
             os.environ["SUPPORT_GROUP_ID"] = str(config.support_group_id)
         app = importlib.import_module("bot")
+        telegram.session.middleware(provider_dispatch.PrivateDeliveryOnly(config.support_group_id))
         if backup_path is not None:
             app.storage.DB_PATH = str(candidate)
             await app.init_db()

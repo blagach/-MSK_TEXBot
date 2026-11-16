@@ -79,23 +79,36 @@ async def set_mode(actor_id, owner_id, enabled, revision):
         return True
 
 
-async def claim_new(lead_id, customer_id):
-    """Only called by the first successful submission, never by startup or retry."""
+async def activate_new(lead_id, actor_id, *, automatic=True):
+    """Activate in SQLite once. No channel receipt, network or backlog replay.
+
+    The same transaction serializes activation against the owner's pause.
+    Historical publishing (uncertain channel send) is never reactivated.
+    """
     async with aiosqlite.connect(storage.DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        if not await user_access.allowed_in(db, customer_id, "requests"):
+        lead = await (await db.execute(
+            "SELECT customer_id,status FROM leads WHERE id=?", (lead_id,),
+        )).fetchone()
+        if not lead or lead[1] != 'new':
+            return False
+        if automatic and lead[0] != actor_id:
+            raise user_access.AccessDenied("Заявка другого заказчика")
+        if not await user_access.allowed_in(db, lead[0], "requests"):
             raise user_access.AccessDenied("Создание заявок ограничено")
         if not (await mode_in(db))["enabled"]:
             return False
         cursor = await db.execute(
-            "UPDATE leads SET status='publishing' WHERE id=? AND customer_id=? AND status='new'",
-            (lead_id, customer_id),
+            "UPDATE leads SET status='published' WHERE id=? AND status='new'",
+            (lead_id,),
         )
         if cursor.rowcount != 1:
             return False
+        await storage.lead_journey.record_event(db, lead_id, "published", actor_id=actor_id)
         await db.execute(
             "INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at) VALUES (?,?,?,?,?,?)",
-            (customer_id, "lead_auto_claim", lead_id, "pending", "{}", datetime.now(timezone.utc).isoformat()),
+            (actor_id, "lead_auto_publish" if automatic else "lead_publish", lead_id,
+             "success", '{"surface":"bot"}', datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
         return True
