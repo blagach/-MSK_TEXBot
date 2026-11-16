@@ -15,7 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
 
 from draft_storage import SQLiteDraftStorage
-from screen_controls import ScreenControls
+from screen_controls import ScreenControls, clear_keyboard, markup_key
 
 
 def keyboard(*actions):
@@ -68,6 +68,72 @@ class ScreenControlTests(unittest.IsolatedAsyncioTestCase):
     def edits(self):
         return [r for r in self.requests if r.__api_method__ == 'editMessageReplyMarkup']
 
+    async def test_form_cleanup_is_not_repeated_by_screen_controller(self):
+        applied = {}
+        async def strict_telegram(bot, method, **kwargs):
+            self.requests.append(method)
+            if method.__api_method__ == 'sendMessage':
+                self.sequence += 1
+                applied[self.sequence] = markup_key(method.reply_markup)
+                return self.message(self.sequence)
+            if method.__api_method__ == 'editMessageReplyMarkup':
+                wanted = markup_key(method.reply_markup)
+                if applied.get(method.message_id) == wanted:
+                    raise TelegramBadRequest(method, 'Bad Request: message is not modified')
+                applied[method.message_id] = wanted
+            return True
+        with patch.object(self.bot.session, 'make_request', side_effect=strict_telegram):
+            first = await self.show(keyboard('lead_step:0'))
+            await self.state.set_data({'form_keyboard_id': first.message_id})
+            async def next_step(event, data):
+                # The existing form handler clears before sending its next panel.
+                await clear_keyboard(self.bot, 12, first.message_id, operation='clear_form')
+                await self.bot.send_message(12, 'Следующий шаг', reply_markup=keyboard('lead_step:1'))
+            with patch('screen_controls.logging.warning') as warning:
+                await self.run_event(next_step)
+                warning.assert_not_called()
+            self.assertEqual([r.message_id for r in self.edits()], [first.message_id])
+            handler = AsyncMock()
+            await self.run_event(handler, self.callback(first.message_id, 'lead_step:0'))
+            handler.assert_not_awaited()
+
+    async def test_cleanup_only_not_modified_is_idempotent_and_other_failures_stay_visible(self):
+        from aiogram.methods import EditMessageReplyMarkup
+        method = EditMessageReplyMarkup(chat_id=12, message_id=1)
+        errors = [
+            ('message is not modified', None),
+            ('message to edit not found', 'message_not_found'),
+            ("message can't be edited", 'message_not_editable'),
+            ('BUTTON_DATA_INVALID secret must not enter logs', 'unexpected_bad_request'),
+        ]
+        for description, reason in errors:
+            with self.subTest(reason=reason), patch.object(self.bot, 'edit_message_reply_markup',
+                    side_effect=TelegramBadRequest(method, description)), patch('screen_controls.logging.warning') as warning:
+                await clear_keyboard(self.bot, 12, 1)
+                if reason is None:
+                    warning.assert_not_called()
+                else:
+                    warning.assert_called_once()
+                    self.assertIn(reason, warning.call_args.args)
+                    self.assertNotIn('secret', str(warning.call_args))
+        with patch.object(self.bot, 'edit_message_reply_markup', side_effect=TelegramNetworkError(method, 'unknown')), patch(
+                'screen_controls.logging.warning') as warning:
+            await clear_keyboard(self.bot, 12, 1)
+            warning.assert_called_once()
+            self.assertIn('TelegramNetworkError', warning.call_args.args)
+
+    async def test_same_update_readding_controls_invalidates_successful_cleanup_cache(self):
+        panel = await self.show(keyboard('help:resources'))
+        self.requests.clear()
+        async def handler(event, data):
+            await clear_keyboard(self.bot, 12, panel.message_id)
+            await self.bot.edit_message_reply_markup(chat_id=12, message_id=panel.message_id,
+                                                     reply_markup=keyboard('help:home'))
+            await self.bot.send_message(12, 'Меню', reply_markup=ReplyKeyboardRemove())
+        await self.run_event(handler)
+        self.assertEqual([r.message_id for r in self.edits()], [panel.message_id] * 3)
+        self.assertIsNone(self.edits()[-1].reply_markup)
+
     async def test_new_screen_retires_old_help_and_admin_panels_and_rejects_delayed_click(self):
         first = await self.show(keyboard('admin:home'))
         second = await self.show(keyboard('help:resources'))
@@ -112,7 +178,7 @@ class ScreenControlTests(unittest.IsolatedAsyncioTestCase):
         edit = next(r for r in self.edits() if r.message_id == first.message_id)
         self.assertEqual([b.callback_data for row in edit.reply_markup.inline_keyboard for b in row],
                          ['help:ticket:5:0'])
-        for action in ('customer_contact:5', 'offer_call:5', 'lc:open:5', 'lc:repeat:5',
+        for action in ('customer_contact:5', 'offer_open:5', 'offer_call:5', 'lc:open:5', 'lc:repeat:5',
                        'publish:5', 'reject:5', 'help:ticket:5:0'):
             handler = AsyncMock()
             await self.run_event(handler, self.callback(10, action))
