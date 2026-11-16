@@ -45,7 +45,9 @@ class CardOfferEntryTests(unittest.IsolatedAsyncioTestCase):
                          [['📞 Получить контакт заказчика'], ['Откликнуться']])
         self.assertEqual(markup.inline_keyboard[1][0].callback_data, f'offer_open:{lid}')
         self.assertTrue(all(len(row) == 1 for row in markup.inline_keyboard))
-        await bot.notify_test_providers(self.telegram, lead)
+        # Historical callers may pass only the delivery seed. Eligibility must
+        # use the current database lead, not require new fields on that seed.
+        await bot.notify_test_providers(self.telegram, {k: lead[k] for k in ('id', 'work_date', 'details')})
         sent = self.telegram.send_message.await_args.kwargs['reply_markup']
         self.assertEqual(sent, markup)
         self.assertEqual(self.rows('SELECT status FROM provider_notification_reservations'), [('confirmed',)])
@@ -171,6 +173,9 @@ class CardOfferEntryTests(unittest.IsolatedAsyncioTestCase):
                 return schema, {t: c.execute('SELECT * FROM "' + t + '"').fetchall() for t in tables}
         before = snapshot()
         await bot.private_contact_card(await bot.get_lead(lid), 701)
+        with patch.object(bot, 'lead_text', return_value='TEST legacy contact card'):
+            _, markup = await bot.private_contact_card({'id': lid}, 701)
+            self.assertEqual(markup.inline_keyboard[1][0].callback_data, f'offer_open:{lid}')
         await bot.open_card_offer(self.callback(lid), self.state)
         self.assertEqual(snapshot(), before)
         with sqlite3.connect(self.path) as c:

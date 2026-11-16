@@ -250,12 +250,14 @@ def private_lead_actions(lead_id, contact_button, *, offer=True):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def offer_entry_allowed(user_id):
+async def offer_entry_allowed(user_id, lead_id):
     async with aiosqlite.connect(storage.DB_PATH) as db:
         profile = await (await db.execute(
-            "SELECT blocked FROM provider_profiles WHERE telegram_id=?", (user_id,),
+            """SELECT 1 FROM provider_profiles p JOIN leads l ON l.id=?
+               WHERE p.telegram_id=? AND p.blocked=0
+                 AND l.status='published' AND l.customer_id<>?""", (lead_id, user_id, user_id),
         )).fetchone()
-        return bool(profile and not profile[0] and await user_access.allowed_in(db, user_id, "offers"))
+        return bool(profile and await user_access.allowed_in(db, user_id, "offers"))
 
 
 async def private_contact_card(lead, user_id):
@@ -267,8 +269,7 @@ async def private_contact_card(lead, user_id):
     button = revealed_contact_button(phone) if phone else respond_button(lead["id"], private=True)
     if phone:
         text += f"\nКонтакт заказчика: {phone}"
-    offer = (lead["status"] == "published" and lead["customer_id"] != user_id
-             and await offer_entry_allowed(user_id))
+    offer = await offer_entry_allowed(user_id, lead["id"])
     return text, private_lead_actions(lead["id"], button, offer=offer)
 
 
@@ -284,7 +285,7 @@ async def open_card_offer(callback: CallbackQuery, state: FSMContext) -> None:
     if not lead or lead["status"] != "published" or lead["customer_id"] == callback.from_user.id:
         await callback.answer("Заявка недоступна для отклика.", show_alert=True)
         return
-    if not await offer_entry_allowed(callback.from_user.id):
+    if not await offer_entry_allowed(callback.from_user.id, lead_id):
         await callback.answer("Отклик недоступен. Проверьте профиль исполнителя или обратитесь в поддержку.", show_alert=True)
         return
     await callback.answer()
@@ -2101,7 +2102,7 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
                 continue
             await send_provider_notification(bot, provider_id, public_text(text), lead_id=lead['id'], revision=revision,
                 reply_markup=private_lead_actions(lead["id"], respond_button(lead["id"], private=True),
-                                                 offer=provider_id != lead["customer_id"]))
+                    offer="customer_id" in current.keys() and provider_id != current["customer_id"]))
             if production:
                 # One shared production lock also paces concurrent publications.
                 await asyncio.sleep(1.05)

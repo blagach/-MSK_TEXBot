@@ -55,6 +55,11 @@ Contact reveal preserves the new row. No extra menu, new offer table, independen
 wizard, payment or channel publication is added. New notification fanout is not
 introduced; only its markup changes.
 
+Historical callers may pass only a lead ID to contact rendering or a minimal
+delivery seed to notification fanout. Those input contracts are preserved:
+offer availability is read from SQLite, and notification markup uses the
+current database lead rather than adding required fields to the seed.
+
 `offer_open:<id>` verifies the private actor/chat, active foreign lead, registered
 unblocked provider and current offer restrictions, then calls the existing
 `open_offer` implementation. Existing price, conditions, phone, review, draft
@@ -70,9 +75,10 @@ separately authorized TEST installation.
 
 ## Validation
 
-69 addressed tests passed with socket connections disabled and **zero network
+79 addressed tests passed with socket connections disabled and **zero network
 attempts**: screen controls, card offer entry, moderation/restoration, in-bot
-publication, notification delivery and the existing offer UI. Ten new tests
+publication, notification delivery, legacy contact rendering, two-account
+delivery isolation and the existing offer UI. Ten new tests
 cover the reproduced double clear, error classification, cache invalidation,
 button/contact markup, the full existing offer FSM, duplicate and concurrent
 confirmation, blocked/wrong actors, closed/restored leads and unchanged SQLite
