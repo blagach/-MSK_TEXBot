@@ -560,21 +560,20 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "settings", replace(bot.settings, test_notification_provider_ids=frozenset({30}))),
             patch.object(bot.provider_dispatch, "recipients_for_lead", new=AsyncMock(return_value=[30])),
         ):
+            mode = await bot.lead_publication.mode()
+            await bot.lead_publication.set_mode(1,1,True,mode["revision"])
             await bot.publish_lead(callback, self.telegram)
         self.assertEqual((await bot.get_lead(lead_id))["status"], "published")
-        channel, customer_notice, notification = self.telegram.send_message.await_args_list
+        customer_notice, notification = self.telegram.send_message.await_args_list
         self.assertIn("опубликована", customer_notice.args[1])
-        self.assertIn("Детали: не указаны", channel.args[1])
+        card, markup = await bot.private_contact_card(await bot.get_lead(lead_id), 30)
+        self.assertIn("Детали: не указаны", card)
         self.assertNotIn("https://", notification.args[1])
         self.assertNotIn("Описание:", notification.args[1])
-        for send in (channel, notification):
-            button = send.kwargs["reply_markup"].inline_keyboard[0][0]
-            self.assertEqual(button.text, "📞 Получить контакт заказчика")
-            if send is channel:
-                self.assertTrue(button.url.endswith("?start=contact_2"))
-            else:
-                self.assertEqual(button.callback_data,"customer_contact:2")
-                self.assertIsNone(button.url)
+        button = notification.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(button.text, "📞 Получить контакт заказчика")
+        self.assertEqual(button.callback_data,"customer_contact:2")
+        self.assertIsNone(button.url)
         await bot.start_offer(self.message, self.state, CommandObject(args="lead_2"))
         self.assertEqual((await self.state.get_data())["lead_id"], lead_id)
         self.assertEqual(await self.state.get_state(), bot.OfferForm.price.state)
@@ -594,7 +593,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         await bot.offer_price(self.message, self.state)
         await bot.executor_menu(self.message, self.state)
         self.assertEqual(self.keyboard_rows()[1:], [
-            ["🔔 Уведомления включены"], ["🏠 Главное меню"],
+            ["🔔 Уведомления включены"], [bot.AVAILABLE_LEADS], ["🏠 Главное меню"],
         ])
         self.message.text = "🔔 Уведомления включены"
         await bot.provider_ui.notifications(self.message, self.state)
@@ -649,6 +648,7 @@ class OfferUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.keyboard_rows(), [
             ["🚜 Моя техника", "📍 Мои регионы"],
             ["🔔 Уведомления включены"],
+            [bot.AVAILABLE_LEADS],
             ["🏠 Главное меню"],
         ])
         await bot.customer_menu(self.message, self.state)

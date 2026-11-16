@@ -99,7 +99,7 @@ class HelpAndAdminTests(unittest.IsolatedAsyncioTestCase):
                 return {n: sorted(await (await db.execute('SELECT * FROM "' + n + '"')).fetchall(), key=repr) for n in names}
 
         before = await rows()
-        telegram = Record(set_my_commands=AsyncMock())
+        telegram = Record(set_my_commands=AsyncMock(), session=Record(middleware=lambda value: None))
         dispatcher = Record(start_polling=AsyncMock())
         with patch.object(bot.provider_dispatch, "verify_production_scope", new_callable=AsyncMock) as verify, patch.object(bot, "Bot", return_value=telegram), patch.object(
             bot, "create_dispatcher", return_value=dispatcher,

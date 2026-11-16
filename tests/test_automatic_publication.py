@@ -72,9 +72,9 @@ class AutomaticPublicationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "settings", replace(bot.settings, test_notification_provider_ids=frozenset())):
             await self.submit()
         self.assertEqual(self.rows("SELECT status FROM leads"), [("published",)])
-        self.assertEqual(len(self.channel_calls()), 1)
-        self.assertNotIn(self.data["phone"], self.channel_calls()[0].args[1])
-        self.assertEqual([c.args[0] for c in self.telegram.send_message.await_args_list], [bot.settings.leads_channel_id, 701])
+        self.assertEqual(len(self.channel_calls()), 0)
+        self.assertNotIn(self.data["phone"], self.telegram.send_message.await_args_list[0].args[1])
+        self.assertEqual([c.args[0] for c in self.telegram.send_message.await_args_list], [701])
         self.assertEqual(self.rows("SELECT status FROM provider_notification_reservations"), [("confirmed",)])
         self.assertEqual(self.rows("SELECT count(*) FROM customer_approvals"), [(0,)])
         self.assertEqual(self.rows("SELECT count(*) FROM provider_equipment"), [(0,)])
@@ -88,23 +88,23 @@ class AutomaticPublicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_double_click_and_same_submission_after_restart_never_send_again(self):
         await asyncio.gather(*(bot.submit_lead(self.message, self.customer, self.state, self.telegram, dict(self.data)) for _ in range(6)))
         self.assertEqual(self.rows("SELECT count(*) FROM leads"), [(1,)])
-        self.assertEqual(len(self.channel_calls()), 1)
+        self.assertEqual(len(self.channel_calls()), 0)
         await bot.init_db()
         await self.submit()
-        self.assertEqual(len(self.channel_calls()), 1)
-        self.assertEqual(self.rows("SELECT count(*) FROM lead_publications"), [(1,)])
+        self.assertEqual(len(self.channel_calls()), 0)
+        self.assertEqual(self.rows("SELECT count(*) FROM lead_publications"), [(0,)])
 
     async def test_distinct_drafts_cannot_concurrently_duplicate_same_request(self):
         await asyncio.gather(*(bot.submit_lead(self.message, self.customer, self.state, self.telegram,
                                               {**self.data, "draft_id": str(i)}) for i in range(5)))
         self.assertEqual(self.rows("SELECT count(*) FROM leads"), [(1,)])
-        self.assertEqual(len(self.channel_calls()), 1)
+        self.assertEqual(len(self.channel_calls()), 0)
 
     async def test_three_per_hour_limit_is_atomic_and_keeps_fourth_draft(self):
         for i in range(4):
             await self.submit(draft_id=str(i), place=f"TEST адрес {i}")
         self.assertEqual(self.rows("SELECT count(*) FROM leads"), [(3,)])
-        self.assertEqual(len(self.channel_calls()), 3)
+        self.assertEqual(len(self.channel_calls()), 0)
         self.assertEqual(await self.state.get_state(), bot.LeadForm.review.state)
         self.assertEqual((await self.state.get_data())["draft_id"], "3")
         self.assertIn("трёх заявок за час", self.message.answer.await_args.args[0])
@@ -114,7 +114,7 @@ class AutomaticPublicationTests(unittest.IsolatedAsyncioTestCase):
                                               {**self.data, "draft_id": str(i), "place": f"TEST адрес {i}"})
                                for i in range(6)))
         self.assertEqual(self.rows("SELECT count(*) FROM leads"), [(3,)])
-        self.assertEqual(len(self.channel_calls()), 3)
+        self.assertEqual(len(self.channel_calls()), 0)
 
     async def test_invalid_fields_and_expired_date_do_not_create_or_send(self):
         for field, value in (("phone", "wrong"), ("place", " "), ("equipment", "unknown"), ("region", "unknown")):
@@ -137,26 +137,22 @@ class AutomaticPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rows("SELECT status FROM leads"), [("new",)])
         self.telegram.send_message.assert_not_awaited()
 
-    async def test_timeout_remains_publishing_and_is_not_replayed_after_restart(self):
-        self.telegram.send_message.side_effect = TelegramNetworkError(
-            method=SendMessage(chat_id=-1, text="TEST"), message="timeout")
+    async def test_customer_ack_timeout_does_not_deactivate_or_repeat(self):
+        self.message.answer.side_effect = TelegramNetworkError(method=SendMessage(chat_id=501,text='x'),message='timeout')
         await self.submit()
-        self.assertEqual(self.rows("SELECT status FROM leads"), [("publishing",)])
-        self.assertEqual(len(self.channel_calls()), 1)
+        self.assertEqual(self.rows("SELECT status FROM leads"), [("published",)])
         self.assertEqual(self.rows("SELECT count(*) FROM lead_publications"), [(0,)])
+        self.message.answer.side_effect = None
         await bot.init_db()
         await self.submit()
-        self.assertEqual(len(self.channel_calls()), 1)
-        self.assertIn("повтор заблокирован", self.message.answer.await_args_list[0].args[0])
+        self.telegram.send_message.assert_not_awaited()
+        self.assertIn('уже сохранена', self.message.answer.await_args.args[0])
 
-    async def test_explicit_rejection_preserves_request_for_admin_without_auto_retry(self):
-        self.telegram.send_message.side_effect = TelegramBadRequest(
-            method=SendMessage(chat_id=-1, text="TEST"), message="rejected")
+    async def test_channel_failure_cannot_affect_activation(self):
+        self.telegram.send_message.side_effect = TelegramBadRequest(method=SendMessage(chat_id=-1,text='x'),message='channel unavailable')
         await self.submit()
-        self.assertEqual(self.rows("SELECT status FROM leads"), [("new",)])
-        self.assertEqual(len(self.channel_calls()), 1)
-        await self.submit()
-        self.assertEqual(len(self.channel_calls()), 1)
+        self.assertEqual(self.rows("SELECT status FROM leads"), [("published",)])
+        self.telegram.send_message.assert_not_awaited()
 
     async def test_uncertain_provider_delivery_is_persisted_and_not_repeated(self):
         await registry.register_provider(701, "TEST исполнитель", "+79990000002", True, self.path)
@@ -174,21 +170,19 @@ class AutomaticPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rows("SELECT status FROM provider_notification_reservations"), [("uncertain",)])
         self.assertEqual(len([c for c in self.telegram.send_message.await_args_list if c.args[0] == 701]), 1)
 
-    async def test_channel_429_is_not_blindly_retried_and_blocks_duplicate(self):
-        self.telegram.send_message.side_effect = TelegramRetryAfter(
-            method=SendMessage(chat_id=-1, text="TEST"), message="rate limited", retry_after=3)
+    async def test_no_channel_api_even_when_it_would_return_429(self):
+        self.telegram.send_message.side_effect = TelegramRetryAfter(method=SendMessage(chat_id=-1,text='x'),message='limited',retry_after=3)
         await self.submit()
-        self.assertEqual(self.rows("SELECT status FROM leads"), [("publishing",)])
-        self.assertEqual(len(self.channel_calls()), 1)
         await self.submit()
-        self.assertEqual(len(self.channel_calls()), 1)
+        self.assertEqual(self.rows("SELECT status FROM leads"), [("published",)])
+        self.telegram.send_message.assert_not_awaited()
 
-    async def test_receipt_commit_failure_never_republishes_or_sends_provider_notifications(self):
-        with patch.object(storage, "finish_publication", AsyncMock(side_effect=sqlite3.OperationalError("TEST disk error"))):
+    async def test_database_activation_failure_does_not_send_or_replay(self):
+        with patch.object(policy, 'activate_new', AsyncMock(side_effect=sqlite3.OperationalError('disk error'))):
             await self.submit()
-        self.assertEqual(self.rows("SELECT status FROM leads"), [("publishing",)])
+        self.assertEqual(self.rows("SELECT status FROM leads"), [("new",)])
         await self.submit()
-        self.assertEqual(len(self.channel_calls()), 1)
+        self.telegram.send_message.assert_not_awaited()
         self.assertEqual(self.rows("SELECT count(*) FROM provider_notification_reservations"), [(0,)])
 
     async def test_pause_is_persistent_owner_only_and_stale_confirmation_cannot_reenable(self):
@@ -212,7 +206,7 @@ class AutomaticPublicationTests(unittest.IsolatedAsyncioTestCase):
         await bot.init_db()
         await self.submit()
         self.assertEqual((await bot.get_lead(old_id))["status"], "new")
-        self.assertEqual(len(self.channel_calls()), 1)
+        self.assertEqual(len(self.channel_calls()), 0)
 
     async def test_old_moderation_confirmation_only_refreshes_preview_without_publication(self):
         await self.state.set_state(bot.LeadForm.review)

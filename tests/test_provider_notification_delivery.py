@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 from types import SimpleNamespace as Record
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
@@ -37,7 +37,7 @@ class ProviderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.config.start()
         self.addCleanup(self.config.stop)
         await bot.init_db()
-        self.telegram = Record(id=99, send_message=AsyncMock(),
+        self.telegram = Record(id=99, session=Record(middleware=MagicMock()), send_message=AsyncMock(),
             get_me=AsyncMock(return_value=Record(id=99, username="MSK_TEXBot", is_bot=True)),
             get_chat=AsyncMock(return_value=Record(id=-100123, type="channel", username="zayavki_specteh_msk")),
             get_chat_member=AsyncMock(return_value=Record(status="administrator", can_post_messages=True)))
@@ -84,10 +84,6 @@ class ProviderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         for target, attribute, wrong in (
             (self.telegram.get_me.return_value,"username","Msktex_test_dmitry_bot"),
             (self.telegram.get_me.return_value,"id",199),
-            (self.telegram.get_chat.return_value,"username","demo_channel"),
-            (self.telegram.get_chat.return_value,"id",-100999),
-            (self.telegram.get_chat.return_value,"type","supergroup"),
-            (self.telegram.get_chat_member.return_value,"can_post_messages",False),
         ):
             original = getattr(target, attribute)
             with self.subTest(attribute=attribute,wrong=wrong), patch.object(target,attribute,wrong):
@@ -95,6 +91,8 @@ class ProviderDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await dispatch.verify_production_scope(self.telegram,"MSK_TEXBot",-100123)
             self.assertEqual(getattr(target,attribute),original)
         self.telegram.send_message.assert_not_awaited()
+        self.telegram.get_chat.assert_not_awaited()
+        self.telegram.get_chat_member.assert_not_awaited()
 
     async def test_production_multiple_types_regions_concurrency_and_unknown_send_never_replay(self):
         await self.arm()
@@ -137,7 +135,8 @@ class ProviderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.send_message.reset_mock()
         foreign = await self.lead(channel=-100999)
         await bot.notify_test_providers(self.telegram,foreign)
-        self.telegram.send_message.assert_not_awaited()
+        self.assertEqual([c.args[0] for c in self.telegram.send_message.await_args_list],[101])
+        self.telegram.send_message.reset_mock()
         self.telegram._provider_notification_scope = dispatch.ProductionNotificationScope(199,-100123)
         await bot.notify_test_providers(self.telegram,await self.lead())
         self.telegram.send_message.assert_not_awaited()

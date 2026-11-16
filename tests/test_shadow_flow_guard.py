@@ -16,7 +16,7 @@ class ShadowFlowGuardTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock())
         fake_bot = SimpleNamespace(send_message=AsyncMock())
         with patch.object(bot, "save_lead_from_draft", new=AsyncMock(return_value=(1, True))), \
-             patch.object(bot.lead_publication, "claim_new", new=AsyncMock(return_value=False)), \
+             patch.object(bot, "activate_lead_in_bot", new=AsyncMock(return_value="paused")), \
              patch.object(bot.user_access,"allowed_in",new_callable=AsyncMock,return_value=True), \
              patch.object(bot.user_access,"allowed",new_callable=AsyncMock,return_value=True), \
              patch.object(bot, "admin_allowed", new_callable=AsyncMock, return_value=False), \
@@ -39,7 +39,6 @@ class ShadowFlowGuardTests(unittest.IsolatedAsyncioTestCase):
             connect.return_value = cm
             await bot.submit_lead(message, message.from_user, state, fake_bot,
                                   {**await state.get_data(), "phone": message.text})
-            self.assertFalse(shadow.await_args.kwargs["enabled"])
-            self.assertEqual(shadow.await_args.kwargs["exclude_lead_id"],1)
-            self.assertTrue(all(c.args[0] in bot.settings.admin_ids
-                for c in fake_bot.send_message.await_args_list))
+            shadow.assert_not_awaited()
+            fake_bot.send_message.assert_not_awaited()
+            self.assertIn('приостановлена',message.answer.await_args.args[0])

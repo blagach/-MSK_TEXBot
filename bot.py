@@ -1066,7 +1066,7 @@ async def executor_menu(message: Message, state: FSMContext) -> None:
 
 
 LEAD_STATUS = {
-    "new": "на модерации", "publishing": "публикуется", "published": "опубликована",
+    "new": "ожидает активации", "publishing": "публикуется", "published": "опубликована",
     "rejected": "отклонена", "closed": "закрыта", "archived": "в архиве",
 }
 
@@ -1089,7 +1089,7 @@ async def list_customer_leads(message, user_id, before=2**63 - 1, admin=False):
         rows.append([lead_key("Ещё заявки", f"{prefix}:{leads[7][0]}")])
     if before != 2**63 - 1:
         rows.append([lead_key("К началу списка", f"{prefix}:0")])
-    await message.answer("Заявки для модерации и опубликованные" if admin else "Ваши заявки",
+    await message.answer("Неактивные и опубликованные заявки" if admin else "Ваши заявки",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
     if not leads:
         await message.answer("Заявок пока нет.")
@@ -1108,6 +1108,9 @@ async def available_leads(message: Message, state: FSMContext) -> None:
 
 
 async def show_matching_leads(message, user_id, before=2**63 - 1):
+    if not await user_access.allowed(user_id, "offers"):
+        await message.answer("Доступ к заявкам ограничен. Обратитесь в поддержку.")
+        return
     async with aiosqlite.connect(storage.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         await provider_registry.register_area_key(db)
@@ -1134,7 +1137,7 @@ async def show_matching_leads(message, user_id, before=2**63 - 1):
             inline_keyboard=[[lead_key("Следующая страница", f"match:{leads[7]['id']}")]],
         ))
     if not leads:
-        await message.answer("Подходящих заявок пока нет. Все опубликованные заявки доступны в канале.")
+        await message.answer("Подходящих заявок пока нет. Проверьте выбранные категории и регионы в меню исполнителя.")
 
 
 @router.callback_query(F.data.startswith("lc:"))
@@ -1709,45 +1712,18 @@ async def submit_lead(message, customer, state, bot, data):
     lead = await get_lead(lead_id)
     await clear_form_keyboard(message, state)
     await state.clear()
+    result = await activate_lead_in_bot(bot, lead, actor_id=customer.id, automatic=True)
+    text = {
+        "published": f"✅ Заявка №{lead_id} опубликована в боте. Она доступна в «Мои заявки».",
+        "paused": f"Активация новых заявок временно приостановлена. Заявка №{lead_id} сохранена, но пока не активна. Уведомления не отправлены.",
+        "blocked": f"Заявка №{lead_id} сохранена, но активация запрещена текущими ограничениями. Обратитесь в поддержку.",
+        "failed": f"Заявка №{lead_id} сохранена. Не удалось подтвердить активацию; не создавайте повтор, обратитесь в поддержку.",
+        "already": f"Заявка №{lead_id} уже обработана. Проверьте статус в «Мои заявки».",
+    }[result]
     try:
-        claimed = await lead_publication.claim_new(lead_id, customer.id)
-    except user_access.AccessDenied:
-        await message.answer(f"Заявка №{lead_id} сохранена, но публикация запрещена текущими ограничениями. Обратитесь в поддержку.")
-        return
-    if claimed:
-        result = await publish_claimed_lead(bot, lead, actor_id=customer.id, automatic=True)
-        text = {
-            "published": f"✅ Заявка №{lead_id} опубликована. Она доступна в «Мои заявки».",
-            "rejected": f"Заявка №{lead_id} сохранена. Telegram отклонил публикацию; передали её администратору для проверки.",
-            "uncertain": f"Заявка №{lead_id} сохранена. Результат публикации пока неизвестен; повтор заблокирован. Обратитесь в поддержку.",
-        }[result]
-        try:
-            await message.answer(text, reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
-        except TelegramAPIError as exc:
-            logging.warning("Automatic publication acknowledgement not confirmed: %s", type(exc).__name__)
-        if result != "published":
-            await alert_publication_review(bot, lead, text)
-        return
-    current = await get_lead(lead_id)
-    if current["status"] != "new":
-        await message.answer(f"Заявка №{lead_id} сохранена. Статус: {LEAD_STATUS.get(current['status'], current['status'])}.",
-                             reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
-        return
-    # Paused fallback: the retained shadow result is informational, never a send command.
-    shadow = await lead_shadow_review.evaluate(
-        customer.id, equipment=data["equipment"],
-        region=data["region"], area=data["area"], place=data["place"],
-        work_date=data["work_date"], details=data["details"],
-        db_path=storage.DB_PATH, enabled=False, exclude_lead_id=lead_id,
-    )
-    logging.info("Lead %s shadow route: %s", lead_id, shadow.route)
-    markup = InlineKeyboardMarkup(inline_keyboard=[[ 
-        InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead_id}"),
-    ]])
-    for admin_id in await admin_recipients("moderate"):
-        await notify(bot, admin_id, "Новая заявка на проверку:\n\n" + lead_text(lead, True), reply_markup=markup)
-    await message.answer(f"Автопубликация временно приостановлена. Заявка №{lead_id} сохранена и направлена на проверку.", reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
+        await message.answer(text, reply_markup=main_menu(await admin_allowed(customer.id, "panel")))
+    except TelegramAPIError as exc:
+        logging.warning("Automatic activation acknowledgement not confirmed: %s", type(exc).__name__)
 
 
 @router.message(F.text == LEGACY_PROVIDER)
@@ -1805,7 +1781,7 @@ async def provider_phone(message: Message, state: FSMContext) -> None:
         )
         await db.commit()
     await state.clear()
-    await message.answer("Готово. Вы зарегистрированы как исполнитель. Когда появится подходящая заявка, она будет опубликована в канале.", reply_markup=main_menu(await admin_allowed(state.key.user_id, "panel")))
+    await message.answer("Готово. Вы зарегистрированы как исполнитель. Выбирайте подписки на категории и регионы; подходящие заявки доступны внутри бота.", reply_markup=main_menu(await admin_allowed(state.key.user_id, "panel")))
 
 
 @router.message(OfferForm.price)
@@ -2021,18 +1997,13 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
     # bound to this Bot instance, never just an empty test allowlist.
     scope = getattr(bot, "_provider_notification_scope", None)
     production = (isinstance(scope, provider_dispatch.ProductionNotificationScope)
-                  and scope.bot_id == bot.id and scope.channel_id == settings.leads_channel_id
+                  and scope.bot_id == bot.id
                   and not settings.test_notification_provider_ids)
     if not settings.test_notification_provider_ids and not production:
         return
-    if production:
-        async with aiosqlite.connect(storage.DB_PATH) as db:
-            published_here = await (await db.execute(
-                "SELECT 1 FROM lead_publications WHERE lead_id=? AND chat_id=?",
-                (lead["id"], scope.channel_id),
-            )).fetchone()
-        if not published_here:
-            return  # No test-channel or unconfirmed publication can fan out.
+    current = await get_lead(lead["id"])
+    if not current or current["status"] != "published":
+        return
     routing = await lead_routing.get(lead["id"], storage.DB_PATH)
     if not routing:
         return
@@ -2079,48 +2050,27 @@ async def send_provider_notification(telegram, recipient, text, **kwargs):
     return False
 
 
-async def publish_claimed_lead(bot, lead, *, actor_id, automatic=False):
-    """One claimed publication; ambiguous send/commit never restores retryability."""
+async def activate_lead_in_bot(bot, lead, *, actor_id, automatic=False):
+    """Atomic database activation; notifications cannot affect availability."""
     lead_id = lead["id"]
-    markup = InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead_id)]])
     try:
-        sent = await bot.send_message(settings.leads_channel_id, lead_text(lead), reply_markup=markup)
-    except (TelegramBadRequest, TelegramForbiddenError):
-        # Explicit rejection: Telegram did not accept the message, retry is safe.
-        await storage.transition(lead_id, "publishing", "new")
-        await admin_access.record(actor_id, "lead_publication", target_id=lead_id, result="rejected")
-        return "rejected"
-    except TelegramAPIError:
-        # Timeout/network failure may happen AFTER Telegram accepted the message.
-        # Keep publishing across restarts; never retry blindly and duplicate a lead.
-        await admin_access.record(actor_id, "lead_publication", target_id=lead_id, result="uncertain")
-        return "uncertain"
-    try:
-        await storage.finish_publication(lead_id, sent.chat.id, sent.message_id,
-                                         actor_id=actor_id, automatic=automatic)
-    except Exception as exc:
-        logging.error("Publication receipt could not be committed: %s", type(exc).__name__)
-        return "uncertain"
+        activated = await lead_publication.activate_new(lead_id, actor_id, automatic=automatic)
+    except user_access.AccessDenied:
+        return "blocked"
+    except aiosqlite.Error as exc:
+        logging.error("Lead activation could not be committed: %s", type(exc).__name__)
+        return "failed"
+    if not activated:
+        current = await get_lead(lead_id)
+        return "paused" if current and current["status"] == "new" else "already"
     if not automatic:
         await moderation_history.record_approval(lead['customer_id'], lead_id, storage.DB_PATH)
-        await notify(bot, lead["customer_id"], f"Ваша заявка №{lead_id} опубликована.")
+        await notify(bot, lead["customer_id"], f"Ваша заявка №{lead_id} опубликована в боте.")
     try:
         await notify_test_providers(bot, lead)
     except Exception as exc:
-        # Publication is committed. Never republish to retry an interrupted fanout.
-        logging.error("Published lead notification fanout interrupted: %s", type(exc).__name__)
+        logging.error("Active lead notification fanout interrupted: %s", type(exc).__name__)
     return "published"
-
-
-async def alert_publication_review(bot, lead, text):
-    markup = None
-    if (await get_lead(lead["id"]))["status"] == "new":
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{lead['id']}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{lead['id']}"),
-        ]])
-    for admin_id in await admin_recipients("moderate"):
-        await notify(bot, admin_id, text + "\n\n" + lead_text(lead, True), reply_markup=markup)
 
 
 @router.callback_query(F.data.startswith("publish:"))
@@ -2128,25 +2078,24 @@ async def publish_lead(callback: CallbackQuery, bot: Bot) -> None:
     lead_id = await admin_lead_id(callback, "publish:")
     if lead_id is None:
         return
-    if not await storage.transition(lead_id, "new", "publishing"):
-        await callback.answer("Заявка уже обработана или ожидает проверки", show_alert=True)
-        return
-    try:
-        await callback.answer("Публикуем заявку")
-    except TelegramAPIError:
-        logging.warning("Cannot acknowledge publication callback for lead %s", lead_id)
     lead = await get_lead(lead_id)
-    result = await publish_claimed_lead(bot, lead, actor_id=callback.from_user.id)
+    if not lead:
+        await callback.answer("Заявка недоступна.", show_alert=True)
+        return
+    result = await activate_lead_in_bot(bot, lead, actor_id=callback.from_user.id)
     if result != "published":
-        await notify(bot, callback.from_user.id,
-                     "Telegram отклонил публикацию. Проверьте права и повторите." if result == "rejected" else
-                     "Результат публикации неизвестен. Проверьте канал; автоматический повтор заблокирован.")
+        await callback.answer(
+                     "Активация не выполнена: " + {"paused": "включена пауза", "blocked": "доступ ограничен", "failed": "ошибка SQLite; проверьте состояние", "already": "заявка уже обработана"}[result])
         return
     if callback.message:
         try:
-            await callback.message.edit_text("✅ Заявка опубликована.\n\n" + lead_text(lead, True))
+            await callback.message.edit_text("✅ Заявка опубликована в боте.\n\n" + lead_text(lead, True))
         except TelegramAPIError:
             logging.warning("Cannot update moderation message for lead %s", lead_id)
+    try:
+        await callback.answer("Заявка активирована в боте")
+    except TelegramAPIError:
+        logging.warning("Activation callback acknowledgement not confirmed")
 
 
 @router.callback_query(F.data.startswith("reject:"))
@@ -2265,6 +2214,7 @@ async def main() -> None:
     drafts = SQLiteDraftStorage(storage.DB_PATH)
     await drafts.init_schema()
     bot = Bot(token=settings.token)
+    bot.session.middleware(provider_dispatch.PrivateDeliveryOnly(settings.support_group_id))
     bot._provider_notification_scope = await provider_dispatch.verify_production_scope(
         bot, settings.bot_username, settings.leads_channel_id,
         restricted_ids=settings.test_notification_provider_ids,
