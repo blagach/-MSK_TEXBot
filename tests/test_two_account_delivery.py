@@ -33,6 +33,8 @@ class TwoAccountDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 api=Record(send_message=AsyncMock(side_effect=[error_class(SendMessage(chat_id=101,text='test'),'unavailable'),Record(message_id=1)]))
                 outcome=AsyncMock()
                 with (patch.object(bot,'get_lead',AsyncMock(return_value={'status':'published'})),
+                      patch.object(bot.lead_journey,'delivery_snapshot',AsyncMock(return_value=('published',0))),
+                      patch.object(bot.notification_reservations,'may_send',AsyncMock(return_value=True)),
                       patch.object(bot,'settings',Record(test_notification_provider_ids={101,102},bot_username='example_test_bot')),
                       patch.object(bot.lead_routing,'get',AsyncMock(return_value={'category':'каток','region':'Москва','area':'СЗАО'})),
                       patch.object(bot.provider_dispatch,'recipients_for_lead',AsyncMock(return_value=[101,102])),
