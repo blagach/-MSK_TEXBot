@@ -39,7 +39,7 @@ import user_access
 import equipment_catalog
 import support_storage
 import support_ui
-from screen_controls import ScreenControls
+from screen_controls import ScreenControls, clear_keyboard
 import storage
 import provider_registry
 import provider_ui
@@ -243,6 +243,21 @@ def revealed_contact_button(phone):
     return InlineKeyboardButton(text=f"📞 {phone}", copy_text=CopyTextButton(text=phone))
 
 
+def private_lead_actions(lead_id, contact_button, *, offer=True):
+    rows = [[contact_button]]
+    if offer:
+        rows.append([InlineKeyboardButton(text="Откликнуться", callback_data=f"offer_open:{lead_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def offer_entry_allowed(user_id):
+    async with aiosqlite.connect(storage.DB_PATH) as db:
+        profile = await (await db.execute(
+            "SELECT blocked FROM provider_profiles WHERE telegram_id=?", (user_id,),
+        )).fetchone()
+        return bool(profile and not profile[0] and await user_access.allowed_in(db, user_id, "offers"))
+
+
 async def private_contact_card(lead, user_id):
     text = lead_text(lead)
     try:
@@ -252,7 +267,28 @@ async def private_contact_card(lead, user_id):
     button = revealed_contact_button(phone) if phone else respond_button(lead["id"], private=True)
     if phone:
         text += f"\nКонтакт заказчика: {phone}"
-    return text, InlineKeyboardMarkup(inline_keyboard=[[button]])
+    offer = (lead["status"] == "published" and lead["customer_id"] != user_id
+             and await offer_entry_allowed(user_id))
+    return text, private_lead_actions(lead["id"], button, offer=offer)
+
+
+@router.callback_query(F.data.startswith("offer_open:"))
+async def open_card_offer(callback: CallbackQuery, state: FSMContext) -> None:
+    message = callback.message
+    if (not isinstance(message, Message) or message.chat.type != "private"
+            or message.chat.id != callback.from_user.id):
+        await callback.answer("Отклик доступен только в личном чате с ботом.", show_alert=True)
+        return
+    lead_id = storage.parse_id(callback.data, "offer_open:")
+    lead = await get_lead(lead_id) if lead_id else None
+    if not lead or lead["status"] != "published" or lead["customer_id"] == callback.from_user.id:
+        await callback.answer("Заявка недоступна для отклика.", show_alert=True)
+        return
+    if not await offer_entry_allowed(callback.from_user.id):
+        await callback.answer("Отклик недоступен. Проверьте профиль исполнителя или обратитесь в поддержку.", show_alert=True)
+        return
+    await callback.answer()
+    await open_offer(message, state, lead_id, callback.from_user.id)
 
 
 @router.callback_query(F.data.startswith("customer_contact:"))
@@ -383,10 +419,7 @@ async def notify(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
 
 
 async def remove_form_keyboard(message: Message, message_id: int) -> None:
-    try:
-        await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message_id)
-    except TelegramAPIError as exc:
-        logging.warning("Could not clear a form keyboard: %s", type(exc).__name__)
+    await clear_keyboard(message.bot, message.chat.id, message_id, operation="clear_form")
 
 
 async def clear_form_keyboard(message: Message, state: FSMContext) -> None:
@@ -2067,7 +2100,8 @@ async def notify_test_providers(bot: Bot, lead: aiosqlite.Row) -> None:
             ):
                 continue
             await send_provider_notification(bot, provider_id, public_text(text), lead_id=lead['id'], revision=revision,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[respond_button(lead["id"], private=True)]]))
+                reply_markup=private_lead_actions(lead["id"], respond_button(lead["id"], private=True),
+                                                 offer=provider_id != lead["customer_id"]))
             if production:
                 # One shared production lock also paces concurrent publications.
                 await asyncio.sleep(1.05)
@@ -2217,7 +2251,7 @@ async def check_user_access(handler, event, data):
     if ((current or "").startswith("LeadForm:") or callback.startswith(("lead_step:", "lead_attachment:", "lead_review:", "lc:repeat:"))
             or text == "📝 Оставить заявку"):
         operation = "requests"
-    if ((current or "").startswith("OfferForm:") or callback.startswith(("offer_step:", "offer_draft:"))
+    if ((current or "").startswith("OfferForm:") or callback.startswith(("offer_step:", "offer_draft:", "offer_open:"))
             or text.startswith("/start lead_")):
         operation = "offers"
     if "full" in saved["scopes"] or operation in saved["scopes"]:

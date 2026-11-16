@@ -6,9 +6,9 @@ Telegram edit must not make an obsolete callback executable again.
 import asyncio
 import logging
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
@@ -18,6 +18,31 @@ PREFIXES = ("admin:", "paused_action:", "sb:", "co:", "sc:", "lab:", "provider_a
             "form_nav:", "cancel_lead_draft:", "offer_draft:", "lead_step:",
             "lead_attachment:", "lead_review:", "lead_close:", "offer_step:")
 LEGACY_PANELS = ("form_keyboard_id", "alert_panel", "payment_panel", "machine_panel")
+
+
+def markup_key(markup):
+    return markup.model_dump(mode="json", exclude_none=True) if markup else None
+
+
+async def clear_keyboard(bot, chat_id, message_id, markup=None, *, operation="retire_screen"):
+    """Idempotent visual edit; never retry or hide other Telegram failures."""
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=markup)
+    except TelegramBadRequest as error:
+        description = error.message.lower()
+        if "message is not modified" in description:
+            logging.debug("Keyboard cleanup already applied: operation=%s", operation)
+            return
+        # Do not log the request, contact details or arbitrary Telegram payloads.
+        reason = next((code for text, code in (
+            ("message to edit not found", "message_not_found"),
+            ("message can't be edited", "message_not_editable"),
+            ("message cannot be edited", "message_not_editable"),
+            ("message_id_invalid", "invalid_message_id"),
+        ) if text in description), "unexpected_bad_request")
+        logging.warning("Keyboard cleanup failed: operation=%s error=TelegramBadRequest reason=%s", operation, reason)
+    except TelegramAPIError as error:
+        logging.warning("Keyboard cleanup failed: operation=%s error=%s", operation, type(error).__name__)
 
 
 def temporary(action):
@@ -52,6 +77,7 @@ class Screen:
     task: object
     panels: dict
     switched: bool = False
+    cleaned: dict = field(default_factory=dict)
 
 
 class ScreenControls:
@@ -65,10 +91,11 @@ class ScreenControls:
             bot.session.middleware(self.outgoing)
 
     async def remove(self, bot, chat_id, message_id, markup=None):
-        try:
-            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=markup)
-        except TelegramAPIError as error:
-            logging.warning("Could not retire screen controls: %s", type(error).__name__)
+        screen = self.active.get()
+        if (screen is not None and screen.task is asyncio.current_task() and screen.chat_id == chat_id
+                and message_id in screen.cleaned and screen.cleaned[message_id] == markup_key(markup)):
+            return
+        await clear_keyboard(bot, chat_id, message_id, markup)
 
     async def retire(self, bot, screen, through, panel=None, remaining=None):
         old = await screen.cursor.get_data()
@@ -77,7 +104,7 @@ class ScreenControls:
         # Persist the invalidation before trying a best-effort visual edit.
         await screen.cursor.set_data({
             "through": max(old.get("through", 0), through),
-            "panels": screen.panels,
+            "panels": dict(screen.panels),
             "revision": old.get("revision", 0) + 1,
         })
         previous = old.get("panels", {})
@@ -100,7 +127,18 @@ class ScreenControls:
         # Ignore edits that only remove buttons, and preserve unrelated messages
         # (validation errors, asynchronous notices, durable object cards).
         if not (new_panel or new_keyboard):
-            return await make_request(bot, method)
+            try:
+                result = await make_request(bot, method)
+            except TelegramBadRequest as error:
+                if method.__api_method__ == "editMessageReplyMarkup" and "message is not modified" in error.message.lower():
+                    screen.cleaned[method.message_id] = markup_key(markup)
+                raise
+            if method.__api_method__ == "editMessageReplyMarkup":
+                # A form handler may already have cleared the panel before the
+                # shared controller retires that screen. Record successful edits
+                # in this update only; failed/unknown edits are never called done.
+                screen.cleaned[method.message_id] = markup_key(markup)
+            return result
         # Invalidate before a new send: an ambiguous send or process interruption
         # must not leave the previous screen executable. /menu can recover it.
         if not screen.switched:
@@ -117,6 +155,9 @@ class ScreenControls:
         result = await make_request(bot, method)
         message_id = result.message_id if isinstance(result, Message) else getattr(method, "message_id", None)
         if message_id is not None:
+            screen.cleaned.pop(message_id, None)
+            if new_keyboard:
+                screen.panels = {}
             remaining = remaining_markup(markup)
             await self.retire(bot, screen, message_id - 1 if new_panel else message_id,
                               message_id if new_panel else None,
