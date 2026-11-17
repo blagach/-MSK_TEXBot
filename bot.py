@@ -54,6 +54,8 @@ import lead_moderation
 import lead_shadow_review
 import lead_publication
 import payment_preferences
+import referral_storage
+import referral_ui
 
 load_dotenv()
 
@@ -362,6 +364,7 @@ async def init_db() -> None:
     await payment_preferences.init_schema(storage.DB_PATH)
     await notification_reservations.init_schema(storage.DB_PATH)
     await support_storage.init_schema()
+    await referral_storage.init_schema(storage.DB_PATH)
     await customer_contacts.init_schema(storage.DB_PATH)
 
 
@@ -979,6 +982,9 @@ async def cancel(message: Message, state: FSMContext) -> None:
 
 @router.message(CommandStart(deep_link=True))
 async def start_offer(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if command.args and command.args.startswith('r1_'):
+        await start(message, state)
+        return
     contact_id = storage.parse_id(command.args, "contact_")
     if contact_id is not None:
         if message.chat.type != "private":
@@ -1051,6 +1057,7 @@ async def start(message: Message, state: FSMContext) -> None:
         WELCOME_TEXT,
         reply_markup=await menu_with_paused_actions(state),
     )
+    await referral_ui.show_entry(message, message.from_user.id)
 
 
 @router.message(F.text == OFFER_HOME)
@@ -1058,6 +1065,35 @@ async def show_main_menu(message: Message, state: FSMContext) -> None:
     await pause_form(message, state)
     await message.answer("Главное меню MSK_TEX. Выберите нужный раздел:",
                          reply_markup=await menu_with_paused_actions(state))
+    await referral_ui.show_entry(message, state.key.user_id)
+
+
+@router.callback_query(F.data.startswith('ref:'))
+async def referral_action(callback: CallbackQuery, state: FSMContext):
+    message = callback.message
+    if (not isinstance(message, Message) or message.chat.type != 'private'
+            or message.chat.id != callback.from_user.id or callback.from_user.is_bot):
+        await callback.answer('Нет доступа.', show_alert=True)
+        return
+    await callback.answer()
+    action = callback.data
+    if action in {'ref:home', 'ref:back'}:
+        await show_main_menu(message, state)
+    elif action in {'ref:open', 'ref:stats'}:
+        if not await referral_ui.available(callback.from_user.id):
+            await message.answer('Приглашения сейчас недоступны.')
+            return
+        await pause_form(message, state)
+        if action == 'ref:stats':
+            await message.answer(referral_ui.summary(await referral_storage.stats(callback.from_user.id)),
+                                 reply_markup=referral_ui.stats_markup())
+        else:
+            await referral_ui.show(message, callback.from_user.id, callback.bot, settings.bot_username)
+
+
+@router.inline_query()
+async def referral_inline(query):
+    await referral_ui.inline(query, settings.bot_username)
 
 
 @router.message(Command("support"), F.chat.type == "private")
@@ -2222,7 +2258,13 @@ async def track_private_visitor(handler, event, data):
     user = event.from_user
     if isinstance(message, Message) and message.chat.type == "private" and user and not user.is_bot:
         try:
-            await storage.record_visitor(user.id)
+            # Attribute before recording the visitor, never after /start dispatch.
+            text = (getattr(event, 'text', None) or '').split(maxsplit=1)
+            command = text[0].split('@') if text else []
+            launch = bool(command and command[0] == '/start' and
+                          (len(command) == 1 or (len(command) == 2 and command[1].casefold() == settings.bot_username.casefold())))
+            payload = text[1].strip() if launch and len(text) == 2 else None
+            await referral_storage.record_visit(user.id, payload, getattr(data.get('event_update'), 'update_id', None))
         except aiosqlite.Error:
             logging.warning("Could not record private bot visit")
     return await handler(event, data)
@@ -2275,10 +2317,10 @@ def create_dispatcher(fsm_storage: SQLiteDraftStorage | None = None, *, test_fea
     dispatcher.startup.register(admin_access.recover_exports)
     controls = ScreenControls()
     dispatcher.startup.register(controls.install)
-    dispatcher.message.outer_middleware(controls)
-    dispatcher.callback_query.outer_middleware(controls)
     dispatcher.message.outer_middleware(track_private_visitor)
     dispatcher.callback_query.outer_middleware(track_private_visitor)
+    dispatcher.message.outer_middleware(controls)
+    dispatcher.callback_query.outer_middleware(controls)
     dispatcher.message.middleware(check_user_access)
     dispatcher.callback_query.middleware(check_user_access)
     if test_features is not None:

@@ -9,6 +9,7 @@ import aiosqlite
 import lead_routing
 import storage
 import user_access
+import referral_storage
 
 
 class SubmissionRejected(ValueError):
@@ -105,6 +106,7 @@ async def activate_new(lead_id, actor_id, *, automatic=True):
         if cursor.rowcount != 1:
             return False
         await storage.lead_journey.record_event(db, lead_id, "published", actor_id=actor_id)
+        await referral_storage.first_lead(db, lead[0], lead_id)
         await db.execute(
             "INSERT INTO admin_action_log(actor_id,action,target_id,result,details,created_at) VALUES (?,?,?,?,?,?)",
             (actor_id, "lead_auto_publish" if automatic else "lead_publish", lead_id,

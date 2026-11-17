@@ -27,12 +27,16 @@ async def save_lead(lead_id, method, db_path="bot.db"):
         await db.commit()
 
 async def save_provider(provider_id, methods, db_path="bot.db"):
+    import referral_storage
     methods = set(methods)
     if not methods or not methods <= METHODS:
         raise ValueError("Выберите принимаемые формы оплаты")
     async with aiosqlite.connect(db_path) as db:
+        await db.execute('BEGIN IMMEDIATE')
         await db.execute("DELETE FROM provider_payment_preferences WHERE provider_id=?", (provider_id,))
         await db.executemany("INSERT INTO provider_payment_preferences VALUES (?,?)", [(provider_id, method) for method in methods])
+        if await (await db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='admin_action_log'")).fetchone():
+            await referral_storage.provider_complete(db, provider_id)
         await db.commit()
 
 async def eligible_providers(lead_id, provider_ids, db_path="bot.db"):
