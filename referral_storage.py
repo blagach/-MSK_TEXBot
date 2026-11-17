@@ -1,5 +1,6 @@
 """Opt-in referral attribution in the existing SQLite. No Telegram calls."""
 import json
+import logging
 import re
 import secrets
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ import storage
 import user_access
 
 CODE = re.compile(r"r1_([A-Za-z0-9_-]{22})\Z")
+_schema_available = True
 
 
 def now():
@@ -37,7 +39,67 @@ async def init_schema(path):
 
 async def mode_in(db):
     row = await (await db.execute("SELECT id,result FROM admin_action_log WHERE action='referral_mode' ORDER BY id DESC LIMIT 1")).fetchone()
-    return {'revision': row[0] if row else 0, 'enabled': bool(row and row[1] == 'enabled')}
+    enabled = _schema_available and bool(row and row[1] == 'enabled')
+    if enabled:
+        # A partial/failed optional migration must not expose broken entry points.
+        count = await (await db.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('referral_links','referral_attributions')")).fetchone()
+        enabled = count[0] == 2
+    return {'revision': row[0] if row else 0, 'enabled': enabled}
+
+
+def fault(operation, error):
+    logging.error('Referral feature failed: operation=%s error=%s; core operation retained, referral statistics may be incomplete',
+                  operation, type(error).__name__)
+
+
+async def init_optional_schema(path):
+    global _schema_available
+    try:
+        await init_schema(path)
+        _schema_available = True
+        return True
+    except Exception as error:
+        # Optional feature boundary, no Telegram requests or core schema work here.
+        fault('schema', error)
+        _schema_available = False
+        return False
+
+
+async def record_visit_safely(uid, payload=None, update_id=None):
+    try:
+        return await record_visit(uid, payload, update_id)
+    except Exception as error:
+        fault('attribution', error)
+        # Preserve original visitor tracking; don't later steal an organic/failed first touch.
+        await storage.record_visitor(uid)
+        return False
+
+
+async def record_after_commit(operation, uid, lead_id=None, *, path=None):
+    """Best-effort metrics AFTER the independent business commit and connection close.
+
+    Catch errors only at this optional SQLite-only boundary, never Telegram or
+    business exceptions. No retry, historical replay, or background sender.
+    """
+    try:
+        async with aiosqlite.connect(path or storage.DB_PATH, timeout=0.1) as db:
+            # Legacy helper callers may have only the payment-preference schema.
+            if not await (await db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='admin_action_log'")).fetchone():
+                return False
+            if not (await mode_in(db))['enabled']:
+                return False
+            await db.execute('BEGIN IMMEDIATE')
+            if operation == 'first_lead':
+                await first_lead(db, uid, lead_id)
+            elif operation == 'provider_complete':
+                await provider_complete(db, uid)
+            else:
+                raise ValueError('Unknown referral operation')
+            await db.commit()
+        return True
+    except Exception as error:
+        fault(operation, error)
+        return False
 
 
 async def mode():

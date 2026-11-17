@@ -51,7 +51,12 @@ async def available(uid):
 
 
 async def show_entry(message, uid):
-    if await available(uid):
+    try:
+        enabled = await available(uid)
+    except Exception as error:
+        referrals.fault('menu_availability', error)
+        return
+    if enabled:
         await message.answer('Пригласите тех, кому нужна спецтехника или кто выполняет работы.', reply_markup=entry_markup())
 
 

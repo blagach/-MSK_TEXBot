@@ -364,7 +364,7 @@ async def init_db() -> None:
     await payment_preferences.init_schema(storage.DB_PATH)
     await notification_reservations.init_schema(storage.DB_PATH)
     await support_storage.init_schema()
-    await referral_storage.init_schema(storage.DB_PATH)
+    await referral_storage.init_optional_schema(storage.DB_PATH)
     await customer_contacts.init_schema(storage.DB_PATH)
 
 
@@ -2264,7 +2264,7 @@ async def track_private_visitor(handler, event, data):
             launch = bool(command and command[0] == '/start' and
                           (len(command) == 1 or (len(command) == 2 and command[1].casefold() == settings.bot_username.casefold())))
             payload = text[1].strip() if launch and len(text) == 2 else None
-            await referral_storage.record_visit(user.id, payload, getattr(data.get('event_update'), 'update_id', None))
+            await referral_storage.record_visit_safely(user.id, payload, getattr(data.get('event_update'), 'update_id', None))
         except aiosqlite.Error:
             logging.warning("Could not record private bot visit")
     return await handler(event, data)
