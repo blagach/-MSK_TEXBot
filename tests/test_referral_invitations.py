@@ -195,13 +195,127 @@ class ReferralTests(unittest.IsolatedAsyncioTestCase):
             await ui.inline(q,'Msktex_test_dmitry_bot')
             self.assertEqual(q.answer.await_args.args[0],[])
 
-    async def test_business_and_metric_rollback_together(self):
+    async def test_referral_failure_does_not_rollback_saved_provider_methods(self):
         payload=await self.enable();await ref.record_visit(701,payload,1)
         await registry.register_provider(701,'TEST','+79990000001',True,self.path)
-        with patch.object(ref,'provider_complete',side_effect=sqlite3.OperationalError('TEST injected failure')):
-            with self.assertRaises(sqlite3.OperationalError):await payments.save_provider(701,{payments.CASH},self.path)
-        self.assertEqual(self.rows('SELECT * FROM provider_payment_preferences'),[])
+        with patch.object(ref,'provider_complete',side_effect=sqlite3.OperationalError('TEST injected failure')), self.assertLogs(level='ERROR') as logs:
+            await payments.save_provider(701,{payments.CASH},self.path)
+        self.assertIn('provider_complete',logs.output[0])
+        self.assertEqual(self.rows('SELECT * FROM provider_payment_preferences'),[(701,payments.CASH)])
         self.assertEqual((await ref.stats())['active'],0)
+
+    async def test_referral_trigger_rollback_does_not_cancel_lead_or_notifications(self):
+        payload=await self.enable();await ref.record_visit(701,payload,1)
+        lid,_=await bot.save_lead_from_draft(R(id=701,full_name='TEST',username=None),self.data['phone'],self.data)
+        with sqlite3.connect(self.path) as c:
+            c.execute("CREATE TRIGGER ref_fault BEFORE UPDATE ON referral_attributions BEGIN SELECT RAISE(ROLLBACK,'TEST referral failure'); END")
+        lead=await bot.get_lead(lid)
+        with self.assertLogs(level='ERROR') as logs, patch.object(bot,'notify_test_providers',new_callable=AsyncMock) as notify:
+            result=await bot.activate_lead_in_bot(self.telegram,lead,actor_id=701,automatic=True)
+        self.assertEqual(result,'published');notify.assert_awaited_once()
+        self.assertEqual(self.rows('SELECT status FROM leads WHERE id=?',(lid,)),[('published',)])
+        self.assertEqual(self.rows("SELECT action FROM admin_action_log WHERE action='lead_auto_publish'"),[('lead_auto_publish',)])
+        self.assertEqual((await ref.stats())['customers'],0)
+        self.assertIn('first_lead',logs.output[0])
+
+    async def test_referral_failure_does_not_strand_registration_fsm(self):
+        payload=await self.enable();await ref.record_visit(701,payload,1)
+        await registry.register_provider(701,'TEST','+79990000001',True,self.path)
+        with sqlite3.connect(self.path) as c:
+            c.execute("CREATE TRIGGER ref_fault BEFORE UPDATE ON referral_attributions BEGIN SELECT RAISE(ROLLBACK,'TEST referral failure'); END")
+        await self.state.set_state(provider_ui.Register.payment)
+        message=self.message_for(701)
+        with self.assertLogs(level='ERROR'):
+            await provider_ui.finish_payment_selection(message,self.state,701,{payments.CASH})
+        self.assertIsNone(await self.state.get_state())
+        self.assertEqual(message.answer.await_args.args[0],'Способы оплаты сохранены.')
+        self.assertEqual(self.rows('SELECT method FROM provider_payment_preferences WHERE provider_id=701'),[(payments.CASH,)])
+        self.assertEqual(self.rows('SELECT display_name FROM provider_profiles WHERE telegram_id=701'),[('TEST',)])
+
+    async def test_optional_init_and_programming_faults_do_not_break_core(self):
+        with patch.object(ref,'init_schema',side_effect=RuntimeError('TEST referral migration fault')),self.assertLogs(level='ERROR'):
+            await bot.init_db()
+        self.assertEqual(self.rows('PRAGMA integrity_check'),[('ok',)])
+        self.assertFalse((await ref.mode())['enabled'])
+        await ref.init_optional_schema(self.path)
+        payload=await self.enable()
+        with patch.object(ref,'record_visit',side_effect=RuntimeError('TEST attribution fault')),self.assertLogs(level='ERROR'):
+            self.assertFalse(await ref.record_visit_safely(701,payload,1))
+        self.assertEqual(self.rows('SELECT telegram_id FROM bot_visitors WHERE telegram_id=701'),[(701,)])
+        message=self.message_for(701)
+        with patch.object(ui,'available',side_effect=RuntimeError('TEST menu fault')),self.assertLogs(level='ERROR'):
+            await bot.start(message,self.state)
+        self.assertEqual(message.answer.await_args.args[0],bot.WELCOME_TEXT)
+
+    async def test_off_old_deep_links_still_open_contact_and_existing_offer_form(self):
+        from aiogram.filters import CommandObject
+        from aiogram.fsm.context import FSMContext
+        from aiogram.fsm.storage.base import StorageKey
+        from aiogram.fsm.storage.memory import MemoryStorage
+        self.assertFalse((await ref.mode())['enabled'])
+        lid,_=await bot.save_lead_from_draft(self.customer,self.data['phone'],self.data)
+        self.assertTrue(await lead_publication.activate_new(lid,501))
+        await registry.register_provider(701,'TEST','+79990000001',True,self.path)
+        state=FSMContext(MemoryStorage(),StorageKey(bot_id=123456,chat_id=701,user_id=701))
+        message=self.message_for(701)
+        await bot.start_offer(message,state,CommandObject(command='start',args=f'contact_{lid}'))
+        self.assertIn(self.data['phone'],message.answer.await_args.args[0])
+        await bot.start_offer(message,state,CommandObject(command='start',args=f'lead_{lid}'))
+        self.assertEqual(await state.get_state(),bot.OfferForm.price.state)
+        self.assertEqual((await state.get_data())['lead_id'],lid)
+        self.assertEqual((await ref.stats())['arrived'],0)
+
+    async def test_fallback_never_requires_getme_inline_support(self):
+        link=ui.url('Msktex_test_dmitry_bot','A'*22)
+        markup=ui.invitation_markup(link,False)
+        button=markup.inline_keyboard[0][0]
+        self.assertEqual(button.text,'Отправить приглашение')
+        self.assertIsNone(button.switch_inline_query_chosen_chat)
+        self.assertEqual(parse_qs(urlparse(button.url).query)['url'],[link])
+
+    async def test_previous_accepted_code_keeps_extended_schema_and_all_records(self):
+        import subprocess
+        import sys
+        import tarfile
+        from io import BytesIO
+        payload=await self.enable();await ref.record_visit(701,payload,1)
+        await registry.register_provider(701,'TEST','+79990000001',True,self.path)
+        await payments.save_provider(701,{payments.CASH},self.path)
+        await bot.save_lead_from_draft(self.customer,self.data['phone'],self.data)
+        archive=subprocess.check_output(['git','archive','242e23ae31a87af5c4da57e008a94518295b0337'])
+        previous=Path(self.tmp.name)/'previous-code';previous.mkdir()
+        with tarfile.open(fileobj=BytesIO(archive)) as tar:
+            tar.extractall(previous,filter='data')
+        script='''import os,sqlite3,asyncio,socket
+os.environ.update(BOT_TOKEN='123456:TEST',ADMIN_IDS='1',LEADS_CHANNEL_ID='-100123')
+os.environ.pop('SERVICE_OWNER_ID',None)
+def blocked(*a,**kw):raise AssertionError('Network forbidden')
+socket.socket.connect=blocked
+original=sqlite3.connect
+def connect(path,*a,**kw):
+ if '/var/data/' in str(path):raise AssertionError('Live SQLite forbidden')
+ return original(path,*a,**kw)
+sqlite3.connect=connect
+import bot,storage
+storage.DB_PATH=os.environ['REFERRAL_REHEARSAL_DB']
+def state():
+ with sqlite3.connect(storage.DB_PATH) as db:
+  schema=db.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name').fetchall()
+  rows={t:db.execute('SELECT * FROM "'+t+'"').fetchall() for (t,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+  assert db.execute('pragma integrity_check').fetchall()==[('ok',)]
+  assert db.execute('pragma foreign_key_check').fetchall()==[]
+  return schema,rows
+before=state()
+asyncio.run(bot.init_db())
+asyncio.run(bot.SQLiteDraftStorage(storage.DB_PATH).init_schema())
+assert before==state()
+print('PREVIOUS_CODE_COMPATIBLE_ALL_ROWS_PRESERVED')
+'''
+        import os
+        env=dict(os.environ,REFERRAL_REHEARSAL_DB=self.path)
+        result=subprocess.run([sys.executable,'-B','-c',script],cwd=previous,env=env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('PREVIOUS_CODE_COMPATIBLE',result.stdout)
 
     async def test_off_inline_returns_no_stale_personal_result(self):
         await self.enable();current=await ref.mode()
