@@ -16,6 +16,8 @@ import admin_access
 import user_access
 import equipment_catalog
 import lead_publication
+import referral_storage
+import referral_ui
 
 router = Router()
 router.callback_query.filter(F.message.chat.type == "private")
@@ -99,6 +101,7 @@ def audit_line(row):
                "lead_publish": "Публикация заявки", "lead_reject": "Отклонение заявки",
                "lead_auto_claim": "Начало автопубликации", "lead_auto_publish": "Автопубликация заявки",
                "lead_publication": "Исход публикации", "autopublish_mode": "Режим автопубликации",
+               "referral_mode": "Режим приглашений",
                "lead_close": "Закрытие заявки", "lead_restore": "Восстановление заявки",
                "provider_notification_cancelled": "Отмена уведомления до отправки",
                "provider_notification_queued": "Резервирование уведомления",
@@ -333,6 +336,8 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         permission = "roles"
     if action == "autopublish" or re.fullmatch(r"autopublish:(pick|apply):[01]:[0-9]{1,18}", action):
         permission = "roles"
+    if action == 'referrals' or re.fullmatch(r'referrals:(pick|apply):[01]:[0-9]{1,18}', action):
+        permission = 'stats'
     if permission is None or not await admin_access.allowed(
         callback.from_user.id, permission, support_admin_ids, service_owner_id,
     ):
@@ -341,7 +346,31 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
         return
     await callback.answer()
     await admin_access.record(callback.from_user.id, "admin_view", details={"section": permission})
-    if action == "home":
+    if action == 'referrals' or action.startswith('referrals:'):
+        current = await referral_storage.mode()
+        if action != 'referrals':
+            if callback.from_user.id != service_owner_id:
+                await callback.answer('Только владелец может менять приглашения.', show_alert=True)
+                return
+            _, stage, target, revision = action.split(':')
+            if current['revision'] != int(revision):
+                await message.answer('Настройка уже изменилась. Откройте раздел заново.')
+                return
+            if stage == 'pick':
+                await message.answer('Подтвердите ' + ('включение' if target == '1' else 'паузу') +
+                    ' приглашений. На паузе новые привязки и полезные действия не учитываются. Данные сохраняются.',
+                    reply_markup=keyboard((("Подтвердить", f'admin:referrals:apply:{target}:{revision}'),),
+                                          (("Отмена", 'admin:referrals'),)))
+                return
+            await referral_storage.set_mode(callback.from_user.id, service_owner_id, target == '1', int(revision))
+            current = await referral_storage.mode()
+        rows = [(("Назад", 'admin:home'),)]
+        if callback.from_user.id == service_owner_id:
+            rows.insert(0, (("Приостановить" if current['enabled'] else "Включить",
+                             f"admin:referrals:pick:{int(not current['enabled'])}:{current['revision']}"),))
+        await message.answer('Приглашения: ' + ('включены' if current['enabled'] else 'на паузе') + '\n\n' +
+                             referral_ui.summary(await referral_storage.stats()), reply_markup=keyboard(*rows))
+    elif action == "home":
         if state is not None and await state.get_state() in (*ManageAdmins.__all_states_names__, *FindUser.__all_states_names__, *ManageAccess.__all_states_names__, *FindLead.__all_states_names__):
             from bot import pause_form
             await pause_form(message, state)
@@ -667,7 +696,7 @@ async def admin_action(callback: CallbackQuery, support_admin_ids, state: FSMCon
             f"создано {row['created']}, опубликовано {row['published']}, откликов {row['offers']}"
             for period, row in zip(("День", "Неделя", "Месяц"), result)
         ]
-        await message.answer("Календарные периоды по Москве. Публикации учитываются с момента включения журнала.\n\n" + "\n".join(lines), reply_markup=keyboard(HOME))
+        await message.answer("Календарные периоды по Москве. Публикации учитываются с момента включения журнала.\n\n" + "\n".join(lines), reply_markup=keyboard((("Приглашения", "admin:referrals"),), HOME))
     elif action == "export":
         request_id=getattr(callback,"id",None)
         try:

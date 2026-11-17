@@ -21,6 +21,8 @@ on:
       - tests/test_sandbox_test_runtime.py
       - render_test_start.py
       - screen_controls.py
+      - "referral_*.py"
+      - tests/test_referral_invitations.py
       - requirements.txt
       - tests/test_tz4_help_admin.py
       - provider_registry.py
