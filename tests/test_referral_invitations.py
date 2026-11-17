@@ -7,7 +7,7 @@ import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace as R
 from unittest.mock import AsyncMock, patch
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from aiogram import Bot
 from aiogram.types import Message, Update
@@ -132,6 +132,41 @@ class ReferralTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(params['url'],[link]);self.assertEqual(params['text'],[ui.DESCRIPTION])
             self.assertEqual(next(b for b in buttons if b.copy_text).copy_text.text,link)
             self.assertIn('Моя статистика',[b.text for b in buttons])
+
+    async def test_share_spaces_survive_percent_only_client_decoding(self):
+        # Telegram's observed iPhone path keeps form-encoded '+' literally.
+        # parse_qs alone concealed this bug by converting '+' back to a space.
+        link = ui.url('Msktex_test_dmitry_bot', 'A' * 22)
+        for inline in (False, True):
+            markup = ui.invitation_markup(link, inline)
+            share = next(row[0].url for row in markup.inline_keyboard if row[0].url)
+            query = urlparse(share).query
+            self.assertNotIn('+', query)
+            self.assertIn('%20', query)
+            decoded = dict((unquote(k), unquote(v)) for k, v in
+                           (part.split('=', 1) for part in query.split('&')))
+            self.assertEqual(decoded, {'url': link, 'text': ui.DESCRIPTION})
+            self.assertEqual(parse_qs(urlparse(decoded['url']).query), {'start': ['r1_' + 'A' * 22]})
+
+    async def test_share_keeps_literal_plus_reserved_characters_and_paragraphs(self):
+        text = 'MSK TEXBot + техника 🚜: 100% & цена=договорная\n\nОткройте бот — +7.'
+        link = ui.url('Msktex_test_dmitry_bot', 'A_-B' * 5 + 'AA')
+        with patch.object(ui, 'DESCRIPTION', text):
+            for inline in (False, True):
+                markup = ui.invitation_markup(link, inline)
+                share = next(row[0].url for row in markup.inline_keyboard if row[0].url)
+                query = urlparse(share).query
+                self.assertIn('%2B', query)
+                self.assertIn('%0A%0A', query)
+                decoded = dict((unquote(k), unquote(v)) for k, v in
+                               (part.split('=', 1) for part in query.split('&')))
+                self.assertEqual(decoded, {'url': link, 'text': text})
+                self.assertEqual(parse_qs(query), {'url': [link], 'text': [text]})
+
+    async def test_invitation_text_has_readable_paragraphs_and_launch_instruction(self):
+        self.assertGreaterEqual(ui.DESCRIPTION.count('\n\n'), 2)
+        self.assertIn('Откройте бота по ссылке', ui.DESCRIPTION)
+        self.assertIn('«Запустить»', ui.DESCRIPTION)
 
     async def test_migration_and_backup_restore_preserve_existing_rows(self):
         await bot.save_lead_from_draft(self.customer,self.data['phone'],self.data)

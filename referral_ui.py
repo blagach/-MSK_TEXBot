@@ -1,5 +1,5 @@
 """User-confirmed invitations; never send to a selected recipient ourselves."""
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from aiogram.types import (CopyTextButton, InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup,
                            InlineQueryResultArticle, InputTextMessageContent, SwitchInlineQueryChosenChat)
@@ -8,8 +8,10 @@ import storage
 import aiosqlite
 
 LABEL = 'Поделиться ботом'
-DESCRIPTION = ('MSK TEXBot — заявки на спецтехнику и поиск исполнителей в Москве и Московской области. '
-               'Заявки и отклики — внутри бота.')
+DESCRIPTION = ('MSK TEXBot — спецтехника в Москве и Московской области.\n\n'
+               'Нужна техника? Разместите заявку. Выполняете работы? '
+               'Находите заявки и откликайтесь внутри бота.\n\n'
+               'Откройте бота по ссылке и нажмите «Запустить».')
 
 
 def entry_markup():
@@ -25,13 +27,18 @@ def url(username, code):
     return f'https://t.me/{username}?start=r1_{code}'
 
 
+def share_url(link):
+    # Telegram clients must receive percent-encoded spaces, not form-encoded '+'.
+    return 'https://t.me/share/url?' + urlencode({'url': link, 'text': DESCRIPTION}, quote_via=quote)
+
+
 def invitation_markup(link, inline):
     send = (Button(text='Отправить приглашение', switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
         query='invite', allow_user_chats=True, allow_bot_chats=False, allow_group_chats=True, allow_channel_chats=False))
-            if inline else Button(text='Отправить приглашение', url='https://t.me/share/url?'+urlencode({'url': link, 'text': DESCRIPTION})))
+            if inline else Button(text='Отправить приглашение', url=share_url(link)))
     rows = [[send]]
     if inline:
-        rows.append([Button(text='Отправить через Telegram', url='https://t.me/share/url?'+urlencode({'url': link, 'text': DESCRIPTION}))])
+        rows.append([Button(text='Отправить через Telegram', url=share_url(link))])
     rows.extend([[Button(text='Копировать ссылку', copy_text=CopyTextButton(text=link))],
                  [Button(text='Моя статистика', callback_data='ref:stats')],
                  [Button(text='Назад', callback_data='ref:back')],
